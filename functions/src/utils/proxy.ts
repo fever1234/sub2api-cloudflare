@@ -33,6 +33,23 @@ export async function proxyRequest(request: ProxyRequest): Promise<ProxyResponse
   }
 }
 
+/**
+ * Header names that describe the upstream body's framing, which no longer
+ * apply once the body has been converted or re-serialized (the chat⇄responses
+ * bridge, JSON pretty-printing). Forwarding a stale `content-length` makes the
+ * client truncate or hang; forwarding `content-encoding` claims bytes that are
+ * not there.
+ */
+export function stripBodyHeaders(headers: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    const lower = key.toLowerCase();
+    if (lower === 'content-length' || lower === 'content-encoding' || lower === 'transfer-encoding') continue;
+    out[key] = value;
+  }
+  return out;
+}
+
 export function buildUpstreamHeaders(
   originalHeaders: Headers,
   provider: string,
@@ -70,6 +87,13 @@ export function buildUpstreamHeaders(
       break;
     case 'xai':
       headers['authorization'] = `Bearer ${apiKey}`;
+      break;
+    case 'opencode_go':
+      // OpenCode authenticates with Authorization: Bearer on every endpoint,
+      // including the Anthropic-protocol one. A client's own x-api-key is the
+      // gateway credential and must not travel upstream.
+      headers['authorization'] = `Bearer ${apiKey}`;
+      delete headers['x-api-key'];
       break;
     default:
       headers['authorization'] = `Bearer ${apiKey}`;
@@ -277,15 +301,24 @@ export function accountRateMultiplier(account: any): number {
 }
 
 export function getUpstreamBaseUrl(baseUrl?: string, provider?: string): string {
-  if (baseUrl && baseUrl.trim()) {
-    return baseUrl.replace(/\/$/, '');
+  const trimmed = String(baseUrl || '').trim().replace(/\/+$/, '');
+  if (trimmed) {
+    // The documented OpenCode base ends in /v1 while every call site appends
+    // /v1/... itself, so one trailing segment is dropped: both …/zen/go and
+    // …/zen/go/v1 resolve to the same upstream paths.
+    if (provider === 'opencode_go') {
+      return trimmed.replace(/\/v1$/, '');
+    }
+    return trimmed;
   }
-  
+
   switch (provider) {
     case 'anthropic':
       return 'https://api.anthropic.com';
     case 'xai':
       return 'https://api.x.ai';
+    case 'opencode_go':
+      return 'https://opencode.ai/zen/go';
     case 'openai':
     default:
       return 'https://api.openai.com';

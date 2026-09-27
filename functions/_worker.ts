@@ -14,6 +14,8 @@ import { handleAccountsRequest } from './src/config/accounts'
 import { handleModelsRequest } from './src/config/models'
 import { encryptApiKey, decryptApiKey, resolveApiKeyEncryptionSecret } from './src/key-crypto'
 import { routingCacheMetrics, invalidateRoutingSnapshot } from './src/utils/routing-cache'
+import { openCodeGoModelProtocol } from './src/utils/responses-bridge'
+import { readCachedModels } from './src/utils/healthcheck'
 
 // Keep an isolate-local scheduler between requests. Persistent request logs in
 // D1 are also consulted by FailoverManager, so this cache is only a fast path.
@@ -539,8 +541,48 @@ async function handleProviderModels(request: Request, env: Env): Promise<Respons
     return json({ error: 'Invalid or disabled API key' }, 401)
   }
   const accounts = await db.listEnabledAccounts()
-  const mappings = await db.listModelMappings()
-  const ids = new Set<string>(mappings.filter(m => m.enabled).map(m => m.requested_model))
-  accounts.forEach(account => ids.add(account.provider === 'anthropic' ? 'claude-3-5-sonnet-20241022' : account.provider === 'xai' ? 'grok-2-latest' : 'gpt-4o'))
-  return json({ object: 'list', data: [...ids].map(id => ({ id, object: 'model', owned_by: 'sub2api' })) })
+  const mappings = (await db.listModelMappings()).filter(m => m.enabled)
+
+  // Native message format per id, derived from where the id came from.
+  // opencode_go owns the only rule table (glm=chat, muse-spark/grok/gpt=
+  // responses, minimax/qwen=anthropic); other providers serve one family.
+  const protocolFor = (provider: string, id: string): string =>
+    provider === 'opencode_go' ? openCodeGoModelProtocol(id)
+      : provider === 'anthropic' ? 'anthropic'
+        : 'chat_completions'
+
+  const ids: string[] = []
+  const protocolById = new Map<string, string>()
+  const note = (id: string, provider: string) => {
+    if (!id || protocolById.has(id)) return
+    ids.push(id)
+    protocolById.set(id, protocolFor(provider, id))
+  }
+
+  // Explicit mappings first: they define how the id routes.
+  mappings.forEach(m => note(String(m.requested_model || ''), m.provider))
+  // Each upstream's own catalogue (cached from its /v1/models), so a client can
+  // discover models that have no mapping yet. No network on this hot path —
+  // only what a previous 获取模型 already stored. opencode_go goes first so its
+  // rule table wins when two providers cache the same id.
+  const catalogueAccounts = [
+    ...accounts.filter(a => a.provider === 'opencode_go'),
+    ...accounts.filter(a => a.provider !== 'opencode_go'),
+  ]
+  catalogueAccounts.forEach(account => {
+    for (const row of readCachedModels(account)?.models || []) note(row.id, account.provider)
+  })
+  // One fallback per provider so a fresh install still answers with something.
+  accounts.forEach(account => note(
+    account.provider === 'anthropic' ? 'claude-3-5-sonnet-20241022'
+      : account.provider === 'xai' ? 'grok-2-latest'
+        : account.provider === 'opencode_go' ? 'glm-5.3'
+          : 'gpt-4o',
+    account.provider
+  ))
+
+  return json({
+    object: 'list',
+    data: ids.map(id => ({ id, object: 'model', owned_by: 'sub2api', protocol: protocolById.get(id) }))
+  })
 }

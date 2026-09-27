@@ -17,7 +17,39 @@
  * exception". The version is recorded in `settings` once the work succeeds, and
  * later requests spend a single cheap read confirming there is nothing to do.
  */
-export const SCHEMA_VERSION = '9';
+export const SCHEMA_VERSION = '10';
+
+/**
+ * The accounts table DDL.
+ *
+ * Exported because SQLite cannot ALTER a CHECK constraint: databases created
+ * before opencode_go existed still enforce the old provider list, so the
+ * migrator rebuilds the table from this exact definition rather than keeping a
+ * second copy to drift out of sync.
+ */
+export const ACCOUNTS_TABLE_DDL = `CREATE TABLE IF NOT EXISTS accounts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  provider TEXT NOT NULL CHECK(provider IN ('openai','anthropic','xai','opencode_go')),
+  api_key TEXT NOT NULL,
+  base_url TEXT,
+  group_id INTEGER NOT NULL,
+  -- Retired: the channel layer was folded into accounts. Kept with a default
+  -- so one INSERT statement works against databases created before the
+  -- change, where this column still carries a NOT NULL constraint.
+  channel_id INTEGER DEFAULT 0,
+  enabled INTEGER DEFAULT 1,
+  error_count INTEGER DEFAULT 0,
+  error_rate REAL DEFAULT 0,
+  last_error_at TEXT,
+  last_error_msg TEXT,
+  priority INTEGER DEFAULT 0,
+  client_spoofing TEXT DEFAULT '',
+  upstream_models TEXT,
+  upstream_models_at TEXT,
+  probe_model TEXT,
+  created_at TEXT DEFAULT (datetime('now'))
+)`;
 
 export const SCHEMA_STATEMENTS: string[] = [
   `CREATE TABLE IF NOT EXISTS users (
@@ -50,29 +82,7 @@ export const SCHEMA_STATEMENTS: string[] = [
     last_error_at TEXT,
     created_at TEXT DEFAULT (datetime('now'))
   )`,
-  `CREATE TABLE IF NOT EXISTS accounts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    provider TEXT NOT NULL CHECK(provider IN ('openai','anthropic','xai')),
-    api_key TEXT NOT NULL,
-    base_url TEXT,
-    group_id INTEGER NOT NULL,
-    -- Retired: the channel layer was folded into accounts. Kept with a default
-    -- so one INSERT statement works against databases created before the
-    -- change, where this column still carries a NOT NULL constraint.
-    channel_id INTEGER DEFAULT 0,
-    enabled INTEGER DEFAULT 1,
-    error_count INTEGER DEFAULT 0,
-    error_rate REAL DEFAULT 0,
-    last_error_at TEXT,
-    last_error_msg TEXT,
-    priority INTEGER DEFAULT 0,
-    client_spoofing TEXT DEFAULT '',
-    upstream_models TEXT,
-    upstream_models_at TEXT,
-    probe_model TEXT,
-    created_at TEXT DEFAULT (datetime('now'))
-  )`,
+  ACCOUNTS_TABLE_DDL,
   `CREATE TABLE IF NOT EXISTS model_mappings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     requested_model TEXT NOT NULL,

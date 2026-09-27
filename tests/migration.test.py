@@ -26,7 +26,9 @@ import sys
 import urllib.error
 import urllib.request
 
-BASE = 'http://127.0.0.1:8788/api/v1'
+# TEST_BASE overrides the dev-server origin (default 8788): Windows may reserve
+# that range, in which case the server must run on another port.
+BASE = (os.environ.get('TEST_BASE', 'http://127.0.0.1:8788') + '/api/v1')
 ADMIN = ('admin', 'MigratePass123')
 
 passed = 0

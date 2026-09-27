@@ -125,8 +125,8 @@ export async function handleAccountsRequest(request: Request, env: Env): Promise
     if (!name || !provider || !groupId) {
       return jsonError('请填写账号名称，并选择服务商和分组', 400);
     }
-    if (!['openai', 'anthropic', 'xai'].includes(provider)) {
-      return jsonError('服务商必须是 openai、anthropic 或 xai', 400);
+    if (!['openai', 'anthropic', 'xai', 'opencode_go'].includes(provider)) {
+      return jsonError('服务商必须是 openai、anthropic、xai 或 opencode_go', 400);
     }
 
     // The group must exist, otherwise scheduling would silently skip this
@@ -181,8 +181,8 @@ export async function handleAccountsRequest(request: Request, env: Env): Promise
       updates.name = name;
     }
     if (body.provider !== undefined) {
-      if (!['openai', 'anthropic', 'xai'].includes(String(body.provider))) {
-        return jsonError('服务商必须是 openai、anthropic 或 xai', 400);
+      if (!['openai', 'anthropic', 'xai', 'opencode_go'].includes(String(body.provider))) {
+        return jsonError('服务商必须是 openai、anthropic、xai 或 opencode_go', 400);
       }
       updates.provider = String(body.provider);
     }

@@ -1,6 +1,9 @@
 // Upstream liveness probing (账号测活).
 import type { Database } from '../db';
-import { getDefaultBaseUrl, getProviderAuthHeaders, getProbeModel } from './provider';
+import { getProviderAuthHeaders, getProbeModel } from './provider';
+import { getUpstreamBaseUrl } from './proxy';
+import { applyOpenCodeProbeHeaders } from './opencode-session';
+import { openCodeGoModelProtocol, chatCompletionsToResponses } from './responses-bridge';
 
 export interface HealthResult {
   accountId: number;
@@ -21,6 +24,27 @@ export interface HealthResult {
 export interface UpstreamModel {
   id: string;
   name?: string;
+  /**
+   * The model's native message format on this provider
+   * (chat_completions | responses | anthropic). Derived locally so the dialog
+   * and downstream /v1/models can label models without asking the upstream.
+   */
+  protocol?: string;
+}
+
+/**
+ * Annotate a catalogue with each model's native message format.
+ *
+ * opencode_go is the only provider with a rule table (glm speaks chat,
+ * muse-spark/grok/gpt speak responses, minimax/qwen speak anthropic); every
+ * other provider serves a single protocol family.
+ */
+function withProtocol(models: UpstreamModel[], provider: string): UpstreamModel[] {
+  if (provider === 'anthropic') return models.map(model => ({ ...model, protocol: 'anthropic' }));
+  if (provider === 'opencode_go') {
+    return models.map(model => ({ ...model, protocol: openCodeGoModelProtocol(model.id) }));
+  }
+  return models.map(model => ({ ...model, protocol: 'chat_completions' }));
 }
 
 const PROBE_TIMEOUT_MS = 15_000;
@@ -90,25 +114,27 @@ export async function listUpstreamModels(
 
   const cached = readCachedModels(account);
   if (cached && !refresh && !isStale(cached.fetchedAt)) {
-    return { models: cached.models, cached: true, fetchedAt: cached.fetchedAt };
+    return { models: withProtocol(cached.models, account.provider), cached: true, fetchedAt: cached.fetchedAt };
   }
 
   const apiKey = String(account.api_key || '').trim();
   if (!apiKey) throw new Error('账号没有配置密钥');
-  const baseUrl = (String(account.base_url || '').trim() || getDefaultBaseUrl(account.provider)).replace(/\/+$/, '');
+  const baseUrl = getUpstreamBaseUrl(account.base_url, account.provider);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
   try {
+    const listHeaders: Record<string, string> = { ...getProviderAuthHeaders(account.provider, apiKey) };
+    if (account.provider === 'opencode_go') applyOpenCodeProbeHeaders(listHeaders);
     const response = await fetch(`${baseUrl}/v1/models`, {
       method: 'GET',
-      headers: getProviderAuthHeaders(account.provider, apiKey),
+      headers: listHeaders,
       signal: controller.signal
     });
     const raw = await response.text().catch(() => '');
     if (!response.ok) {
       // A stale list still lets the operator pick a model and test, which beats
       // an empty dialog when the listing endpoint is the only thing broken.
-      if (cached) return { models: cached.models, cached: true, fetchedAt: cached.fetchedAt };
+      if (cached) return { models: withProtocol(cached.models, account.provider), cached: true, fetchedAt: cached.fetchedAt };
       throw new Error(`获取模型失败（HTTP ${response.status}）`);
     }
     let payload: any = null;
@@ -119,13 +145,13 @@ export async function listUpstreamModels(
       .filter((row: UpstreamModel) => row.id)
       .slice(0, 200);
     if (!models.length) {
-      if (cached) return { models: cached.models, cached: true, fetchedAt: cached.fetchedAt };
+      if (cached) return { models: withProtocol(cached.models, account.provider), cached: true, fetchedAt: cached.fetchedAt };
       throw new Error('上游没有返回可用模型');
     }
 
     await db.saveUpstreamModels(accountId, models).catch(() => {});
     const stored = await db.getAccount(accountId);
-    return { models, cached: false, fetchedAt: String(stored?.upstream_models_at || '') };
+    return { models: withProtocol(models, account.provider), cached: false, fetchedAt: String(stored?.upstream_models_at || '') };
   } finally {
     clearTimeout(timer);
   }
@@ -179,8 +205,7 @@ export async function probeAccount(db: Database, accountId: number, selectedMode
     return result;
   }
 
-  const baseUrl = (String(account.base_url || '').trim()
-    || getDefaultBaseUrl(account.provider)).replace(/\/+$/, '');
+  const baseUrl = getUpstreamBaseUrl(account.base_url, account.provider);
 
   const isAnthropic = account.provider === 'anthropic';
   const probeModel = resolveProbeModel(account, selectedModel);
@@ -188,22 +213,45 @@ export async function probeAccount(db: Database, accountId: number, selectedMode
   const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
   const startedAt = Date.now();
 
-  const endpoint = isAnthropic ? `${baseUrl}/v1/messages` : `${baseUrl}/v1/chat/completions`;
-  const payload = {
+  // OpenCode Go serves one native protocol per model family: picking a
+  // responses-native model (muse-spark-*/grok-*/gpt-*) in the dialog must probe
+  // it on /v1/responses, otherwise upstream answers 400 "does not support this
+  // protocol" and a healthy credential reads as dead.
+  const protocol = account.provider === 'opencode_go' ? openCodeGoModelProtocol(probeModel) : (isAnthropic ? 'anthropic' : 'chat_completions');
+  const endpoint = protocol === 'anthropic'
+    ? `${baseUrl}/v1/messages`
+    : protocol === 'responses'
+      ? `${baseUrl}/v1/responses`
+      : `${baseUrl}/v1/chat/completions`;
+  const chatPayload = {
     model: probeModel,
     max_tokens: PROBE_MAX_TOKENS,
     stream: true,
     messages: [{ role: 'user', content: PROBE_PROMPT }]
   };
+  // The bridge forces stream=true upstream; the probe reader consumes any
+  // `data:` frame, so the Responses shape needs no special handling downstream.
+  const payload: unknown = protocol === 'responses'
+    ? chatCompletionsToResponses(chatPayload)
+    : protocol === 'anthropic'
+      ? { model: probeModel, max_tokens: PROBE_MAX_TOKENS, stream: true, messages: [{ role: 'user', content: PROBE_PROMPT }] }
+      : chatPayload;
+  const probeHeaders: Record<string, string> = {
+    ...getProviderAuthHeaders(account.provider, apiKey),
+    'content-type': 'application/json',
+    accept: 'text/event-stream'
+  };
+  if (protocol === 'anthropic' && account.provider === 'opencode_go') {
+    probeHeaders['anthropic-version'] = '2023-06-01';
+  }
+  // OpenCode rejects a probe that lacks a session header, and its edge WAF
+  // rejects generic UAs, so both are attached before the probe fires.
+  if (account.provider === 'opencode_go') applyOpenCodeProbeHeaders(probeHeaders);
 
   try {
     const response = await fetch(endpoint, {
       method: 'POST',
-      headers: {
-        ...getProviderAuthHeaders(account.provider, apiKey),
-        'content-type': 'application/json',
-        accept: 'text/event-stream'
-      },
+      headers: probeHeaders,
       body: JSON.stringify(payload),
       signal: controller.signal
     });

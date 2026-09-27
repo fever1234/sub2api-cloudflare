@@ -22,7 +22,7 @@ export interface Group {
 export interface Account {
   id: number;
   name: string;
-  provider: 'openai' | 'anthropic' | 'xai';
+  provider: 'openai' | 'anthropic' | 'xai' | 'opencode_go';
   api_key: string;
   base_url?: string;
   group_id: number;

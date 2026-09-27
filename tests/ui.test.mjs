@@ -88,16 +88,21 @@ function fakeFetch(url, options = {}) {
   }
 
   // The probe dialog reads the list cached on the account, so the stub reports
-  // `cached` and the remembered model the same way the worker does.
+  // `cached`, the remembered model and the message-format label the same way
+  // the worker does (openai → chat, anthropic → anthropic).
   const upstreamModels = path.match(/^\/accounts\/(\d+)\/models/)
   if (upstreamModels) {
+    const accountId = Number(upstreamModels[1])
+    const catalogue = accountId === 2
+      ? [{ id: 'claude-opus-5', protocol: 'anthropic' }, { id: 'claude-sonnet-4-5', protocol: 'anthropic' }]
+      : [{ id: 'gpt-5.6-terra', protocol: 'chat_completions' }, { id: 'gpt-5.5', protocol: 'chat_completions' }]
     return respond({
       data: {
-        account_id: Number(upstreamModels[1]),
-        models: [{ id: 'gpt-5.6-terra' }, { id: 'gpt-5.5' }],
+        account_id: accountId,
+        models: catalogue,
         cached: !path.includes('refresh=1'),
         fetched_at: '2026-01-01 00:00:00',
-        probe_model: 'gpt-5.5'
+        probe_model: accountId === 2 ? 'claude-opus-5' : 'gpt-5.5'
       }
     })
   }
@@ -451,32 +456,38 @@ if (cleanupForm) {
   check('bulk cleanup sends the retention window', Boolean(cleanup), JSON.stringify(posted.slice(-3)))
 }
 
-// ---- probe dialog defaults to the provider's model -------------------------
-// The dialog must be usable the moment it opens: the provider default is
-// preselected and named, so fetching the upstream catalogue is only needed when
-// that model is not on this account's plan.
+// ---- probe dialog opens with the full catalogue ------------------------------
+// The dialog auto-loads the account's models (cache-first, so a fresh list
+// costs no upstream round trip) and labels each entry with its native message
+// format; the provider default stays preselected so 开始测试 works instantly.
 press(doc.querySelector('.nav-item[data-page="accounts"]'))
 await tick(10)
 press(doc.querySelector('#accounts-list [data-action="test-account"]'))
-await tick(14)
+await tick(24)
 const probeCard = doc.querySelector('.modal-card')
 const probeSelect = probeCard?.querySelector('#f-test_model')
 check('probe dialog opens', Boolean(probeCard))
 check('probe dialog names the openai default model',
   /gpt-5\.6-terra/.test(probeCard?.textContent || ''), probeCard?.textContent?.slice(0, 200))
-// Opening the dialog must not spend an upstream round trip; the operator asked
-// for the default to just work.
-check('probe dialog does not fetch models on open',
-  !fetched.some(url => url.includes('/accounts/1/models')), fetched.slice(-3).join(' | '))
-if (probeSelect) {
+check('probe dialog auto-loads the catalogue on open',
+  fetched.some(url => url.includes('/accounts/1/models')), fetched.slice(-4).join(' | '))
+check('auto-loaded catalogue fills the dropdown without a click',
+  Boolean(probeSelect) && probeSelect.options.length > 1, `${probeSelect?.options.length} options`)
+check('the default model is preselected when the upstream serves it',
+  probeSelect?.value === 'gpt-5.6-terra', probeSelect?.value)
+check('each model is labelled with its message format',
+  [...(probeSelect?.options || [])].some(opt => /chat 格式/.test(opt.textContent)),
+  [...(probeSelect?.options || [])].map(opt => opt.textContent).join(' | '))
+check('the catalogue load reports it came from cache',
+  /缓存/.test(probeCard?.textContent || ''),
+  probeCard?.querySelector('[data-test-result]')?.textContent || '')
+if (probeCard && probeSelect) {
   press(probeCard.querySelector('[data-fetch-models]'))
   await tick(16)
-  check('fetching models fills the dropdown', probeSelect.options.length > 1,
-    `${probeSelect.options.length} options`)
-  check('the default model is preselected when the upstream serves it',
-    probeSelect.value === 'gpt-5.6-terra', probeSelect.value)
-  check('the fetched list reports it came from cache',
-    /缓存/.test(probeCard.textContent || ''),
+  check('the fetch button forces a live refresh',
+    fetched.some(url => url.includes('refresh=1')), fetched.slice(-4).join(' | '))
+  check('a live refresh reports a fresh fetch',
+    /已获取/.test(probeCard.querySelector('[data-test-result]')?.textContent || ''),
     probeCard.querySelector('[data-test-result]')?.textContent || '')
 }
 fire(doc.querySelector('.modal-backdrop'), 'mousedown')
@@ -484,10 +495,14 @@ await tick(4)
 
 // A Claude account must default to the Claude model, not OpenAI's.
 press(doc.querySelectorAll('#accounts-list [data-action="test-account"]')[1])
-await tick(14)
+await tick(24)
 const claudeCard = doc.querySelector('.modal-card')
 check('a claude account defaults to the claude model',
   /claude-opus-5/.test(claudeCard?.textContent || ''), claudeCard?.textContent?.slice(0, 200))
+const claudeSelect = claudeCard?.querySelector('#f-test_model')
+check('the claude catalogue is labelled with the anthropic format',
+  [...(claudeSelect?.options || [])].some(opt => /anthropic 格式/.test(opt.textContent)),
+  [...(claudeSelect?.options || [])].map(opt => opt.textContent).join(' | '))
 fire(doc.querySelector('.modal-backdrop'), 'mousedown')
 await tick(4)
 
@@ -527,6 +542,38 @@ if (groupBoxes.length >= 2) {
   check('batch probe sends the per-provider models',
     batchPost?.body?.models?.openai === 'gpt-5.6-terra', JSON.stringify(batchPost?.body?.models))
   check('batch probe lists each account result', /acct-openai/.test(doc.body.textContent))
+}
+
+// ---- fresh deployment must offer setup, not a login box --------------------
+// The worker answers /auth/setup with `setup_available`, not `needs_setup`.
+// Reading the wrong field showed a login box on a deployment with no account,
+// which is indistinguishable from "I forgot my password".
+{
+  const freshConsole = new VirtualConsole()
+  const freshErrors = []
+  freshConsole.on('jsdomError', error => freshErrors.push(error.message))
+  const freshDom = new JSDOM(html, { runScripts: 'outside-only', pretendToBeVisual: true, url: 'http://localhost:8788/', virtualConsole: freshConsole })
+  const freshWindow = freshDom.window
+  freshWindow.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} })
+  freshWindow.fetch = (url, options = {}) => {
+    const path = String(url).replace('/api/v1', '')
+    const method = (options.method || 'GET').toUpperCase()
+    if (path.startsWith('/auth/setup') && method === 'GET') {
+      return respond({ data: { initialized: false, setup_available: true, schema_ready: true } })
+    }
+    return respond({ data: {} })
+  }
+  freshWindow.eval(appJs)
+  await new Promise(resolve => setTimeout(resolve, 50))
+
+  const freshDoc = freshWindow.document
+  check('fresh deployment shows the setup form', !freshDoc.getElementById('setup-form').classList.contains('hidden'))
+  check('fresh deployment hides the login form', freshDoc.getElementById('login-form').classList.contains('hidden'))
+  check('fresh deployment titles the setup screen',
+    freshDoc.getElementById('auth-title').textContent === '初始化管理员',
+    freshDoc.getElementById('auth-title').textContent)
+  check('fresh deployment boot raised no errors', freshErrors.length === 0, freshErrors.join(' | '))
+  freshWindow.close()
 }
 
 check('no uncaught page errors', jsErrors.length === 0, jsErrors.join(' | '))

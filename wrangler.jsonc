@@ -1,18 +1,19 @@
 {
   "name": "sub2api-gateway",
+  "pages_build_output_dir": "frontend",
   "compatibility_flags": ["nodejs_compat"],
   "compatibility_date": "2025-10-25",
   "d1_databases": [
     {
       "binding": "DB",
       "database_name": "sub2api-db",
-      "database_id": "00e845e2-7690-44e2-a70f-3249d87d7a23"
+      "database_id": "12d66f4d-a562-43eb-a685-904c33b346cc"
     }
   ],
   "kv_namespaces": [
     {
       "binding": "CONFIG_KV",
-      "id": "b8674b89affa40889d3d869951de5eb4"
+      "id": "0411c4e30bc04ef192b1dcaf179824ea"
     }
   ]
 }

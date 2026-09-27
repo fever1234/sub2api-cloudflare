@@ -3,7 +3,9 @@ import type { Env } from '../index';
 import { createDatabase } from '../db';
 import { authenticateApiKey } from '../auth';
 import { FailoverManager } from '../failover';
-import { proxyRequest, buildUpstreamHeaders, getUpstreamBaseUrl, findModelMapping, resolveUpstreamCredentials , accountRateMultiplier } from '../utils/proxy';
+import { proxyRequest, buildUpstreamHeaders, getUpstreamBaseUrl, findModelMapping, resolveUpstreamCredentials , accountRateMultiplier, stripBodyHeaders } from '../utils/proxy';
+import { applyOpenCodeHeaders } from '../utils/opencode-session';
+import { openCodeGoModelProtocol, chatCompletionsToResponses, responsesSseToChatStream, bufferResponsesSseAsChat } from '../utils/responses-bridge';
 import { streamWithRecording } from '../utils/record';
 import { defer, Deferrable } from '../utils/background';
 import { getModelFromHeader } from '../utils/headers';
@@ -49,7 +51,7 @@ export async function handleOpenAIRequest(request: Request, env: Env, failover: 
   // Get OpenAI-compatible accounts
   const routing = await loadRoutingSnapshot(db, failover);
   let accounts = routing.accounts;
-  accounts = accounts.filter(a => (a.provider === 'openai' || a.provider === 'xai') && a.enabled);
+  accounts = accounts.filter(a => (a.provider === 'openai' || a.provider === 'xai' || a.provider === 'opencode_go') && a.enabled);
 
   // A client key may be pinned to one group. That is a hard constraint: serving
   // it from another group would bill and route traffic somewhere the operator
@@ -61,7 +63,7 @@ export async function handleOpenAIRequest(request: Request, env: Env, failover: 
     if (accounts.length === 0) {
       return new Response(JSON.stringify({
         error: 'No available accounts',
-        message: '该 API 密钥绑定的主分组和兜底分组下没有可用账号'
+        message: '�?API 密钥绑定的主分组和兜底分组下没有可用账号'
       }), { status: 503, headers: { 'Content-Type': 'application/json' } });
     }
   }
@@ -75,7 +77,9 @@ export async function handleOpenAIRequest(request: Request, env: Env, failover: 
   const mappings = routing.mappings;
   
   // Apply model mapping
-  const mapping = findModelMapping(model, mappings, 'openai') || findModelMapping(model, mappings, 'xai');
+  const mapping = findModelMapping(model, mappings, 'openai')
+    || findModelMapping(model, mappings, 'xai')
+    || findModelMapping(model, mappings, 'opencode_go');
   const requestedProvider = mapping?.provider || (model.toLowerCase().startsWith('grok-') ? 'xai' : undefined);
   if (requestedProvider) {
     accounts = accounts.filter(account => account.provider === requestedProvider);
@@ -99,13 +103,32 @@ export async function handleOpenAIRequest(request: Request, env: Env, failover: 
   }
   
   const { account, group } = selection;
-  const provider = account.provider as 'openai' | 'xai';
-  
+  const provider = account.provider;
+
+  // opencode_go serves responses-native models (muse-spark-*, grok-*, gpt-*)
+  // only on /v1/responses. Bridge the chat request so an OpenAI-compatible
+  // client can still use them; every other model keeps the direct chat path.
+  let bridged = false;
+  let outboundBody: unknown = requestBody;
+  if (!isResponses && provider === 'opencode_go' && openCodeGoModelProtocol(upstreamModel) === 'responses') {
+    try {
+      outboundBody = chatCompletionsToResponses(requestBody);
+      endpoint = '/v1/responses';
+      bridged = true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'request cannot be converted to the Responses API';
+      return new Response(JSON.stringify({ error: { message, type: 'invalid_request_error', param: null, code: null } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+    }
+  }
+
   // Build upstream request
   const credentials = resolveUpstreamCredentials(account);
   const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, provider);
   const upstreamUrl = `${baseUrl}${endpoint}`;
   const headers = buildUpstreamHeaders(request.headers, provider, credentials.apiKey, credentials.baseUrl, account.client_spoofing);
+  if (provider === 'opencode_go') {
+    applyOpenCodeHeaders(headers, { clientHeaders: request.headers, body: requestBody, allowGenerate: true });
+  }
   
   const startTime = Date.now();
   
@@ -116,7 +139,7 @@ export async function handleOpenAIRequest(request: Request, env: Env, failover: 
       headers,
       body: new ReadableStream({
         start(controller) {
-          controller.enqueue(new TextEncoder().encode(typeof requestBody === 'string' ? requestBody : JSON.stringify(requestBody)));
+          controller.enqueue(new TextEncoder().encode(JSON.stringify(outboundBody)));
           controller.close();
         }
       })
@@ -127,9 +150,30 @@ export async function handleOpenAIRequest(request: Request, env: Env, failover: 
       await proxyResponse.text().catch(() => '');
       failover.recordRequest(account.id, group.id, true);
       defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: proxyResponse.status, error_message: `Upstream returned ${proxyResponse.status}`, latency_ms: Date.now() - startTime }));
-      return handleFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, `Upstream returned ${proxyResponse.status}`, preferredGroupId, startTime, ctx, fallbackGroupId);
+      return handleFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, model, `Upstream returned ${proxyResponse.status}`, preferredGroupId, startTime, ctx, fallbackGroupId);
     }
-    if (stream && proxyResponse.body) {
+
+    let finalStatus = proxyResponse.status;
+    let finalBody: any;
+    if (bridged && !isError) {
+      if (stream && proxyResponse.body) {
+        // The bridge stream carries the usage chunk billing reads, so first-byte
+        // latency is not delayed by bookkeeping.
+        return streamWithRecording(responsesSseToChatStream(proxyResponse.body, model), proxyResponse.status, stripBodyHeaders(proxyResponse.headers), {
+          db, failover, keyRecordId: keyRecord.id,
+          accountId: account.id, groupId: group.id,
+          provider: provider, model: upstreamModel,
+          rateMultiplier: accountRateMultiplier(account),
+          startedAt: startTime,
+          ctx
+        });
+      }
+      const buffered = await bufferResponsesSseAsChat(proxyResponse.body, model);
+      finalBody = buffered.body;
+      finalStatus = buffered.status;
+    }
+
+    if (stream && finalBody === undefined && proxyResponse.body) {
       // Streaming records usage from the stream's completion callback so
       // first-byte latency is not delayed by bookkeeping.
       return streamWithRecording(proxyResponse.body, proxyResponse.status, proxyResponse.headers, {
@@ -141,13 +185,20 @@ export async function handleOpenAIRequest(request: Request, env: Env, failover: 
         ctx
       });
     }
-    const responseText = await proxyResponse.text();
+    let responseText: string;
     let responseBody: any = {};
-    try {
-      responseBody = JSON.parse(responseText);
-    } catch {
-      // Non-JSON response
+    if (finalBody !== undefined) {
+      responseText = JSON.stringify(finalBody);
+      responseBody = finalBody;
+    } else {
+      responseText = await proxyResponse.text();
+      try {
+        responseBody = JSON.parse(responseText);
+      } catch {
+        // Non-JSON response
+      }
     }
+    const finalError = finalStatus >= 400;
     
     // Calculate cost
     const { promptTokens, completionTokens, totalTokens } = extractTokenUsage(responseBody, proxyResponse.headers);
@@ -158,25 +209,27 @@ export async function handleOpenAIRequest(request: Request, env: Env, failover: 
     if (cost > 0) {
       defer(ctx, db.incrementApiKeyUsage(keyRecord.id, cost));
     }
-    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cost, base_cost: breakdown.baseCost, rate_multiplier: breakdown.multiplier, cost_estimated: breakdown.estimated ? 1 : 0, cache_status: 'bypass', status: proxyResponse.status, error_message: isError ? responseBody?.error?.message || 'Error' : '', latency_ms: Date.now() - startTime }));
+    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cost, base_cost: breakdown.baseCost, rate_multiplier: breakdown.multiplier, cost_estimated: breakdown.estimated ? 1 : 0, cache_status: 'bypass', status: finalStatus, error_message: finalError ? responseBody?.error?.message || 'Error' : '', latency_ms: Date.now() - startTime }));
     
     // Record request log
     defer(ctx, db.createRequestLog({
       account_id: account.id,
       group_id: group.id,
       model: upstreamModel,
-      status: proxyResponse.status,
-      error_message: isError ? responseBody?.error?.message || 'Error' : '',
+      status: finalStatus,
+      error_message: finalError ? responseBody?.error?.message || 'Error' : '',
       latency_ms: Date.now() - startTime
     }));
     
     // Record for failover
-    failover.recordRequest(account.id, group.id, isError);
+    failover.recordRequest(account.id, group.id, finalError);
     
     return new Response(responseText, {
-      status: proxyResponse.status,
+      status: finalStatus,
       headers: {
-        ...proxyResponse.headers,
+        // The bridge re-serialized the body, so the upstream's framing headers
+        // describe bytes that are not being sent.
+        ...(finalBody !== undefined ? stripBodyHeaders(proxyResponse.headers) : proxyResponse.headers),
         'content-type': 'application/json', 'cache-control': 'no-store, no-transform'
       }
     });
@@ -187,7 +240,7 @@ export async function handleOpenAIRequest(request: Request, env: Env, failover: 
     defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: errorMessage, latency_ms: Date.now() - startTime }));
     
     // Try failover
-    return handleFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, errorMessage, preferredGroupId, startTime, ctx, fallbackGroupId);
+    return handleFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, model, errorMessage, preferredGroupId, startTime, ctx, fallbackGroupId);
   }
 }
 
@@ -204,6 +257,7 @@ async function handleFailover(
   provider: string,
   upstreamModel: string,
   stream: boolean,
+  clientModel: string,
   errorMessage: string,
   preferredGroupId?: number,
   originStart: number = Date.now(),
@@ -226,20 +280,43 @@ async function handleFailover(
     
     const { account, group } = selection;
     attempted.add(account.id);
-    const currentProvider = account.provider as 'openai' | 'xai';
+    const currentProvider = account.provider;
+    // Session hints are read from the body on the retry path too, so a retried
+    // OpenCode call keeps the conversation id rather than minting a new one.
+    let retryBody: any;
+    try { retryBody = JSON.parse(body); } catch { retryBody = undefined; }
     
     try {
       const credentials = resolveUpstreamCredentials(account);
       const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, currentProvider);
-      const upstreamUrl = `${baseUrl}${endpoint}`;
+      // Re-decide the bridge per retry: the next account may be a different
+      // provider, and only opencode_go responses-native models convert.
+      let retryEndpoint = endpoint;
+      let retrySendBody = body;
+      let retryBridged = false;
+      if (!isResponses && currentProvider === 'opencode_go' && retryBody && openCodeGoModelProtocol(String(retryBody.model || upstreamModel)) === 'responses') {
+        try {
+          retrySendBody = JSON.stringify(chatCompletionsToResponses(retryBody));
+          retryEndpoint = '/v1/responses';
+          retryBridged = true;
+        } catch {
+          retrySendBody = body;
+          retryEndpoint = endpoint;
+        }
+      }
+      const upstreamUrl = `${baseUrl}${retryEndpoint}`;
       const headers = buildUpstreamHeaders(request.headers, currentProvider, credentials.apiKey, credentials.baseUrl, account.client_spoofing);
+      if (currentProvider === 'opencode_go') {
+        applyOpenCodeHeaders(headers, { clientHeaders: request.headers, body: retryBody, allowGenerate: true });
+      }
+      const sendBody = retrySendBody;
       const proxyResponse = await proxyRequest({
         url: upstreamUrl,
         method: request.method,
         headers,
         body: new ReadableStream({
           start(controller) {
-            controller.enqueue(new TextEncoder().encode(body));
+            controller.enqueue(new TextEncoder().encode(sendBody));
             controller.close();
           }
         })
@@ -251,9 +328,28 @@ async function handleFailover(
         continue;
       }
       
+      let finalStatus = proxyResponse.status;
+      let finalBody: any;
+      if (retryBridged && !isError) {
+        if (stream && proxyResponse.body) {
+          return streamWithRecording(responsesSseToChatStream(proxyResponse.body, clientModel), proxyResponse.status, stripBodyHeaders(proxyResponse.headers), {
+            db, failover, keyRecordId: keyRecord.id,
+            accountId: account.id, groupId: group.id,
+            provider: currentProvider, model: upstreamModel,
+            rateMultiplier: accountRateMultiplier(account),
+            startedAt: originStart,
+            ctx
+          });
+        }
+        const buffered = await bufferResponsesSseAsChat(proxyResponse.body, clientModel);
+        finalBody = buffered.body;
+        finalStatus = buffered.status;
+      }
+      const finalError = isError || finalStatus >= 400;
+      
       // Streaming records its own request log and usage from the stream
       // completion callback, so return before the non-streaming bookkeeping.
-      if (stream && !isError && proxyResponse.body) {
+      if (stream && !finalError && finalBody === undefined && proxyResponse.body) {
         return streamWithRecording(proxyResponse.body, proxyResponse.status, proxyResponse.headers, {
           db, failover, keyRecordId: keyRecord.id,
           accountId: account.id, groupId: group.id,
@@ -264,20 +360,23 @@ async function handleFailover(
         });
       }
 
-      failover.recordRequest(account.id, group.id, isError);
+      failover.recordRequest(account.id, group.id, finalError);
       defer(ctx, db.createRequestLog({
         account_id: account.id,
         group_id: group.id,
         model: upstreamModel,
-        status: proxyResponse.status,
-        error_message: isError ? errorMessage : '',
+        status: finalStatus,
+        error_message: finalError ? errorMessage : '',
         latency_ms: 0
       }));
-      const responseText = await proxyResponse.text();
+      const responseText = finalBody !== undefined ? JSON.stringify(finalBody) : await proxyResponse.text();
       
       return new Response(responseText, {
-        status: proxyResponse.status,
-        headers: { ...proxyResponse.headers, 'content-type': 'application/json', 'cache-control': 'no-store, no-transform' }
+        status: finalStatus,
+        headers: {
+          ...(finalBody !== undefined ? stripBodyHeaders(proxyResponse.headers) : proxyResponse.headers),
+          'content-type': 'application/json', 'cache-control': 'no-store, no-transform'
+        }
       });
       
     } catch (retryError) {

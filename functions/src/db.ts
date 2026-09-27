@@ -1,7 +1,7 @@
 // D1 Database abstraction layer
 import type { Env } from './index';
 import type { UsageRecord, RequestLog } from './types';
-import { SCHEMA_STATEMENTS, ADDITIVE_COLUMNS, SCHEMA_VERSION } from './schema';
+import { SCHEMA_STATEMENTS, ADDITIVE_COLUMNS, SCHEMA_VERSION, ACCOUNTS_TABLE_DDL } from './schema';
 
 export class Database {
   constructor(private db: D1Database) {}
@@ -552,15 +552,88 @@ export class Database {
       await this.db.prepare(statement).run();
     }
     await this.applyAdditiveColumns();
+    // The provider CHECK lives in the accounts DDL. On a database created
+    // before opencode_go it still rejects the new provider, and CREATE TABLE
+    // IF NOT EXISTS cannot change an existing constraint, so the table is
+    // rebuilt first — before the channels fold below writes into it.
+    const widened = await this.migrateAccountsProviderCheck();
     // Columns must exist before the backfill reads or writes them.
     const folded = await this.migrateChannelsIntoAccounts();
     // Recorded last, and only on full success: a crash midway — or a backfill
     // that failed and wants to retry — leaves the version unset so the next
     // request tries again instead of taking the fast path forever.
-    if (folded) {
+    if (folded && widened) {
       await this.setSetting('schema_version', SCHEMA_VERSION);
     }
     return !wasReady;
+  }
+
+  /**
+   * Widen the accounts.provider CHECK constraint so `opencode_go` rows are legal.
+   *
+   * SQLite cannot ALTER a CHECK constraint, so the table is recreated from the
+   * current DDL under a temporary name and swapped in a single D1 batch, which
+   * runs as one transaction: any failure rolls back rather than leaving the
+   * database without its accounts table. The copy list is the intersection of
+   * the old columns and the new definition (old column set, plus any additive
+   * columns the rebuild must carry over such as rate_multiplier), so no stored
+   * value is silently reset to its default.
+   *
+   * Returns false only when work was needed but did not succeed. ensureSchema
+   * then withholds the version stamp, so the next boot retries instead of
+   * fast-pathing past a constraint that still rejects opencode_go.
+   */
+  private async migrateAccountsProviderCheck(): Promise<boolean> {
+    const current = await this.queryOne<{ sql: string }>(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'accounts'"
+    ).catch(() => null);
+    if (!current?.sql) return true; // fresh database: SCHEMA_STATEMENTS already created it with the wide CHECK
+    if (current.sql.includes("'opencode_go'")) return true;
+
+    let oldColumns: string[] = [];
+    try {
+      oldColumns = (await this.query<{ name: string }>('PRAGMA table_info(accounts)')).map(row => row.name);
+    } catch {
+      return false;
+    }
+    if (!oldColumns.length) return false;
+
+    const widenedDdl = ACCOUNTS_TABLE_DDL.replace(
+      'CREATE TABLE IF NOT EXISTS accounts (',
+      'CREATE TABLE IF NOT EXISTS accounts_widened ('
+    );
+    const newColumns = new Set(
+      [...widenedDdl.matchAll(/^\s*([a-z_]+)\s+(TEXT|INTEGER|REAL|BLOB|NUMERIC)/gmi)].map(match => match[1])
+    );
+    // The additive columns exist on the old table but not in the base DDL;
+    // the rebuild must add them too or the copy would drop their values.
+    const additive = ADDITIVE_COLUMNS.filter(entry =>
+      entry.table === 'accounts' && !newColumns.has(entry.column)
+    );
+    additive.forEach(entry => newColumns.add(entry.column));
+
+    const copyColumns = oldColumns.filter(name => newColumns.has(name));
+    if (!copyColumns.length) return false;
+    const columnList = copyColumns.join(', ');
+
+    try {
+      await this.db.batch([
+        this.db.prepare('DROP TABLE IF EXISTS accounts_widened'),
+        this.db.prepare(widenedDdl),
+        ...additive.map(entry =>
+          this.db.prepare(`ALTER TABLE accounts_widened ADD COLUMN ${entry.column} ${entry.definition}`)
+        ),
+        this.db.prepare(`INSERT INTO accounts_widened (${columnList}) SELECT ${columnList} FROM accounts`),
+        this.db.prepare('DROP TABLE accounts'),
+        this.db.prepare('ALTER TABLE accounts_widened RENAME TO accounts'),
+        // Dropping the old table dropped its indexes with it.
+        this.db.prepare('CREATE INDEX IF NOT EXISTS idx_accounts_group ON accounts(group_id)'),
+        this.db.prepare('CREATE INDEX IF NOT EXISTS idx_accounts_channel ON accounts(channel_id)')
+      ]);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /**

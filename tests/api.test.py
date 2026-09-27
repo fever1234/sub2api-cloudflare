@@ -1,9 +1,12 @@
 """Temporary end-to-end API check against the local Pages dev server."""
 import json
+import sys
 import urllib.error
 import urllib.request
 
-BASE = "http://127.0.0.1:8788"
+# Optional base URL argument, matching gateway/features tests, for machines
+# where the default 8788 range is reserved (e.g. Windows excluded port ranges).
+BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8788"
 results = []
 
 

@@ -41,7 +41,7 @@ CREATE TABLE IF NOT EXISTS channels (
 CREATE TABLE IF NOT EXISTS accounts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
-  provider TEXT NOT NULL CHECK(provider IN ('openai','anthropic','xai')),
+  provider TEXT NOT NULL CHECK(provider IN ('openai','anthropic','xai','opencode_go')),
   api_key TEXT NOT NULL,
   base_url TEXT,
   group_id INTEGER NOT NULL,

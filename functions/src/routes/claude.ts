@@ -4,6 +4,7 @@ import { createDatabase } from '../db';
 import { authenticateApiKey } from '../auth';
 import { FailoverManager } from '../failover';
 import { proxyRequest, buildUpstreamHeaders, getUpstreamBaseUrl, findModelMapping, resolveUpstreamCredentials , accountRateMultiplier } from '../utils/proxy';
+import { applyOpenCodeHeaders } from '../utils/opencode-session';
 import { streamWithRecording } from '../utils/record';
 import { defer, Deferrable } from '../utils/background';
 import { getModelFromHeader } from '../utils/headers';
@@ -39,10 +40,11 @@ export async function handleClaudeRequest(request: Request, env: Env, failover: 
   const model = requestBody.model || getModelFromHeader(request) || '';
   const stream = requestBody.stream === true;
   
-  // Get Anthropic accounts
+  // Get Anthropic-protocol accounts. OpenCode Go is included because its
+  // MiniMax and Qwen models are natively served on the Anthropic endpoint.
   const routing = await loadRoutingSnapshot(db, failover);
   let accounts = routing.accounts;
-  accounts = accounts.filter(a => a.provider === 'anthropic' && a.enabled);
+  accounts = accounts.filter(a => (a.provider === 'anthropic' || a.provider === 'opencode_go') && a.enabled);
 
   // A client key may be pinned to one group. That is a hard constraint: serving
   // it from another group would bill and route traffic somewhere the operator
@@ -60,7 +62,7 @@ export async function handleClaudeRequest(request: Request, env: Env, failover: 
   }
   
   if (accounts.length === 0) {
-    return new Response(JSON.stringify({ error: 'No available Anthropic accounts' }), { status: 503, headers: { 'Content-Type': 'application/json' } });
+    return new Response(JSON.stringify({ error: 'No available Anthropic-compatible accounts' }), { status: 503, headers: { 'Content-Type': 'application/json' } });
   }
   
   // Load supporting data
@@ -68,7 +70,15 @@ export async function handleClaudeRequest(request: Request, env: Env, failover: 
   const mappings = routing.mappings;
   
   // Apply model mapping
-  const mapping = findModelMapping(model, mappings, 'anthropic');
+  const mapping = findModelMapping(model, mappings, 'anthropic') || findModelMapping(model, mappings, 'opencode_go');
+  // A mapping may pin this request to one of the route's providers; other
+  // providers (an OpenAI-targeted mapping, say) leave the pool untouched.
+  if (mapping && (mapping.provider === 'anthropic' || mapping.provider === 'opencode_go')) {
+    accounts = accounts.filter(account => account.provider === mapping.provider);
+  }
+  if (accounts.length === 0) {
+    return new Response(JSON.stringify({ error: 'No available accounts for requested model' }), { status: 503, headers: { 'Content-Type': 'application/json' } });
+  }
   let upstreamModel = mapping?.requested_model.endsWith('*')
     ? mapping.upstream_model + model.slice(mapping.requested_model.length - 1)
     : (mapping?.upstream_model || model);
@@ -85,12 +95,20 @@ export async function handleClaudeRequest(request: Request, env: Env, failover: 
   }
   
   const { account, group } = selection;
+  const provider = account.provider;
   
   // Build upstream request
   const credentials = resolveUpstreamCredentials(account);
-  const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, 'anthropic');
-  const upstreamUrl = `${baseUrl}/v1/messages?beta=true`;
-  const headers = buildUpstreamHeaders(request.headers, 'anthropic', credentials.apiKey, credentials.baseUrl, account.client_spoofing);
+  const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, provider);
+  // ?beta=true is Anthropic's own flag; OpenCode's Anthropic-protocol endpoint
+  // is called without it upstream, so it is not appended there.
+  const upstreamUrl = provider === 'opencode_go'
+    ? `${baseUrl}/v1/messages`
+    : `${baseUrl}/v1/messages?beta=true`;
+  const headers = buildUpstreamHeaders(request.headers, provider, credentials.apiKey, credentials.baseUrl, account.client_spoofing);
+  if (provider === 'opencode_go') {
+    applyOpenCodeHeaders(headers, { clientHeaders: request.headers, body: requestBody, allowGenerate: true });
+  }
   
   const startTime = Date.now();
   
@@ -120,7 +138,7 @@ export async function handleClaudeRequest(request: Request, env: Env, failover: 
       return streamWithRecording(proxyResponse.body, proxyResponse.status, proxyResponse.headers, {
         db, failover, keyRecordId: keyRecord.id,
         accountId: account.id, groupId: group.id,
-        provider: 'anthropic', model: upstreamModel,
+        provider, model: upstreamModel,
         rateMultiplier: accountRateMultiplier(account),
         startedAt: startTime,
         ctx
@@ -136,14 +154,14 @@ export async function handleClaudeRequest(request: Request, env: Env, failover: 
     
     // Calculate cost
     const { promptTokens, completionTokens, totalTokens } = extractTokenUsage(responseBody, proxyResponse.headers);
-    const breakdown = calculateCostBreakdown('anthropic', upstreamModel, promptTokens, completionTokens, accountRateMultiplier(account));
+    const breakdown = calculateCostBreakdown(provider, upstreamModel, promptTokens, completionTokens, accountRateMultiplier(account));
     const cost = breakdown.cost;
     
     // Record usage
     if (cost > 0) {
       defer(ctx, db.incrementApiKeyUsage(keyRecord.id, cost));
     }
-    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider: 'anthropic', prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cost, base_cost: breakdown.baseCost, rate_multiplier: breakdown.multiplier, cost_estimated: breakdown.estimated ? 1 : 0, cache_status: 'bypass', status: proxyResponse.status, error_message: isError ? responseBody?.error?.message || 'Error' : '', latency_ms: Date.now() - startTime }));
+    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cost, base_cost: breakdown.baseCost, rate_multiplier: breakdown.multiplier, cost_estimated: breakdown.estimated ? 1 : 0, cache_status: 'bypass', status: proxyResponse.status, error_message: isError ? responseBody?.error?.message || 'Error' : '', latency_ms: Date.now() - startTime }));
     
     // Record request log
     defer(ctx, db.createRequestLog({
@@ -206,12 +224,21 @@ async function handleClaudeFailover(
     
     const { account, group } = selection;
     attempted.add(account.id);
+    const currentProvider = account.provider;
+    // Keep the conversation id stable across OpenCode retries.
+    let retryBody: unknown;
+    try { retryBody = JSON.parse(body); } catch { retryBody = undefined; }
     
     try {
       const credentials = resolveUpstreamCredentials(account);
-      const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, 'anthropic');
-      const upstreamUrl = `${baseUrl}/v1/messages?beta=true`;
-      const headers = buildUpstreamHeaders(request.headers, 'anthropic', credentials.apiKey, credentials.baseUrl, account.client_spoofing);
+      const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, currentProvider);
+      const upstreamUrl = currentProvider === 'opencode_go'
+        ? `${baseUrl}/v1/messages`
+        : `${baseUrl}/v1/messages?beta=true`;
+      const headers = buildUpstreamHeaders(request.headers, currentProvider, credentials.apiKey, credentials.baseUrl, account.client_spoofing);
+      if (currentProvider === 'opencode_go') {
+        applyOpenCodeHeaders(headers, { clientHeaders: request.headers, body: retryBody, allowGenerate: true });
+      }
       const proxyResponse = await proxyRequest({
         url: upstreamUrl,
         method: request.method,
@@ -236,7 +263,7 @@ async function handleClaudeFailover(
         return streamWithRecording(proxyResponse.body, proxyResponse.status, proxyResponse.headers, {
           db, failover, keyRecordId: keyRecord.id,
           accountId: account.id, groupId: group.id,
-          provider: 'anthropic', model: upstreamModel,
+          provider: currentProvider, model: upstreamModel,
           rateMultiplier: accountRateMultiplier(account),
           startedAt: originStart,
           ctx

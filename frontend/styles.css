@@ -770,8 +770,10 @@ html.dark .badge-warn { color: var(--amber); }
 .prov-openai    { color: var(--emerald); background: rgba(16, 185, 129, .12); }
 .prov-anthropic { color: #c2410c;        background: rgba(249, 115, 22, .14); }
 .prov-xai       { color: var(--text-1);  background: var(--surface-2); }
+.prov-opencode_go { color: #6d28d9;      background: rgba(124, 58, 237, .12); }
 .prov-unknown   { color: var(--text-2);  background: var(--surface-2); }
 html.dark .prov-anthropic { color: #fdba74; }
+html.dark .prov-opencode_go { color: #a78bfa; }
 
 /* -------------------------------------------------- empty + loading states */
 

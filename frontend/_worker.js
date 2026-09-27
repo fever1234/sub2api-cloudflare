@@ -1,5 +1,28 @@
 // functions/src/schema.ts
-var SCHEMA_VERSION = "9";
+var SCHEMA_VERSION = "10";
+var ACCOUNTS_TABLE_DDL = `CREATE TABLE IF NOT EXISTS accounts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  provider TEXT NOT NULL CHECK(provider IN ('openai','anthropic','xai','opencode_go')),
+  api_key TEXT NOT NULL,
+  base_url TEXT,
+  group_id INTEGER NOT NULL,
+  -- Retired: the channel layer was folded into accounts. Kept with a default
+  -- so one INSERT statement works against databases created before the
+  -- change, where this column still carries a NOT NULL constraint.
+  channel_id INTEGER DEFAULT 0,
+  enabled INTEGER DEFAULT 1,
+  error_count INTEGER DEFAULT 0,
+  error_rate REAL DEFAULT 0,
+  last_error_at TEXT,
+  last_error_msg TEXT,
+  priority INTEGER DEFAULT 0,
+  client_spoofing TEXT DEFAULT '',
+  upstream_models TEXT,
+  upstream_models_at TEXT,
+  probe_model TEXT,
+  created_at TEXT DEFAULT (datetime('now'))
+)`;
 var SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -31,29 +54,7 @@ var SCHEMA_STATEMENTS = [
     last_error_at TEXT,
     created_at TEXT DEFAULT (datetime('now'))
   )`,
-  `CREATE TABLE IF NOT EXISTS accounts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    provider TEXT NOT NULL CHECK(provider IN ('openai','anthropic','xai')),
-    api_key TEXT NOT NULL,
-    base_url TEXT,
-    group_id INTEGER NOT NULL,
-    -- Retired: the channel layer was folded into accounts. Kept with a default
-    -- so one INSERT statement works against databases created before the
-    -- change, where this column still carries a NOT NULL constraint.
-    channel_id INTEGER DEFAULT 0,
-    enabled INTEGER DEFAULT 1,
-    error_count INTEGER DEFAULT 0,
-    error_rate REAL DEFAULT 0,
-    last_error_at TEXT,
-    last_error_msg TEXT,
-    priority INTEGER DEFAULT 0,
-    client_spoofing TEXT DEFAULT '',
-    upstream_models TEXT,
-    upstream_models_at TEXT,
-    probe_model TEXT,
-    created_at TEXT DEFAULT (datetime('now'))
-  )`,
+  ACCOUNTS_TABLE_DDL,
   `CREATE TABLE IF NOT EXISTS model_mappings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     requested_model TEXT NOT NULL,
@@ -730,11 +731,73 @@ var Database = class {
       await this.db.prepare(statement).run();
     }
     await this.applyAdditiveColumns();
+    const widened = await this.migrateAccountsProviderCheck();
     const folded = await this.migrateChannelsIntoAccounts();
-    if (folded) {
+    if (folded && widened) {
       await this.setSetting("schema_version", SCHEMA_VERSION);
     }
     return !wasReady;
+  }
+  /**
+   * Widen the accounts.provider CHECK constraint so `opencode_go` rows are legal.
+   *
+   * SQLite cannot ALTER a CHECK constraint, so the table is recreated from the
+   * current DDL under a temporary name and swapped in a single D1 batch, which
+   * runs as one transaction: any failure rolls back rather than leaving the
+   * database without its accounts table. The copy list is the intersection of
+   * the old columns and the new definition (old column set, plus any additive
+   * columns the rebuild must carry over such as rate_multiplier), so no stored
+   * value is silently reset to its default.
+   *
+   * Returns false only when work was needed but did not succeed. ensureSchema
+   * then withholds the version stamp, so the next boot retries instead of
+   * fast-pathing past a constraint that still rejects opencode_go.
+   */
+  async migrateAccountsProviderCheck() {
+    const current = await this.queryOne(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'accounts'"
+    ).catch(() => null);
+    if (!current?.sql) return true;
+    if (current.sql.includes("'opencode_go'")) return true;
+    let oldColumns = [];
+    try {
+      oldColumns = (await this.query("PRAGMA table_info(accounts)")).map((row) => row.name);
+    } catch {
+      return false;
+    }
+    if (!oldColumns.length) return false;
+    const widenedDdl = ACCOUNTS_TABLE_DDL.replace(
+      "CREATE TABLE IF NOT EXISTS accounts (",
+      "CREATE TABLE IF NOT EXISTS accounts_widened ("
+    );
+    const newColumns = new Set(
+      [...widenedDdl.matchAll(/^\s*([a-z_]+)\s+(TEXT|INTEGER|REAL|BLOB|NUMERIC)/gmi)].map((match) => match[1])
+    );
+    const additive = ADDITIVE_COLUMNS.filter(
+      (entry) => entry.table === "accounts" && !newColumns.has(entry.column)
+    );
+    additive.forEach((entry) => newColumns.add(entry.column));
+    const copyColumns = oldColumns.filter((name) => newColumns.has(name));
+    if (!copyColumns.length) return false;
+    const columnList = copyColumns.join(", ");
+    try {
+      await this.db.batch([
+        this.db.prepare("DROP TABLE IF EXISTS accounts_widened"),
+        this.db.prepare(widenedDdl),
+        ...additive.map(
+          (entry) => this.db.prepare(`ALTER TABLE accounts_widened ADD COLUMN ${entry.column} ${entry.definition}`)
+        ),
+        this.db.prepare(`INSERT INTO accounts_widened (${columnList}) SELECT ${columnList} FROM accounts`),
+        this.db.prepare("DROP TABLE accounts"),
+        this.db.prepare("ALTER TABLE accounts_widened RENAME TO accounts"),
+        // Dropping the old table dropped its indexes with it.
+        this.db.prepare("CREATE INDEX IF NOT EXISTS idx_accounts_group ON accounts(group_id)"),
+        this.db.prepare("CREATE INDEX IF NOT EXISTS idx_accounts_channel ON accounts(channel_id)")
+      ]);
+      return true;
+    } catch {
+      return false;
+    }
   }
   /**
    * Fold the retired channel layer into accounts.
@@ -1023,6 +1086,15 @@ async function proxyRequest(request) {
     throw error;
   }
 }
+function stripBodyHeaders(headers) {
+  const out = {};
+  for (const [key, value] of Object.entries(headers)) {
+    const lower = key.toLowerCase();
+    if (lower === "content-length" || lower === "content-encoding" || lower === "transfer-encoding") continue;
+    out[key] = value;
+  }
+  return out;
+}
 function buildUpstreamHeaders(originalHeaders, provider, apiKey, baseUrl, clientSpoofing) {
   const headers = {};
   const preserveHeaders = [
@@ -1049,6 +1121,10 @@ function buildUpstreamHeaders(originalHeaders, provider, apiKey, baseUrl, client
       break;
     case "xai":
       headers["authorization"] = `Bearer ${apiKey}`;
+      break;
+    case "opencode_go":
+      headers["authorization"] = `Bearer ${apiKey}`;
+      delete headers["x-api-key"];
       break;
     default:
       headers["authorization"] = `Bearer ${apiKey}`;
@@ -1178,14 +1254,20 @@ function accountRateMultiplier(account) {
   return Number.isFinite(value) && value >= 0 ? value : 1;
 }
 function getUpstreamBaseUrl(baseUrl, provider) {
-  if (baseUrl && baseUrl.trim()) {
-    return baseUrl.replace(/\/$/, "");
+  const trimmed = String(baseUrl || "").trim().replace(/\/+$/, "");
+  if (trimmed) {
+    if (provider === "opencode_go") {
+      return trimmed.replace(/\/v1$/, "");
+    }
+    return trimmed;
   }
   switch (provider) {
     case "anthropic":
       return "https://api.anthropic.com";
     case "xai":
       return "https://api.x.ai";
+    case "opencode_go":
+      return "https://opencode.ai/zen/go";
     case "openai":
     default:
       return "https://api.openai.com";
@@ -1373,6 +1455,919 @@ var FailoverManager = class {
     }
   }
 };
+
+// functions/src/utils/opencode-session.ts
+var SESSION_HEADER = "x-opencode-session";
+var SESSION_HEADERS = [
+  "x-opencode-session",
+  "session-id",
+  "session_id",
+  "conversation_id",
+  "x-session-affinity",
+  "x-session-id",
+  "x-conversation-id",
+  "x-claude-code-session-id"
+];
+var OPENCODE_UPSTREAM_USER_AGENT = "opencode/1.0.0";
+var SESSION_ID_MAX_LENGTH = 256;
+function headerGet(headers, name) {
+  if (!headers) return "";
+  if (typeof headers.get === "function") {
+    return String(headers.get(name) || "").trim();
+  }
+  const record = headers;
+  const lower = name.toLowerCase();
+  for (const key of Object.keys(record)) {
+    if (key.toLowerCase() === lower) return String(record[key] ?? "").trim();
+  }
+  return "";
+}
+function sanitizeSessionId(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return "";
+  const cleaned = raw.replace(/[\u0000-\u001f\u007f]/g, "");
+  return cleaned.slice(0, SESSION_ID_MAX_LENGTH);
+}
+function sessionIdFromBody(body) {
+  if (!body || typeof body !== "object") return "";
+  const record = body;
+  const fromCacheKey = sanitizeSessionId(record.prompt_cache_key);
+  if (fromCacheKey) return fromCacheKey;
+  const metadata = record.metadata;
+  if (metadata && typeof metadata === "object") {
+    const userId = sanitizeSessionId(metadata.user_id);
+    if (userId) {
+      if (userId.startsWith("{")) {
+        try {
+          const parsed = JSON.parse(userId);
+          const nested = sanitizeSessionId(parsed?.session_id);
+          if (nested) return nested;
+        } catch {
+        }
+      }
+      return userId;
+    }
+  }
+  return "";
+}
+var CONTENT_SEED_PREFIX = "compat_cs_";
+var CONTENT_SEED_MAX_CHARS = 1e5;
+function jsonOf(value) {
+  if (value === null) return "null";
+  if (value === void 0) return "";
+  try {
+    return JSON.stringify(value) ?? "";
+  } catch {
+    return "";
+  }
+}
+function seedHash(material) {
+  let h1 = 2166136261;
+  let h2 = 2654435769;
+  for (let i = 0; i < material.length; i++) {
+    const c = material.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 16777619) >>> 0;
+    h2 = Math.imul(h2 ^ c, 2246822507) >>> 0;
+  }
+  return h1.toString(16).padStart(8, "0") + h2.toString(16).padStart(8, "0");
+}
+function deriveContentSessionSeed(body) {
+  if (!body || typeof body !== "object") return "";
+  const rec = body;
+  const parts = [];
+  const model = typeof rec.model === "string" ? rec.model.trim() : "";
+  if (model) parts.push("model=" + model);
+  if (Array.isArray(rec.tools) && rec.tools.length > 0) parts.push("|tools=" + jsonOf(rec.tools));
+  if (Array.isArray(rec.functions) && rec.functions.length > 0) parts.push("|functions=" + jsonOf(rec.functions));
+  if (typeof rec.instructions === "string" && rec.instructions !== "") {
+    parts.push("|instructions=" + rec.instructions);
+  }
+  let firstUserCaptured = false;
+  const captureFirstUser = (content) => {
+    if (firstUserCaptured) return;
+    parts.push("|first_user=" + jsonOf(content));
+    firstUserCaptured = true;
+  };
+  if (Array.isArray(rec.messages)) {
+    let systemPrefixOpen = true;
+    for (const message of rec.messages) {
+      if (!message || typeof message !== "object") {
+        systemPrefixOpen = false;
+        continue;
+      }
+      const role = message.role;
+      if ((role === "system" || role === "developer") && systemPrefixOpen) {
+        parts.push("|system=" + jsonOf(message.content));
+      } else if (role === "user") {
+        systemPrefixOpen = false;
+        captureFirstUser(message.content);
+      } else {
+        systemPrefixOpen = false;
+      }
+    }
+  } else if (Array.isArray(rec.input)) {
+    for (const item of rec.input) {
+      if (!item || typeof item !== "object") continue;
+      if (item.role === "system" || item.role === "developer") {
+        parts.push("|system=" + jsonOf(item.content));
+      } else if (item.role === "user") {
+        captureFirstUser(item.content);
+      }
+      if (!firstUserCaptured && item.type === "input_text") {
+        parts.push("|first_user=" + (typeof item.text === "string" ? item.text : ""));
+        firstUserCaptured = true;
+      }
+    }
+  } else if (typeof rec.input === "string" && rec.input !== "") {
+    parts.push("|input=" + rec.input);
+  }
+  if (parts.length === 0) return "";
+  const material = parts.join("").slice(0, CONTENT_SEED_MAX_CHARS);
+  return CONTENT_SEED_PREFIX + seedHash(material);
+}
+function resolveOpenCodeSessionId(input) {
+  for (const name of SESSION_HEADERS) {
+    const fromHeader = sanitizeSessionId(headerGet(input.clientHeaders, name));
+    if (fromHeader) return fromHeader;
+  }
+  const fromBody = sessionIdFromBody(input.body);
+  if (fromBody) return fromBody;
+  const applied = sanitizeSessionId(headerGet(input.appliedHeaders, SESSION_HEADER));
+  if (applied) return applied;
+  const seed = deriveContentSessionSeed(input.body);
+  if (seed) return seed;
+  if (input.allowGenerate && typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return "";
+}
+function applyOpenCodeHeaders(headers, input) {
+  let hasUserAgent = false;
+  for (const key of Object.keys(headers)) {
+    if (key.toLowerCase() === "user-agent") {
+      hasUserAgent = true;
+      if (!String(headers[key] || "").trim()) delete headers[key];
+      else break;
+    }
+  }
+  if (!hasUserAgent) {
+    headers["user-agent"] = OPENCODE_UPSTREAM_USER_AGENT;
+  }
+  const sessionId = resolveOpenCodeSessionId({ ...input, appliedHeaders: headers });
+  if (!sessionId) return;
+  for (const key of Object.keys(headers)) {
+    if (key.toLowerCase() === SESSION_HEADER) delete headers[key];
+  }
+  headers[SESSION_HEADER] = sessionId;
+}
+function applyOpenCodeProbeHeaders(headers) {
+  applyOpenCodeHeaders(headers, { allowGenerate: true });
+}
+
+// functions/src/utils/responses-bridge.ts
+var OPENCODE_GO_PROTOCOL_RULES = [
+  { pattern: "grok-*", protocol: "responses" },
+  { pattern: "gpt-*", protocol: "responses" },
+  { pattern: "muse-spark-*", protocol: "responses" },
+  { pattern: "minimax-*", protocol: "anthropic" },
+  { pattern: "qwen*", protocol: "anthropic" }
+];
+function normalizeOpenCodeModelId(model) {
+  let value = String(model || "").toLowerCase().trim();
+  for (const prefix of ["opencode-go/", "opencode_go/", "opencode/"]) {
+    if (value.startsWith(prefix)) value = value.slice(prefix.length);
+  }
+  return value;
+}
+function protocolRuleMatches(pattern, model) {
+  const rule = String(pattern || "").toLowerCase().trim();
+  if (!rule || !model) return false;
+  if (rule === "*") return true;
+  if (rule.endsWith("*")) return model.startsWith(rule.slice(0, -1));
+  return rule === model;
+}
+function openCodeGoModelProtocol(model) {
+  const normalized = normalizeOpenCodeModelId(model);
+  for (const rule of OPENCODE_GO_PROTOCOL_RULES) {
+    if (rule.protocol !== "chat_completions" && rule.protocol !== "anthropic" && rule.protocol !== "responses") continue;
+    if (protocolRuleMatches(rule.pattern, normalized)) return rule.protocol;
+  }
+  return "chat_completions";
+}
+var MIN_MAX_OUTPUT_TOKENS = 128;
+function isReasoningModel(model) {
+  return /^gpt-5/.test(model) || /^gpt-6-(sol|luna)/.test(model);
+}
+function isGpt6SolOrLuna(model) {
+  return /^gpt-6-(sol|luna)/.test(model);
+}
+function asNumber(value) {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : void 0;
+}
+function isObject(value) {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+function chatResponseFormatToResponsesTextFormat(format) {
+  if (!isObject(format)) return void 0;
+  if (format.type !== "json_schema") return format;
+  const inner = format.json_schema;
+  if (!isObject(inner)) return format;
+  return { ...inner, type: "json_schema" };
+}
+function isEmptyBase64DataUri(raw) {
+  if (!raw.startsWith("data:")) return false;
+  const rest = raw.slice("data:".length);
+  const semicolon = rest.indexOf(";");
+  if (semicolon < 0) return false;
+  const tail = rest.slice(semicolon + 1);
+  if (!tail.startsWith("base64,")) return false;
+  return tail.slice("base64,".length).trim() === "";
+}
+function chatContentToText(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const texts = [];
+  for (const part of content) {
+    if (isObject(part) && part.type === "text" && typeof part.text === "string" && part.text !== "") {
+      texts.push(part.text);
+    }
+  }
+  return texts.join("");
+}
+function chatPartsToResponsesParts(parts) {
+  const out = [];
+  for (const part of parts) {
+    if (!isObject(part)) continue;
+    const breakpoint = part.prompt_cache_breakpoint;
+    if (part.type === "text") {
+      const text = String(part.text ?? "");
+      if (text !== "" || breakpoint !== void 0) {
+        out.push({ ...breakpoint !== void 0 ? { prompt_cache_breakpoint: breakpoint } : {}, type: "input_text", text });
+      }
+    } else if (part.type === "image_url") {
+      const url = isObject(part.image_url) ? String(part.image_url.url || "") : "";
+      if (url && !isEmptyBase64DataUri(url)) {
+        out.push({ ...breakpoint !== void 0 ? { prompt_cache_breakpoint: breakpoint } : {}, type: "input_image", image_url: url });
+      }
+    } else if (part.type === "file") {
+      const file = part.file;
+      if (isObject(file) && (file.file_data || file.file_id)) {
+        out.push({
+          ...breakpoint !== void 0 ? { prompt_cache_breakpoint: breakpoint } : {},
+          type: "input_file",
+          ...file.filename ? { filename: file.filename } : {},
+          ...file.file_data ? { file_data: file.file_data } : {},
+          ...file.file_id ? { file_id: file.file_id } : {}
+        });
+      }
+    }
+  }
+  return out;
+}
+function chatMessageContentToResponsesContent(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    const parts = chatPartsToResponsesParts(content);
+    if (parts.length === 0) return "";
+    return parts;
+  }
+  return "";
+}
+function parseAssistantContent(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  let out = "";
+  for (const part of content) {
+    if (!isObject(part)) continue;
+    const text = typeof part.text === "string" ? part.text : "";
+    if (part.type === "thinking" || part.type === "reasoning") {
+      const thinking = typeof part.thinking === "string" && part.thinking !== "" ? part.thinking : text;
+      if (thinking) out += `<thinking>${thinking}</thinking>`;
+    } else if (text) {
+      out += text;
+    }
+  }
+  return out;
+}
+function chatMessageToInputItems(message) {
+  const role = String(message?.role || "user");
+  switch (role) {
+    case "system":
+    case "user":
+    case "developer":
+      return [{ role: role === "developer" ? "system" : role, content: chatMessageContentToResponsesContent(message.content) }];
+    case "assistant": {
+      const items = [];
+      let content = "";
+      if (typeof message.reasoning_content === "string" && message.reasoning_content !== "") {
+        content = `<thinking>${message.reasoning_content}</thinking>`;
+      }
+      const text = parseAssistantContent(message.content);
+      if (text !== "") {
+        content = content ? `${content}
+${text}` : text;
+      }
+      if (content !== "") {
+        items.push({ role: "assistant", content: [{ type: "output_text", text: content }] });
+      }
+      for (const call of Array.isArray(message.tool_calls) ? message.tool_calls : []) {
+        if (!isObject(call) || !isObject(call.function)) continue;
+        const args = String(call.function.arguments ?? "");
+        items.push({
+          type: "function_call",
+          call_id: String(call.id ?? ""),
+          name: String(call.function.name ?? ""),
+          arguments: args === "" ? "{}" : args
+        });
+      }
+      return items;
+    }
+    case "tool": {
+      const output = chatContentToText(message.content) || "(empty)";
+      return [{ type: "function_call_output", call_id: String(message.tool_call_id ?? ""), output }];
+    }
+    case "function": {
+      const output = chatContentToText(message.content) || "(empty)";
+      return [{ type: "function_call_output", call_id: String(message.name ?? ""), output }];
+    }
+    default:
+      return [{ role: "user", content: chatMessageContentToResponsesContent(message.content) }];
+  }
+}
+function chatToolsToResponsesTools(tools, functions) {
+  const out = [];
+  for (const tool of Array.isArray(tools) ? tools : []) {
+    if (!isObject(tool)) continue;
+    const type = String(tool.type || "").toLowerCase().trim();
+    if (type === "x_search") {
+      out.push({
+        type: "x_search",
+        ...tool.allowed_x_handles ? { allowed_x_handles: tool.allowed_x_handles } : {},
+        ...tool.excluded_x_handles ? { excluded_x_handles: tool.excluded_x_handles } : {},
+        ...tool.from_date ? { from_date: tool.from_date } : {},
+        ...tool.to_date ? { to_date: tool.to_date } : {},
+        ...tool.enable_image_understanding !== void 0 ? { enable_image_understanding: tool.enable_image_understanding } : {},
+        ...tool.enable_video_understanding !== void 0 ? { enable_video_understanding: tool.enable_video_understanding } : {}
+      });
+      continue;
+    }
+    if (type === "web_search" || type === "code_execution") {
+      out.push({ type });
+      continue;
+    }
+    if (type !== "function" || !isObject(tool.function)) continue;
+    out.push({
+      type: "function",
+      name: tool.function.name,
+      ...tool.function.description ? { description: tool.function.description } : {},
+      ...tool.function.parameters !== void 0 ? { parameters: tool.function.parameters } : {},
+      strict: tool.function.strict === void 0 ? false : tool.function.strict
+    });
+  }
+  for (const fn of Array.isArray(functions) ? functions : []) {
+    if (!isObject(fn)) continue;
+    out.push({
+      type: "function",
+      name: fn.name,
+      ...fn.description ? { description: fn.description } : {},
+      ...fn.parameters !== void 0 ? { parameters: fn.parameters } : {},
+      strict: fn.strict === void 0 ? false : fn.strict
+    });
+  }
+  return out;
+}
+function chatFunctionCallToToolChoice(raw) {
+  if (typeof raw === "string") return raw;
+  if (isObject(raw)) return { type: "function", name: raw.name };
+  return void 0;
+}
+function chatToolChoiceToResponses(choice) {
+  if (!isObject(choice)) return choice;
+  if (choice.type === "function" && isObject(choice.function) && typeof choice.function.name === "string" && choice.name === void 0) {
+    return { type: "function", name: choice.function.name };
+  }
+  return choice;
+}
+function chatCompletionsToResponses(chat) {
+  const messages = Array.isArray(chat?.messages) ? chat.messages : [];
+  const input = messages.flatMap((message) => chatMessageToInputItems(message));
+  const out = {
+    model: chat.model,
+    input,
+    stream: true,
+    include: ["reasoning.encrypted_content"],
+    store: false
+  };
+  if (typeof chat.instructions === "string" && chat.instructions !== "") out.instructions = chat.instructions;
+  const dropSampling = isReasoningModel(String(chat.model || "")) && !(isGpt6SolOrLuna(String(chat.model || "")) && chat.reasoning_effort === "none");
+  if (!dropSampling) {
+    if (chat.temperature !== void 0 && chat.temperature !== null) out.temperature = chat.temperature;
+    if (chat.top_p !== void 0 && chat.top_p !== null) out.top_p = chat.top_p;
+  }
+  const maxTokens = asNumber(chat.max_completion_tokens) ?? asNumber(chat.max_tokens);
+  if (maxTokens !== void 0 && maxTokens > 0) {
+    out.max_output_tokens = Math.max(maxTokens, MIN_MAX_OUTPUT_TOKENS);
+  }
+  if (typeof chat.reasoning_effort === "string" && chat.reasoning_effort !== "") {
+    out.reasoning = { effort: chat.reasoning_effort, summary: "auto" };
+  }
+  const format = chatResponseFormatToResponsesTextFormat(chat.response_format);
+  if (format !== void 0) out.text = { format };
+  const tools = chatToolsToResponsesTools(chat.tools, chat.functions);
+  if (tools.length > 0) out.tools = tools;
+  if (chat.tool_choice !== void 0 && chat.tool_choice !== null && chat.tool_choice !== "") {
+    out.tool_choice = chatToolChoiceToResponses(chat.tool_choice);
+  } else if (chat.function_call !== void 0 && chat.function_call !== null) {
+    const toolChoice = chatFunctionCallToToolChoice(chat.function_call);
+    if (toolChoice !== void 0) out.tool_choice = toolChoice;
+  }
+  if (chat.parallel_tool_calls !== void 0) out.parallel_tool_calls = chat.parallel_tool_calls;
+  if (typeof chat.service_tier === "string" && chat.service_tier !== "") out.service_tier = chat.service_tier;
+  if (chat.prompt_cache_options !== void 0) out.prompt_cache_options = chat.prompt_cache_options;
+  if (typeof chat.prompt_cache_key === "string" && chat.prompt_cache_key !== "") out.prompt_cache_key = chat.prompt_cache_key;
+  if (typeof chat.user === "string" && chat.user !== "") out.user = chat.user;
+  if (chat.stop !== void 0 && chat.stop !== null) out.stop = chat.stop;
+  return out;
+}
+function generateChatCmplId() {
+  const bytes = new Uint8Array(12);
+  crypto.getRandomValues(bytes);
+  let hex = "";
+  for (const byte of bytes) hex += byte.toString(16).padStart(2, "0");
+  return `chatcmpl-${hex}`;
+}
+function responsesStatusToChatFinishReason(status, incomplete, toolCallCount) {
+  if (status === "incomplete") {
+    const reason = incomplete?.reason;
+    if (reason === "max_output_tokens") return "length";
+    if (reason === "content_filter") return "content_filter";
+    return "stop";
+  }
+  if (status === "completed" && toolCallCount > 0) return "tool_calls";
+  return "stop";
+}
+function responsesUsageToChatUsage(usage) {
+  if (!isObject(usage)) return void 0;
+  const prompt = Number(usage.input_tokens ?? usage.prompt_tokens ?? 0) || 0;
+  const completion = Number(usage.output_tokens ?? usage.completion_tokens ?? 0) || 0;
+  const chat = {
+    prompt_tokens: prompt,
+    completion_tokens: completion,
+    total_tokens: Number(usage.total_tokens) || prompt + completion
+  };
+  const inputDetails = isObject(usage.input_tokens_details) ? usage.input_tokens_details : void 0;
+  if (inputDetails) {
+    const details = {};
+    if (inputDetails.cached_tokens) details.cached_tokens = inputDetails.cached_tokens;
+    if (inputDetails.audio_tokens) details.audio_tokens = inputDetails.audio_tokens;
+    if (inputDetails.cache_creation_tokens) details.cache_creation_tokens = inputDetails.cache_creation_tokens;
+    if (inputDetails.cache_write_tokens) details.cache_write_tokens = inputDetails.cache_write_tokens;
+    if (Object.keys(details).length > 0) chat.prompt_tokens_details = details;
+  }
+  if (Number(usage.cache_creation_input_tokens) > 0 && !chat.prompt_tokens_details?.cache_creation_tokens && !chat.prompt_tokens_details?.cache_write_tokens) {
+    chat.prompt_tokens_details = { ...chat.prompt_tokens_details || {}, cache_creation_tokens: usage.cache_creation_input_tokens };
+  }
+  const outputDetails = isObject(usage.output_tokens_details) ? usage.output_tokens_details : void 0;
+  if (outputDetails) {
+    const details = {};
+    if (outputDetails.reasoning_tokens) details.reasoning_tokens = outputDetails.reasoning_tokens;
+    if (outputDetails.audio_tokens) details.audio_tokens = outputDetails.audio_tokens;
+    if (outputDetails.accepted_prediction_tokens) details.accepted_prediction_tokens = outputDetails.accepted_prediction_tokens;
+    if (outputDetails.rejected_prediction_tokens) details.rejected_prediction_tokens = outputDetails.rejected_prediction_tokens;
+    if (Object.keys(details).length > 0) chat.completion_tokens_details = details;
+  }
+  return chat;
+}
+function responsesToChatCompletion(response, model) {
+  const resp = isObject(response) ? response : {};
+  const out = {
+    id: resp.id || generateChatCmplId(),
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1e3),
+    model
+  };
+  if (resp.service_tier) out.service_tier = resp.service_tier;
+  let contentText = "";
+  let reasoningText = "";
+  const toolCalls = [];
+  for (const item of Array.isArray(resp.output) ? resp.output : []) {
+    if (!isObject(item)) continue;
+    if (item.type === "message") {
+      for (const part of Array.isArray(item.content) ? item.content : []) {
+        if (isObject(part) && part.type === "output_text" && part.text) contentText += part.text;
+      }
+    } else if (item.type === "function_call") {
+      toolCalls.push({
+        id: item.call_id,
+        type: "function",
+        function: { name: item.name, arguments: item.arguments || "" }
+      });
+    } else if (item.type === "reasoning") {
+      for (const summary of Array.isArray(item.summary) ? item.summary : []) {
+        if (isObject(summary) && summary.type === "summary_text" && summary.text) reasoningText += summary.text;
+      }
+    }
+  }
+  const message = { role: "assistant" };
+  if (toolCalls.length > 0) message.tool_calls = toolCalls;
+  if (contentText !== "") message.content = contentText;
+  if (reasoningText !== "") message.reasoning_content = reasoningText;
+  if (message.content === void 0 && toolCalls.length === 0) message.content = "";
+  out.choices = [{
+    index: 0,
+    message,
+    finish_reason: responsesStatusToChatFinishReason(resp.status, resp.incomplete_details, toolCalls.length)
+  }];
+  const usage = responsesUsageToChatUsage(resp.usage);
+  if (usage) out.usage = usage;
+  return out;
+}
+function newResponsesToChatState(model) {
+  return {
+    id: generateChatCmplId(),
+    model,
+    created: Math.floor(Date.now() / 1e3),
+    serviceTier: "",
+    sentRole: false,
+    sawToolCall: false,
+    sawText: false,
+    finalized: false,
+    nextToolCallIndex: 0,
+    outputIndexToToolIndex: {},
+    outputIndexToArguments: {},
+    includeUsage: true,
+    usage: null
+  };
+}
+function makeChatDeltaChunk(state, delta) {
+  const chunk = {
+    id: state.id,
+    object: "chat.completion.chunk",
+    created: state.created,
+    model: state.model,
+    choices: [{ index: 0, delta, finish_reason: null }]
+  };
+  if (state.serviceTier) chunk.service_tier = state.serviceTier;
+  return chunk;
+}
+function makeChatFinishChunk(state, finishReason) {
+  const chunk = {
+    id: state.id,
+    object: "chat.completion.chunk",
+    created: state.created,
+    model: state.model,
+    choices: [{ index: 0, delta: { content: "" }, finish_reason: finishReason }]
+  };
+  if (state.serviceTier) chunk.service_tier = state.serviceTier;
+  return chunk;
+}
+function makeChatUsageChunk(state) {
+  const chunk = {
+    id: state.id,
+    object: "chat.completion.chunk",
+    created: state.created,
+    model: state.model,
+    choices: [],
+    usage: state.usage
+  };
+  if (state.serviceTier) chunk.service_tier = state.serviceTier;
+  return chunk;
+}
+function handleCreated(evt, state) {
+  const response = isObject(evt.response) ? evt.response : void 0;
+  if (response) {
+    if (response.id) state.id = response.id;
+    if (!state.model && response.model) state.model = response.model;
+    if (response.service_tier) state.serviceTier = response.service_tier;
+  }
+  if (state.sentRole) return [];
+  state.sentRole = true;
+  return [makeChatDeltaChunk(state, { role: "assistant" })];
+}
+function handleTextDelta(evt, state) {
+  if (!evt.delta) return [];
+  state.sawText = true;
+  return [makeChatDeltaChunk(state, { content: evt.delta })];
+}
+function handleOutputItemAdded(evt, state) {
+  const item = isObject(evt.item) ? evt.item : void 0;
+  if (!item || item.type !== "function_call" && item.type !== "custom_tool_call") return [];
+  state.sawToolCall = true;
+  const index = state.nextToolCallIndex;
+  state.outputIndexToToolIndex[Number(evt.output_index)] = index;
+  state.nextToolCallIndex += 1;
+  return [makeChatDeltaChunk(state, {
+    tool_calls: [{
+      index,
+      id: item.call_id,
+      type: "function",
+      function: { name: item.name, arguments: "" }
+    }]
+  })];
+}
+function handleFuncArgsDelta(evt, state) {
+  if (!evt.delta) return [];
+  const index = state.outputIndexToToolIndex[Number(evt.output_index)];
+  if (index === void 0) return [];
+  state.outputIndexToArguments[evt.output_index] = (state.outputIndexToArguments[evt.output_index] || "") + evt.delta;
+  return [makeChatDeltaChunk(state, {
+    tool_calls: [{ index, function: { arguments: evt.delta } }]
+  })];
+}
+function handleFuncArgsDone(evt, state) {
+  const index = state.outputIndexToToolIndex[Number(evt.output_index)];
+  if (index === void 0) return [];
+  const completed = evt.type === "response.custom_tool_call_input.done" ? evt.input : evt.arguments;
+  const current = state.outputIndexToArguments[evt.output_index] || "";
+  if (!completed || !completed.startsWith(current) || completed === current) return [];
+  const remainder = completed.slice(current.length);
+  state.outputIndexToArguments[evt.output_index] = completed;
+  return [makeChatDeltaChunk(state, {
+    tool_calls: [{ index, function: { arguments: remainder } }]
+  })];
+}
+function handleReasoningDelta(evt, state) {
+  if (!evt.delta) return [];
+  return [makeChatDeltaChunk(state, { reasoning_content: evt.delta })];
+}
+function handleCompleted(evt, state) {
+  state.finalized = true;
+  let finishReason = "stop";
+  if (isObject(evt.usage)) state.usage = responsesUsageToChatUsage(evt.usage);
+  const response = isObject(evt.response) ? evt.response : void 0;
+  if (response) {
+    if (isObject(response.usage)) state.usage = responsesUsageToChatUsage(response.usage);
+    if (response.service_tier) state.serviceTier = response.service_tier;
+    if (response.status === "incomplete") {
+      const reason = response.incomplete_details?.reason;
+      if (reason === "max_output_tokens") finishReason = "length";
+      else if (reason === "content_filter") finishReason = "content_filter";
+    } else if (response.status === "completed" && state.sawToolCall) {
+      finishReason = "tool_calls";
+    }
+  } else if (state.sawToolCall) {
+    finishReason = "tool_calls";
+  }
+  const chunks = [makeChatFinishChunk(state, finishReason)];
+  if (state.includeUsage && state.usage) chunks.push(makeChatUsageChunk(state));
+  return chunks;
+}
+function responsesEventToChatChunks(event, state) {
+  const type = String(event?.type || "");
+  switch (type) {
+    case "response.created":
+      return handleCreated(event, state);
+    case "response.output_text.delta":
+      return handleTextDelta(event, state);
+    case "response.output_item.added":
+      return handleOutputItemAdded(event, state);
+    case "response.function_call_arguments.delta":
+    case "response.custom_tool_call_input.delta":
+      return handleFuncArgsDelta(event, state);
+    case "response.function_call_arguments.done":
+    case "response.custom_tool_call_input.done":
+      return handleFuncArgsDone(event, state);
+    case "response.reasoning_summary_text.delta":
+    case "response.reasoning_text.delta":
+      return handleReasoningDelta(event, state);
+    case "response.completed":
+    case "response.done":
+    case "response.incomplete":
+    case "response.failed":
+      return handleCompleted(event, state);
+    default:
+      return [];
+  }
+}
+function finalizeResponsesChatStream(state) {
+  if (state.finalized) return [];
+  state.finalized = true;
+  const chunks = [makeChatFinishChunk(state, state.sawToolCall ? "tool_calls" : "stop")];
+  if (state.includeUsage && state.usage) chunks.push(makeChatUsageChunk(state));
+  return chunks;
+}
+function chatChunkToSse(chunk) {
+  return `data: ${JSON.stringify(chunk)}
+
+`;
+}
+function newBufferedResponseAccumulator() {
+  return { text: "", reasoning: "", funcCalls: [], outputIndexToFuncIdx: {} };
+}
+function bufferedAccumulatorProcessEvent(acc, event) {
+  const type = String(event?.type || "");
+  if (type === "response.output_text.delta") {
+    if (event.delta) acc.text += event.delta;
+  } else if (type === "response.output_item.added") {
+    const item = isObject(event.item) ? event.item : void 0;
+    if (item && (item.type === "function_call" || item.type === "custom_tool_call")) {
+      const index = acc.funcCalls.length;
+      acc.outputIndexToFuncIdx[Number(event.output_index)] = index;
+      acc.funcCalls.push({ outputIndex: Number(event.output_index), callId: item.call_id || "", name: item.name || "", args: "" });
+    }
+  } else if (type === "response.function_call_arguments.delta" || type === "response.custom_tool_call_input.delta") {
+    if (event.delta) {
+      const index = acc.outputIndexToFuncIdx[Number(event.output_index)];
+      if (index !== void 0) acc.funcCalls[index].args += event.delta;
+    }
+  } else if (type === "response.function_call_arguments.done" || type === "response.custom_tool_call_input.done") {
+    const completed = type === "response.custom_tool_call_input.done" ? event.input : event.arguments;
+    if (completed) {
+      const index = acc.outputIndexToFuncIdx[Number(event.output_index)];
+      if (index !== void 0) acc.funcCalls[index].args = completed;
+    }
+  } else if (type === "response.reasoning_summary_text.delta" || type === "response.reasoning_text.delta") {
+    if (event.delta) acc.reasoning += event.delta;
+  }
+}
+function bufferedAccumulatorHasContent(acc) {
+  return acc.text !== "" || acc.funcCalls.length > 0 || acc.reasoning !== "";
+}
+function bufferedAccumulatorBuildOutput(acc) {
+  const out = [];
+  if (acc.reasoning) out.push({ type: "reasoning", summary: [{ type: "summary_text", text: acc.reasoning }] });
+  if (acc.text) out.push({ type: "message", role: "assistant", content: [{ type: "output_text", text: acc.text }] });
+  for (const call of acc.funcCalls) {
+    out.push({ type: "function_call", call_id: call.callId, name: call.name, arguments: call.args });
+  }
+  return out;
+}
+function bufferedAccumulatorSupplementResponseOutput(acc, resp) {
+  if (!resp) return;
+  if (!Array.isArray(resp.output) || resp.output.length === 0) {
+    if (bufferedAccumulatorHasContent(acc)) resp.output = bufferedAccumulatorBuildOutput(acc);
+    return;
+  }
+  resp.output.forEach((item, outputIndex) => {
+    if (!isObject(item) || item.type !== "function_call" || item.arguments) return;
+    for (const call of acc.funcCalls) {
+      const matchesCallId = item.call_id && item.call_id === call.callId;
+      if (!matchesCallId && call.outputIndex !== outputIndex) continue;
+      if (call.args) item.arguments = call.args;
+      break;
+    }
+  });
+}
+var SseFrameParser = class {
+  buffer = "";
+  push(text) {
+    this.buffer += text;
+    const frames = [];
+    for (; ; ) {
+      const boundary = findFrameBoundary(this.buffer);
+      if (!boundary) break;
+      const raw = this.buffer.slice(0, boundary.index);
+      this.buffer = this.buffer.slice(boundary.index + boundary.length);
+      const frame = parseSseFrame(raw);
+      if (frame) frames.push(frame);
+    }
+    return frames;
+  }
+  flush() {
+    if (!this.buffer.trim()) {
+      this.buffer = "";
+      return [];
+    }
+    const frame = parseSseFrame(this.buffer);
+    this.buffer = "";
+    return frame ? [frame] : [];
+  }
+};
+function findFrameBoundary(buffer) {
+  const candidates = [buffer.indexOf("\n\n"), buffer.indexOf("\r\n\r\n")].filter((index2) => index2 >= 0);
+  if (candidates.length === 0) return null;
+  const index = Math.min(...candidates);
+  const length = buffer.startsWith("\r\n\r\n", index) ? 4 : 2;
+  return { index, length };
+}
+function parseSseFrame(raw) {
+  const lines = raw.split(/\r?\n/);
+  let event;
+  const data = [];
+  for (const line of lines) {
+    if (!line || line.startsWith(":")) continue;
+    const colon = line.indexOf(":");
+    const field = colon < 0 ? line : line.slice(0, colon);
+    let value = colon < 0 ? "" : line.slice(colon + 1);
+    if (value.startsWith(" ")) value = value.slice(1);
+    if (field === "event") event = value;
+    else if (field === "data") data.push(value);
+  }
+  if (data.length === 0 && !event) return null;
+  return { event, data: data.join("\n") };
+}
+function frameToResponsesEvent(frame) {
+  const data = frame.data.trim();
+  if (!data || data === "[DONE]") return null;
+  let payload;
+  try {
+    payload = JSON.parse(data);
+  } catch {
+    return null;
+  }
+  if (!isObject(payload)) return null;
+  if (!payload.type && frame.event) payload.type = frame.event;
+  return payload;
+}
+var TERMINAL_RESPONSE_EVENTS = /* @__PURE__ */ new Set(["response.completed", "response.done", "response.incomplete", "response.failed"]);
+function chatErrorBody(message) {
+  return { error: { message, type: "upstream_error", param: null, code: null } };
+}
+function responsesSseToChatStream(body, model) {
+  const state = newResponsesToChatState(model);
+  const parser = new SseFrameParser();
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  const reader = body.getReader();
+  return new ReadableStream({
+    async pull(controller) {
+      try {
+        for (; ; ) {
+          const { done, value } = await reader.read();
+          if (done) {
+            for (const frame of parser.flush()) {
+              const event = frameToResponsesEvent(frame);
+              if (event) {
+                for (const chunk of responsesEventToChatChunks(event, state)) controller.enqueue(encoder.encode(chatChunkToSse(chunk)));
+              }
+            }
+            for (const chunk of finalizeResponsesChatStream(state)) controller.enqueue(encoder.encode(chatChunkToSse(chunk)));
+            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+            controller.close();
+            return;
+          }
+          let produced = false;
+          for (const frame of parser.push(decoder.decode(value, { stream: true }))) {
+            const event = frameToResponsesEvent(frame);
+            if (!event) continue;
+            for (const chunk of responsesEventToChatChunks(event, state)) {
+              controller.enqueue(encoder.encode(chatChunkToSse(chunk)));
+              produced = true;
+            }
+          }
+          if (produced) return;
+        }
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+    async cancel(reason) {
+      try {
+        await reader.cancel(reason);
+      } catch {
+      }
+    }
+  });
+}
+async function bufferResponsesSseAsChat(body, model) {
+  const acc = newBufferedResponseAccumulator();
+  const parser = new SseFrameParser();
+  const decoder = new TextDecoder();
+  const reader = body.getReader();
+  let terminal = null;
+  let sawSse = false;
+  let rawText = "";
+  const handleFrame = (frame) => {
+    const event = frameToResponsesEvent(frame);
+    if (!event) return;
+    sawSse = true;
+    bufferedAccumulatorProcessEvent(acc, event);
+    if (TERMINAL_RESPONSE_EVENTS.has(String(event.type))) terminal = event;
+  };
+  for (; ; ) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const text = decoder.decode(value, { stream: true });
+    if (!sawSse) rawText += text;
+    for (const frame of parser.push(text)) handleFrame(frame);
+  }
+  for (const frame of parser.flush()) handleFrame(frame);
+  if (!sawSse && !terminal) {
+    const parsed = safeJson(rawText);
+    if (isObject(parsed) && (parsed.output !== void 0 || parsed.object === "response")) {
+      return { body: responsesToChatCompletion(parsed, model), status: 200 };
+    }
+    return { body: chatErrorBody("Upstream returned an unparseable response"), status: 502 };
+  }
+  if (!terminal) {
+    return { body: chatErrorBody("Upstream stream ended without a terminal response event"), status: 502 };
+  }
+  if (String(terminal.type) === "response.failed") {
+    const message = terminal.response?.error?.message || "Upstream response failed";
+    return { body: chatErrorBody(message), status: 502 };
+  }
+  const response = isObject(terminal.response) ? terminal.response : {};
+  bufferedAccumulatorSupplementResponseOutput(acc, response);
+  return { body: responsesToChatCompletion(response, model), status: 200 };
+}
+function safeJson(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
 
 // functions/src/pricing.ts
 var TOKENS_PER_UNIT = 1e6;
@@ -1630,7 +2625,7 @@ async function handleGatewayRequest(request, env, failover, ctx) {
     if (accounts.length === 0) {
       return new Response(JSON.stringify({
         error: "No available accounts",
-        message: "\u8BE5 API \u5BC6\u94A5\u7ED1\u5B9A\u7684\u4E3B\u5206\u7EC4\u548C\u515C\u5E95\u5206\u7EC4\u4E0B\u6CA1\u6709\u53EF\u7528\u8D26\u53F7"
+        message: "\uFFFD\uFFFD?API \u5BC6\u94A5\u7ED1\u5B9A\u7684\u4E3B\u5206\u7EC4\u548C\u515C\u5E95\u5206\u7EC4\u4E0B\u6CA1\u6709\u53EF\u7528\u8D26\u53F7"
       }), { status: 503, headers: { "Content-Type": "application/json" } });
     }
   }
@@ -1657,14 +2652,35 @@ async function handleGatewayRequest(request, env, failover, ctx) {
     if (!upstreamPath.includes("/chat/completions")) {
       upstreamPath = "/v1/chat/completions";
     }
+  } else if (provider === "opencode_go") {
+    if (!upstreamPath.includes("/v1/messages") && !upstreamPath.includes("/chat/completions") && !upstreamPath.includes("/responses")) {
+      upstreamPath = "/v1/chat/completions";
+    }
+  }
+  let bridgedBody;
+  if (provider === "opencode_go" && request.method !== "GET" && request.method !== "HEAD" && !upstreamPath.includes("/responses") && !upstreamPath.includes("/v1/messages") && openCodeGoModelProtocol(upstreamModel) === "responses") {
+    if (upstreamModel && upstreamModel !== model && requestBody.model) {
+      requestBody.model = upstreamModel;
+    }
+    try {
+      bridgedBody = JSON.stringify(chatCompletionsToResponses(requestBody));
+      upstreamPath = "/v1/responses";
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "request cannot be converted to the Responses API";
+      return new Response(JSON.stringify({ error: { message, type: "invalid_request_error", param: null, code: null } }), { status: 400, headers: { "Content-Type": "application/json" } });
+    }
   }
   const upstreamUrl = new URL(`${baseUrl}${upstreamPath}`);
   if (provider === "anthropic") upstreamUrl.searchParams.set("beta", "true");
   const headers = buildUpstreamHeaders(request.headers, provider, credentials.apiKey, credentials.baseUrl, account.client_spoofing);
+  if (provider === "opencode_go") {
+    applyOpenCodeHeaders(headers, { clientHeaders: request.headers, body: requestBody, allowGenerate: true });
+  }
   if (upstreamModel && upstreamModel !== model && requestBody.model) {
     requestBody.model = upstreamModel;
   }
-  const upstreamBody = request.method === "GET" || request.method === "HEAD" ? void 0 : upstreamModel !== model ? JSON.stringify(requestBody) : body;
+  const chatBody = request.method === "GET" || request.method === "HEAD" ? void 0 : upstreamModel !== model ? JSON.stringify(requestBody) : body;
+  const upstreamBody = bridgedBody !== void 0 ? bridgedBody : chatBody;
   const startTime = Date.now();
   let isError = false;
   let errorMessage = "";
@@ -1687,9 +2703,30 @@ async function handleGatewayRequest(request, env, failover, ctx) {
       await proxyResponse.text().catch(() => "");
       failover.recordRequest(account.id, group.id, true);
       defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: responseStatus, error_message: `Upstream returned ${responseStatus}`, latency_ms: Date.now() - startTime }));
-      return handleFailover(upstreamBody, request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, `Upstream returned ${responseStatus}`, preferredGroupId, startTime, ctx, fallbackGroupId);
+      return handleFailover(chatBody, request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, model, `Upstream returned ${responseStatus}`, preferredGroupId, startTime, ctx, fallbackGroupId);
     }
-    if (stream && proxyResponse.body) {
+    let finalBody;
+    if (bridgedBody !== void 0 && !isError) {
+      if (stream && proxyResponse.body) {
+        return streamWithRecording(responsesSseToChatStream(proxyResponse.body, model), proxyResponse.status, stripBodyHeaders(proxyResponse.headers), {
+          db,
+          failover,
+          keyRecordId: keyRecord.id,
+          accountId: account.id,
+          groupId: group.id,
+          provider,
+          model: upstreamModel,
+          rateMultiplier: accountRateMultiplier(account),
+          startedAt: startTime,
+          ctx
+        });
+      }
+      const buffered = await bufferResponsesSseAsChat(proxyResponse.body, model);
+      finalBody = buffered.body;
+      responseStatus = buffered.status;
+      isError = responseStatus >= 400;
+    }
+    if (stream && finalBody === void 0 && proxyResponse.body) {
       return streamWithRecording(proxyResponse.body, proxyResponse.status, proxyResponse.headers, {
         db,
         failover,
@@ -1703,11 +2740,17 @@ async function handleGatewayRequest(request, env, failover, ctx) {
         ctx
       });
     }
-    const responseText = await proxyResponse.text();
+    let responseText;
     let responseBody = {};
-    try {
-      responseBody = JSON.parse(responseText);
-    } catch {
+    if (finalBody !== void 0) {
+      responseText = JSON.stringify(finalBody);
+      responseBody = finalBody;
+    } else {
+      responseText = await proxyResponse.text();
+      try {
+        responseBody = JSON.parse(responseText);
+      } catch {
+      }
     }
     const { promptTokens, completionTokens, totalTokens } = extractTokenUsage(responseBody, proxyResponse.headers);
     const breakdown = calculateCostBreakdown(provider, upstreamModel, promptTokens, completionTokens, accountRateMultiplier(account));
@@ -1726,9 +2769,11 @@ async function handleGatewayRequest(request, env, failover, ctx) {
     }));
     failover.recordRequest(account.id, group.id, isError);
     return new Response(responseText, {
-      status: proxyResponse.status,
+      status: responseStatus,
       headers: {
-        ...proxyResponse.headers,
+        // The bridge re-serialized the body, so the upstream's framing headers
+        // describe bytes that are not being sent.
+        ...finalBody !== void 0 ? stripBodyHeaders(proxyResponse.headers) : proxyResponse.headers,
         "content-type": "application/json",
         "cache-control": "no-store, no-transform"
       }
@@ -1739,10 +2784,10 @@ async function handleGatewayRequest(request, env, failover, ctx) {
     responseStatus = 502;
     failover.recordRequest(account.id, group.id, true);
     defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: errorMessage, latency_ms: Date.now() - startTime }));
-    return handleFailover(upstreamBody, request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, errorMessage, preferredGroupId, startTime, ctx, fallbackGroupId);
+    return handleFailover(chatBody, request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, model, errorMessage, preferredGroupId, startTime, ctx, fallbackGroupId);
   }
 }
-async function handleFailover(body, request, env, failover, keyRecord, accounts, groups, mappings, provider, upstreamModel, stream, errorMessage, preferredGroupId, originStart = Date.now(), ctx, fallbackGroupId = 0) {
+async function handleFailover(body, request, env, failover, keyRecord, accounts, groups, mappings, provider, upstreamModel, stream, clientModel, errorMessage, preferredGroupId, originStart = Date.now(), ctx, fallbackGroupId = 0) {
   const db = createDatabase(env.DB);
   const attempted = /* @__PURE__ */ new Set();
   const maxRetries = Math.min(Math.max(Number(env.MAX_SAME_ACCOUNT_RETRIES) || 3, 1), 5);
@@ -1754,6 +2799,12 @@ async function handleFailover(body, request, env, failover, keyRecord, accounts,
     }
     const { account, group } = selection;
     attempted.add(account.id);
+    let retryBody;
+    try {
+      retryBody = body ? JSON.parse(body) : void 0;
+    } catch {
+      retryBody = void 0;
+    }
     try {
       const credentials = resolveUpstreamCredentials(account);
       const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, provider);
@@ -1763,17 +2814,34 @@ async function handleFailover(body, request, env, failover, keyRecord, accounts,
         upstreamPath = "/v1/messages";
       } else if (provider === "xai" && !upstreamPath.includes("/chat/completions")) {
         upstreamPath = "/v1/chat/completions";
+      } else if (provider === "opencode_go" && !upstreamPath.includes("/v1/messages") && !upstreamPath.includes("/chat/completions") && !upstreamPath.includes("/responses")) {
+        upstreamPath = "/v1/chat/completions";
+      }
+      let retrySendBody = body;
+      let retryBridged = false;
+      if (provider === "opencode_go" && body !== void 0 && retryBody && !upstreamPath.includes("/responses") && !upstreamPath.includes("/v1/messages") && openCodeGoModelProtocol(String(retryBody?.model || upstreamModel)) === "responses") {
+        try {
+          retrySendBody = JSON.stringify(chatCompletionsToResponses(retryBody));
+          upstreamPath = "/v1/responses";
+          retryBridged = true;
+        } catch {
+          retrySendBody = body;
+        }
       }
       const retryUrl = new URL(`${baseUrl}${upstreamPath}`);
       if (provider === "anthropic") retryUrl.searchParams.set("beta", "true");
       const headers = buildUpstreamHeaders(request.headers, provider, credentials.apiKey, credentials.baseUrl, account.client_spoofing);
+      if (provider === "opencode_go") {
+        applyOpenCodeHeaders(headers, { clientHeaders: request.headers, body: retryBody, allowGenerate: true });
+      }
+      const sendBody = retrySendBody;
       const proxyResponse = await proxyRequest({
         url: retryUrl.toString(),
         method: request.method,
         headers,
         body: new ReadableStream({
           start(controller) {
-            if (body !== void 0) controller.enqueue(new TextEncoder().encode(body));
+            if (sendBody !== void 0) controller.enqueue(new TextEncoder().encode(sendBody));
             controller.close();
           }
         })
@@ -1783,7 +2851,29 @@ async function handleFailover(body, request, env, failover, keyRecord, accounts,
         failover.recordRequest(account.id, group.id, true);
         continue;
       }
-      if (stream && !isError && proxyResponse.body) {
+      let finalStatus = proxyResponse.status;
+      let finalBody;
+      if (retryBridged && !isError) {
+        if (stream && proxyResponse.body) {
+          return streamWithRecording(responsesSseToChatStream(proxyResponse.body, clientModel), proxyResponse.status, stripBodyHeaders(proxyResponse.headers), {
+            db,
+            failover,
+            keyRecordId: keyRecord.id,
+            accountId: account.id,
+            groupId: group.id,
+            provider,
+            model: upstreamModel,
+            rateMultiplier: accountRateMultiplier(account),
+            startedAt: originStart,
+            ctx
+          });
+        }
+        const buffered = await bufferResponsesSseAsChat(proxyResponse.body, clientModel);
+        finalBody = buffered.body;
+        finalStatus = buffered.status;
+      }
+      const finalError = isError || finalStatus >= 400;
+      if (stream && !finalError && finalBody === void 0 && proxyResponse.body) {
         return streamWithRecording(proxyResponse.body, proxyResponse.status, proxyResponse.headers, {
           db,
           failover,
@@ -1797,19 +2887,23 @@ async function handleFailover(body, request, env, failover, keyRecord, accounts,
           ctx
         });
       }
-      failover.recordRequest(account.id, group.id, isError);
+      failover.recordRequest(account.id, group.id, finalError);
       defer(ctx, db.createRequestLog({
         account_id: account.id,
         group_id: group.id,
         model: upstreamModel,
-        status: proxyResponse.status,
-        error_message: isError ? "Upstream error" : "",
+        status: finalStatus,
+        error_message: finalError ? "Upstream error" : "",
         latency_ms: 0
       }));
-      const responseText = await proxyResponse.text();
+      const responseText = finalBody !== void 0 ? JSON.stringify(finalBody) : await proxyResponse.text();
       return new Response(responseText, {
-        status: proxyResponse.status,
-        headers: { ...proxyResponse.headers, "content-type": "application/json", "cache-control": "no-store, no-transform" }
+        status: finalStatus,
+        headers: {
+          ...finalBody !== void 0 ? stripBodyHeaders(proxyResponse.headers) : proxyResponse.headers,
+          "content-type": "application/json",
+          "cache-control": "no-store, no-transform"
+        }
       });
     } catch (retryError) {
       failover.recordRequest(account.id, group.id, true);
@@ -1871,7 +2965,7 @@ async function handleOpenAIRequest(request, env, failover, ctx) {
   }
   const routing = await loadRoutingSnapshot(db, failover);
   let accounts = routing.accounts;
-  accounts = accounts.filter((a) => (a.provider === "openai" || a.provider === "xai") && a.enabled);
+  accounts = accounts.filter((a) => (a.provider === "openai" || a.provider === "xai" || a.provider === "opencode_go") && a.enabled);
   const keyGroupId = Number(keyRecord?.group_id) || 0;
   const fallbackGroupId = Number(keyRecord?.fallback_group_id) || 0;
   if (keyGroupId) {
@@ -1879,7 +2973,7 @@ async function handleOpenAIRequest(request, env, failover, ctx) {
     if (accounts.length === 0) {
       return new Response(JSON.stringify({
         error: "No available accounts",
-        message: "\u8BE5 API \u5BC6\u94A5\u7ED1\u5B9A\u7684\u4E3B\u5206\u7EC4\u548C\u515C\u5E95\u5206\u7EC4\u4E0B\u6CA1\u6709\u53EF\u7528\u8D26\u53F7"
+        message: "\uFFFD\uFFFD?API \u5BC6\u94A5\u7ED1\u5B9A\u7684\u4E3B\u5206\u7EC4\u548C\u515C\u5E95\u5206\u7EC4\u4E0B\u6CA1\u6709\u53EF\u7528\u8D26\u53F7"
       }), { status: 503, headers: { "Content-Type": "application/json" } });
     }
   }
@@ -1888,7 +2982,7 @@ async function handleOpenAIRequest(request, env, failover, ctx) {
   }
   const groups = new Map(routing.groups.map((g) => [g.id, g]));
   const mappings = routing.mappings;
-  const mapping = findModelMapping(model, mappings, "openai") || findModelMapping(model, mappings, "xai");
+  const mapping = findModelMapping(model, mappings, "openai") || findModelMapping(model, mappings, "xai") || findModelMapping(model, mappings, "opencode_go");
   const requestedProvider = mapping?.provider || (model.toLowerCase().startsWith("grok-") ? "xai" : void 0);
   if (requestedProvider) {
     accounts = accounts.filter((account2) => account2.provider === requestedProvider);
@@ -1907,10 +3001,314 @@ async function handleOpenAIRequest(request, env, failover, ctx) {
   }
   const { account, group } = selection;
   const provider = account.provider;
+  let bridged = false;
+  let outboundBody = requestBody;
+  if (!isResponses && provider === "opencode_go" && openCodeGoModelProtocol(upstreamModel) === "responses") {
+    try {
+      outboundBody = chatCompletionsToResponses(requestBody);
+      endpoint = "/v1/responses";
+      bridged = true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "request cannot be converted to the Responses API";
+      return new Response(JSON.stringify({ error: { message, type: "invalid_request_error", param: null, code: null } }), { status: 400, headers: { "Content-Type": "application/json" } });
+    }
+  }
   const credentials = resolveUpstreamCredentials(account);
   const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, provider);
   const upstreamUrl = `${baseUrl}${endpoint}`;
   const headers = buildUpstreamHeaders(request.headers, provider, credentials.apiKey, credentials.baseUrl, account.client_spoofing);
+  if (provider === "opencode_go") {
+    applyOpenCodeHeaders(headers, { clientHeaders: request.headers, body: requestBody, allowGenerate: true });
+  }
+  const startTime = Date.now();
+  try {
+    const proxyResponse = await proxyRequest({
+      url: upstreamUrl,
+      method: request.method,
+      headers,
+      body: new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(JSON.stringify(outboundBody)));
+          controller.close();
+        }
+      })
+    });
+    const isError = proxyResponse.status >= 400;
+    if (isError && failover.shouldFailover({ status: proxyResponse.status }) && accounts.length > 1) {
+      await proxyResponse.text().catch(() => "");
+      failover.recordRequest(account.id, group.id, true);
+      defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: proxyResponse.status, error_message: `Upstream returned ${proxyResponse.status}`, latency_ms: Date.now() - startTime }));
+      return handleFailover2(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, model, `Upstream returned ${proxyResponse.status}`, preferredGroupId, startTime, ctx, fallbackGroupId);
+    }
+    let finalStatus = proxyResponse.status;
+    let finalBody;
+    if (bridged && !isError) {
+      if (stream && proxyResponse.body) {
+        return streamWithRecording(responsesSseToChatStream(proxyResponse.body, model), proxyResponse.status, stripBodyHeaders(proxyResponse.headers), {
+          db,
+          failover,
+          keyRecordId: keyRecord.id,
+          accountId: account.id,
+          groupId: group.id,
+          provider,
+          model: upstreamModel,
+          rateMultiplier: accountRateMultiplier(account),
+          startedAt: startTime,
+          ctx
+        });
+      }
+      const buffered = await bufferResponsesSseAsChat(proxyResponse.body, model);
+      finalBody = buffered.body;
+      finalStatus = buffered.status;
+    }
+    if (stream && finalBody === void 0 && proxyResponse.body) {
+      return streamWithRecording(proxyResponse.body, proxyResponse.status, proxyResponse.headers, {
+        db,
+        failover,
+        keyRecordId: keyRecord.id,
+        accountId: account.id,
+        groupId: group.id,
+        provider,
+        model: upstreamModel,
+        rateMultiplier: accountRateMultiplier(account),
+        startedAt: startTime,
+        ctx
+      });
+    }
+    let responseText;
+    let responseBody = {};
+    if (finalBody !== void 0) {
+      responseText = JSON.stringify(finalBody);
+      responseBody = finalBody;
+    } else {
+      responseText = await proxyResponse.text();
+      try {
+        responseBody = JSON.parse(responseText);
+      } catch {
+      }
+    }
+    const finalError = finalStatus >= 400;
+    const { promptTokens, completionTokens, totalTokens } = extractTokenUsage(responseBody, proxyResponse.headers);
+    const breakdown = calculateCostBreakdown(provider, upstreamModel, promptTokens, completionTokens, accountRateMultiplier(account));
+    const cost = breakdown.cost;
+    if (cost > 0) {
+      defer(ctx, db.incrementApiKeyUsage(keyRecord.id, cost));
+    }
+    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cost, base_cost: breakdown.baseCost, rate_multiplier: breakdown.multiplier, cost_estimated: breakdown.estimated ? 1 : 0, cache_status: "bypass", status: finalStatus, error_message: finalError ? responseBody?.error?.message || "Error" : "", latency_ms: Date.now() - startTime }));
+    defer(ctx, db.createRequestLog({
+      account_id: account.id,
+      group_id: group.id,
+      model: upstreamModel,
+      status: finalStatus,
+      error_message: finalError ? responseBody?.error?.message || "Error" : "",
+      latency_ms: Date.now() - startTime
+    }));
+    failover.recordRequest(account.id, group.id, finalError);
+    return new Response(responseText, {
+      status: finalStatus,
+      headers: {
+        // The bridge re-serialized the body, so the upstream's framing headers
+        // describe bytes that are not being sent.
+        ...finalBody !== void 0 ? stripBodyHeaders(proxyResponse.headers) : proxyResponse.headers,
+        "content-type": "application/json",
+        "cache-control": "no-store, no-transform"
+      }
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : "Unknown error";
+    failover.recordRequest(account.id, group.id, true);
+    defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: errorMessage, latency_ms: Date.now() - startTime }));
+    return handleFailover2(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, model, errorMessage, preferredGroupId, startTime, ctx, fallbackGroupId);
+  }
+}
+async function handleFailover2(body, request, env, failover, keyRecord, accounts, groups, mappings, provider, upstreamModel, stream, clientModel, errorMessage, preferredGroupId, originStart = Date.now(), ctx, fallbackGroupId = 0) {
+  const db = createDatabase(env.DB);
+  const url = new URL(request.url);
+  const isResponses = url.pathname.includes("/responses");
+  let endpoint = "/v1/chat/completions";
+  if (isResponses) endpoint = "/v1/responses";
+  const attempted = /* @__PURE__ */ new Set();
+  const maxRetries = Math.min(Math.max(Number(env.MAX_SAME_ACCOUNT_RETRIES) || 3, 1), 5);
+  for (let i = 0; i < maxRetries; i++) {
+    const nextAccounts = accounts.filter((a) => a.enabled && !attempted.has(a.id));
+    const selection = await failover.selectAccount(nextAccounts, groups, preferredGroupId, fallbackGroupId ? [fallbackGroupId] : []);
+    if (!selection) break;
+    const { account, group } = selection;
+    attempted.add(account.id);
+    const currentProvider = account.provider;
+    let retryBody;
+    try {
+      retryBody = JSON.parse(body);
+    } catch {
+      retryBody = void 0;
+    }
+    try {
+      const credentials = resolveUpstreamCredentials(account);
+      const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, currentProvider);
+      let retryEndpoint = endpoint;
+      let retrySendBody = body;
+      let retryBridged = false;
+      if (!isResponses && currentProvider === "opencode_go" && retryBody && openCodeGoModelProtocol(String(retryBody.model || upstreamModel)) === "responses") {
+        try {
+          retrySendBody = JSON.stringify(chatCompletionsToResponses(retryBody));
+          retryEndpoint = "/v1/responses";
+          retryBridged = true;
+        } catch {
+          retrySendBody = body;
+          retryEndpoint = endpoint;
+        }
+      }
+      const upstreamUrl = `${baseUrl}${retryEndpoint}`;
+      const headers = buildUpstreamHeaders(request.headers, currentProvider, credentials.apiKey, credentials.baseUrl, account.client_spoofing);
+      if (currentProvider === "opencode_go") {
+        applyOpenCodeHeaders(headers, { clientHeaders: request.headers, body: retryBody, allowGenerate: true });
+      }
+      const sendBody = retrySendBody;
+      const proxyResponse = await proxyRequest({
+        url: upstreamUrl,
+        method: request.method,
+        headers,
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(sendBody));
+            controller.close();
+          }
+        })
+      });
+      const isError = proxyResponse.status >= 400;
+      if (isError && failover.shouldFailover({ status: proxyResponse.status }) && i < maxRetries - 1) {
+        failover.recordRequest(account.id, group.id, true);
+        continue;
+      }
+      let finalStatus = proxyResponse.status;
+      let finalBody;
+      if (retryBridged && !isError) {
+        if (stream && proxyResponse.body) {
+          return streamWithRecording(responsesSseToChatStream(proxyResponse.body, clientModel), proxyResponse.status, stripBodyHeaders(proxyResponse.headers), {
+            db,
+            failover,
+            keyRecordId: keyRecord.id,
+            accountId: account.id,
+            groupId: group.id,
+            provider: currentProvider,
+            model: upstreamModel,
+            rateMultiplier: accountRateMultiplier(account),
+            startedAt: originStart,
+            ctx
+          });
+        }
+        const buffered = await bufferResponsesSseAsChat(proxyResponse.body, clientModel);
+        finalBody = buffered.body;
+        finalStatus = buffered.status;
+      }
+      const finalError = isError || finalStatus >= 400;
+      if (stream && !finalError && finalBody === void 0 && proxyResponse.body) {
+        return streamWithRecording(proxyResponse.body, proxyResponse.status, proxyResponse.headers, {
+          db,
+          failover,
+          keyRecordId: keyRecord.id,
+          accountId: account.id,
+          groupId: group.id,
+          provider: currentProvider,
+          model: upstreamModel,
+          rateMultiplier: accountRateMultiplier(account),
+          startedAt: originStart,
+          ctx
+        });
+      }
+      failover.recordRequest(account.id, group.id, finalError);
+      defer(ctx, db.createRequestLog({
+        account_id: account.id,
+        group_id: group.id,
+        model: upstreamModel,
+        status: finalStatus,
+        error_message: finalError ? errorMessage : "",
+        latency_ms: 0
+      }));
+      const responseText = finalBody !== void 0 ? JSON.stringify(finalBody) : await proxyResponse.text();
+      return new Response(responseText, {
+        status: finalStatus,
+        headers: {
+          ...finalBody !== void 0 ? stripBodyHeaders(proxyResponse.headers) : proxyResponse.headers,
+          "content-type": "application/json",
+          "cache-control": "no-store, no-transform"
+        }
+      });
+    } catch (retryError) {
+      failover.recordRequest(account.id, group.id, true);
+      defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: retryError instanceof Error ? retryError.message : "Upstream request failed", latency_ms: 0 }));
+      continue;
+    }
+  }
+  return new Response(JSON.stringify({ error: "All accounts failed", message: errorMessage }), { status: 502, headers: { "Content-Type": "application/json" } });
+}
+
+// functions/src/routes/claude.ts
+async function handleClaudeRequest(request, env, failover, ctx) {
+  const db = createDatabase(env.DB);
+  const url = new URL(request.url);
+  const authHeader = request.headers.get("authorization");
+  const apiKey = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : request.headers.get("x-api-key");
+  if (!apiKey) {
+    return new Response(JSON.stringify({ error: "Missing API key" }), { status: 401, headers: { "Content-Type": "application/json" } });
+  }
+  const keyRecord = await authenticateApiKey(db, apiKey);
+  if (!keyRecord) {
+    return new Response(JSON.stringify({ error: "Invalid or disabled API key" }), { status: 401, headers: { "Content-Type": "application/json" } });
+  }
+  const body = await request.text();
+  let requestBody;
+  try {
+    requestBody = JSON.parse(body);
+  } catch {
+    return new Response(JSON.stringify({ error: "Invalid JSON body" }), { status: 400, headers: { "Content-Type": "application/json" } });
+  }
+  const model = requestBody.model || getModelFromHeader(request) || "";
+  const stream = requestBody.stream === true;
+  const routing = await loadRoutingSnapshot(db, failover);
+  let accounts = routing.accounts;
+  accounts = accounts.filter((a) => (a.provider === "anthropic" || a.provider === "opencode_go") && a.enabled);
+  const keyGroupId = Number(keyRecord?.group_id) || 0;
+  const fallbackGroupId = Number(keyRecord?.fallback_group_id) || 0;
+  if (keyGroupId) {
+    accounts = accounts.filter((account2) => Number(account2.group_id) === keyGroupId || Number(account2.group_id) === fallbackGroupId);
+    if (accounts.length === 0) {
+      return new Response(JSON.stringify({
+        error: "No available accounts",
+        message: "\u8BE5 API \u5BC6\u94A5\u7ED1\u5B9A\u7684\u4E3B\u5206\u7EC4\u548C\u515C\u5E95\u5206\u7EC4\u4E0B\u6CA1\u6709\u53EF\u7528\u8D26\u53F7"
+      }), { status: 503, headers: { "Content-Type": "application/json" } });
+    }
+  }
+  if (accounts.length === 0) {
+    return new Response(JSON.stringify({ error: "No available Anthropic-compatible accounts" }), { status: 503, headers: { "Content-Type": "application/json" } });
+  }
+  const groups = new Map(routing.groups.map((g) => [g.id, g]));
+  const mappings = routing.mappings;
+  const mapping = findModelMapping(model, mappings, "anthropic") || findModelMapping(model, mappings, "opencode_go");
+  if (mapping && (mapping.provider === "anthropic" || mapping.provider === "opencode_go")) {
+    accounts = accounts.filter((account2) => account2.provider === mapping.provider);
+  }
+  if (accounts.length === 0) {
+    return new Response(JSON.stringify({ error: "No available accounts for requested model" }), { status: 503, headers: { "Content-Type": "application/json" } });
+  }
+  let upstreamModel = mapping?.requested_model.endsWith("*") ? mapping.upstream_model + model.slice(mapping.requested_model.length - 1) : mapping?.upstream_model || model;
+  const preferredGroupId = keyGroupId || mapping?.group_id || void 0;
+  if (upstreamModel && upstreamModel !== model && requestBody.model) {
+    requestBody.model = upstreamModel;
+  }
+  const selection = await failover.selectAccount(accounts, groups, preferredGroupId, fallbackGroupId ? [fallbackGroupId] : []);
+  if (!selection) {
+    return new Response(JSON.stringify({ error: "No available accounts" }), { status: 503, headers: { "Content-Type": "application/json" } });
+  }
+  const { account, group } = selection;
+  const provider = account.provider;
+  const credentials = resolveUpstreamCredentials(account);
+  const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, provider);
+  const upstreamUrl = provider === "opencode_go" ? `${baseUrl}/v1/messages` : `${baseUrl}/v1/messages?beta=true`;
+  const headers = buildUpstreamHeaders(request.headers, provider, credentials.apiKey, credentials.baseUrl, account.client_spoofing);
+  if (provider === "opencode_go") {
+    applyOpenCodeHeaders(headers, { clientHeaders: request.headers, body: requestBody, allowGenerate: true });
+  }
   const startTime = Date.now();
   try {
     const proxyResponse = await proxyRequest({
@@ -1929,7 +3327,7 @@ async function handleOpenAIRequest(request, env, failover, ctx) {
       await proxyResponse.text().catch(() => "");
       failover.recordRequest(account.id, group.id, true);
       defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: proxyResponse.status, error_message: `Upstream returned ${proxyResponse.status}`, latency_ms: Date.now() - startTime }));
-      return handleFailover2(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, `Upstream returned ${proxyResponse.status}`, preferredGroupId, startTime, ctx, fallbackGroupId);
+      return handleClaudeFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, upstreamModel, stream, `Upstream returned ${proxyResponse.status}`, preferredGroupId, startTime, ctx, fallbackGroupId);
     }
     if (stream && proxyResponse.body) {
       return streamWithRecording(proxyResponse.body, proxyResponse.status, proxyResponse.headers, {
@@ -1979,15 +3377,11 @@ async function handleOpenAIRequest(request, env, failover, ctx) {
     const errorMessage = error instanceof Error ? error.message : "Unknown error";
     failover.recordRequest(account.id, group.id, true);
     defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: errorMessage, latency_ms: Date.now() - startTime }));
-    return handleFailover2(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, errorMessage, preferredGroupId, startTime, ctx, fallbackGroupId);
+    return handleClaudeFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, upstreamModel, stream, errorMessage, preferredGroupId, startTime, ctx, fallbackGroupId);
   }
 }
-async function handleFailover2(body, request, env, failover, keyRecord, accounts, groups, mappings, provider, upstreamModel, stream, errorMessage, preferredGroupId, originStart = Date.now(), ctx, fallbackGroupId = 0) {
+async function handleClaudeFailover(body, request, env, failover, keyRecord, accounts, groups, mappings, upstreamModel, stream, errorMessage, preferredGroupId, originStart = Date.now(), ctx, fallbackGroupId = 0) {
   const db = createDatabase(env.DB);
-  const url = new URL(request.url);
-  const isResponses = url.pathname.includes("/responses");
-  let endpoint = "/v1/chat/completions";
-  if (isResponses) endpoint = "/v1/responses";
   const attempted = /* @__PURE__ */ new Set();
   const maxRetries = Math.min(Math.max(Number(env.MAX_SAME_ACCOUNT_RETRIES) || 3, 1), 5);
   for (let i = 0; i < maxRetries; i++) {
@@ -1997,11 +3391,20 @@ async function handleFailover2(body, request, env, failover, keyRecord, accounts
     const { account, group } = selection;
     attempted.add(account.id);
     const currentProvider = account.provider;
+    let retryBody;
+    try {
+      retryBody = JSON.parse(body);
+    } catch {
+      retryBody = void 0;
+    }
     try {
       const credentials = resolveUpstreamCredentials(account);
       const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, currentProvider);
-      const upstreamUrl = `${baseUrl}${endpoint}`;
+      const upstreamUrl = currentProvider === "opencode_go" ? `${baseUrl}/v1/messages` : `${baseUrl}/v1/messages?beta=true`;
       const headers = buildUpstreamHeaders(request.headers, currentProvider, credentials.apiKey, credentials.baseUrl, account.client_spoofing);
+      if (currentProvider === "opencode_go") {
+        applyOpenCodeHeaders(headers, { clientHeaders: request.headers, body: retryBody, allowGenerate: true });
+      }
       const proxyResponse = await proxyRequest({
         url: upstreamUrl,
         method: request.method,
@@ -2026,201 +3429,6 @@ async function handleFailover2(body, request, env, failover, keyRecord, accounts
           accountId: account.id,
           groupId: group.id,
           provider: currentProvider,
-          model: upstreamModel,
-          rateMultiplier: accountRateMultiplier(account),
-          startedAt: originStart,
-          ctx
-        });
-      }
-      failover.recordRequest(account.id, group.id, isError);
-      defer(ctx, db.createRequestLog({
-        account_id: account.id,
-        group_id: group.id,
-        model: upstreamModel,
-        status: proxyResponse.status,
-        error_message: isError ? errorMessage : "",
-        latency_ms: 0
-      }));
-      const responseText = await proxyResponse.text();
-      return new Response(responseText, {
-        status: proxyResponse.status,
-        headers: { ...proxyResponse.headers, "content-type": "application/json", "cache-control": "no-store, no-transform" }
-      });
-    } catch (retryError) {
-      failover.recordRequest(account.id, group.id, true);
-      defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: retryError instanceof Error ? retryError.message : "Upstream request failed", latency_ms: 0 }));
-      continue;
-    }
-  }
-  return new Response(JSON.stringify({ error: "All accounts failed", message: errorMessage }), { status: 502, headers: { "Content-Type": "application/json" } });
-}
-
-// functions/src/routes/claude.ts
-async function handleClaudeRequest(request, env, failover, ctx) {
-  const db = createDatabase(env.DB);
-  const url = new URL(request.url);
-  const authHeader = request.headers.get("authorization");
-  const apiKey = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : request.headers.get("x-api-key");
-  if (!apiKey) {
-    return new Response(JSON.stringify({ error: "Missing API key" }), { status: 401, headers: { "Content-Type": "application/json" } });
-  }
-  const keyRecord = await authenticateApiKey(db, apiKey);
-  if (!keyRecord) {
-    return new Response(JSON.stringify({ error: "Invalid or disabled API key" }), { status: 401, headers: { "Content-Type": "application/json" } });
-  }
-  const body = await request.text();
-  let requestBody;
-  try {
-    requestBody = JSON.parse(body);
-  } catch {
-    return new Response(JSON.stringify({ error: "Invalid JSON body" }), { status: 400, headers: { "Content-Type": "application/json" } });
-  }
-  const model = requestBody.model || getModelFromHeader(request) || "";
-  const stream = requestBody.stream === true;
-  const routing = await loadRoutingSnapshot(db, failover);
-  let accounts = routing.accounts;
-  accounts = accounts.filter((a) => a.provider === "anthropic" && a.enabled);
-  const keyGroupId = Number(keyRecord?.group_id) || 0;
-  const fallbackGroupId = Number(keyRecord?.fallback_group_id) || 0;
-  if (keyGroupId) {
-    accounts = accounts.filter((account2) => Number(account2.group_id) === keyGroupId || Number(account2.group_id) === fallbackGroupId);
-    if (accounts.length === 0) {
-      return new Response(JSON.stringify({
-        error: "No available accounts",
-        message: "\u8BE5 API \u5BC6\u94A5\u7ED1\u5B9A\u7684\u4E3B\u5206\u7EC4\u548C\u515C\u5E95\u5206\u7EC4\u4E0B\u6CA1\u6709\u53EF\u7528\u8D26\u53F7"
-      }), { status: 503, headers: { "Content-Type": "application/json" } });
-    }
-  }
-  if (accounts.length === 0) {
-    return new Response(JSON.stringify({ error: "No available Anthropic accounts" }), { status: 503, headers: { "Content-Type": "application/json" } });
-  }
-  const groups = new Map(routing.groups.map((g) => [g.id, g]));
-  const mappings = routing.mappings;
-  const mapping = findModelMapping(model, mappings, "anthropic");
-  let upstreamModel = mapping?.requested_model.endsWith("*") ? mapping.upstream_model + model.slice(mapping.requested_model.length - 1) : mapping?.upstream_model || model;
-  const preferredGroupId = keyGroupId || mapping?.group_id || void 0;
-  if (upstreamModel && upstreamModel !== model && requestBody.model) {
-    requestBody.model = upstreamModel;
-  }
-  const selection = await failover.selectAccount(accounts, groups, preferredGroupId, fallbackGroupId ? [fallbackGroupId] : []);
-  if (!selection) {
-    return new Response(JSON.stringify({ error: "No available accounts" }), { status: 503, headers: { "Content-Type": "application/json" } });
-  }
-  const { account, group } = selection;
-  const credentials = resolveUpstreamCredentials(account);
-  const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, "anthropic");
-  const upstreamUrl = `${baseUrl}/v1/messages?beta=true`;
-  const headers = buildUpstreamHeaders(request.headers, "anthropic", credentials.apiKey, credentials.baseUrl, account.client_spoofing);
-  const startTime = Date.now();
-  try {
-    const proxyResponse = await proxyRequest({
-      url: upstreamUrl,
-      method: request.method,
-      headers,
-      body: new ReadableStream({
-        start(controller) {
-          controller.enqueue(new TextEncoder().encode(typeof requestBody === "string" ? requestBody : JSON.stringify(requestBody)));
-          controller.close();
-        }
-      })
-    });
-    const isError = proxyResponse.status >= 400;
-    if (isError && failover.shouldFailover({ status: proxyResponse.status }) && accounts.length > 1) {
-      await proxyResponse.text().catch(() => "");
-      failover.recordRequest(account.id, group.id, true);
-      defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: proxyResponse.status, error_message: `Upstream returned ${proxyResponse.status}`, latency_ms: Date.now() - startTime }));
-      return handleClaudeFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, upstreamModel, stream, `Upstream returned ${proxyResponse.status}`, preferredGroupId, startTime, ctx, fallbackGroupId);
-    }
-    if (stream && proxyResponse.body) {
-      return streamWithRecording(proxyResponse.body, proxyResponse.status, proxyResponse.headers, {
-        db,
-        failover,
-        keyRecordId: keyRecord.id,
-        accountId: account.id,
-        groupId: group.id,
-        provider: "anthropic",
-        model: upstreamModel,
-        rateMultiplier: accountRateMultiplier(account),
-        startedAt: startTime,
-        ctx
-      });
-    }
-    const responseText = await proxyResponse.text();
-    let responseBody = {};
-    try {
-      responseBody = JSON.parse(responseText);
-    } catch {
-    }
-    const { promptTokens, completionTokens, totalTokens } = extractTokenUsage(responseBody, proxyResponse.headers);
-    const breakdown = calculateCostBreakdown("anthropic", upstreamModel, promptTokens, completionTokens, accountRateMultiplier(account));
-    const cost = breakdown.cost;
-    if (cost > 0) {
-      defer(ctx, db.incrementApiKeyUsage(keyRecord.id, cost));
-    }
-    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider: "anthropic", prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cost, base_cost: breakdown.baseCost, rate_multiplier: breakdown.multiplier, cost_estimated: breakdown.estimated ? 1 : 0, cache_status: "bypass", status: proxyResponse.status, error_message: isError ? responseBody?.error?.message || "Error" : "", latency_ms: Date.now() - startTime }));
-    defer(ctx, db.createRequestLog({
-      account_id: account.id,
-      group_id: group.id,
-      model: upstreamModel,
-      status: proxyResponse.status,
-      error_message: isError ? responseBody?.error?.message || "Error" : "",
-      latency_ms: Date.now() - startTime
-    }));
-    failover.recordRequest(account.id, group.id, isError);
-    return new Response(responseText, {
-      status: proxyResponse.status,
-      headers: {
-        ...proxyResponse.headers,
-        "content-type": "application/json",
-        "cache-control": "no-store, no-transform"
-      }
-    });
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : "Unknown error";
-    failover.recordRequest(account.id, group.id, true);
-    defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: errorMessage, latency_ms: Date.now() - startTime }));
-    return handleClaudeFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, upstreamModel, stream, errorMessage, preferredGroupId, startTime, ctx, fallbackGroupId);
-  }
-}
-async function handleClaudeFailover(body, request, env, failover, keyRecord, accounts, groups, mappings, upstreamModel, stream, errorMessage, preferredGroupId, originStart = Date.now(), ctx, fallbackGroupId = 0) {
-  const db = createDatabase(env.DB);
-  const attempted = /* @__PURE__ */ new Set();
-  const maxRetries = Math.min(Math.max(Number(env.MAX_SAME_ACCOUNT_RETRIES) || 3, 1), 5);
-  for (let i = 0; i < maxRetries; i++) {
-    const nextAccounts = accounts.filter((a) => a.enabled && !attempted.has(a.id));
-    const selection = await failover.selectAccount(nextAccounts, groups, preferredGroupId, fallbackGroupId ? [fallbackGroupId] : []);
-    if (!selection) break;
-    const { account, group } = selection;
-    attempted.add(account.id);
-    try {
-      const credentials = resolveUpstreamCredentials(account);
-      const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, "anthropic");
-      const upstreamUrl = `${baseUrl}/v1/messages?beta=true`;
-      const headers = buildUpstreamHeaders(request.headers, "anthropic", credentials.apiKey, credentials.baseUrl, account.client_spoofing);
-      const proxyResponse = await proxyRequest({
-        url: upstreamUrl,
-        method: request.method,
-        headers,
-        body: new ReadableStream({
-          start(controller) {
-            controller.enqueue(new TextEncoder().encode(body));
-            controller.close();
-          }
-        })
-      });
-      const isError = proxyResponse.status >= 400;
-      if (isError && failover.shouldFailover({ status: proxyResponse.status }) && i < maxRetries - 1) {
-        failover.recordRequest(account.id, group.id, true);
-        continue;
-      }
-      if (stream && !isError && proxyResponse.body) {
-        return streamWithRecording(proxyResponse.body, proxyResponse.status, proxyResponse.headers, {
-          db,
-          failover,
-          keyRecordId: keyRecord.id,
-          accountId: account.id,
-          groupId: group.id,
-          provider: "anthropic",
           model: upstreamModel,
           rateMultiplier: accountRateMultiplier(account),
           startedAt: originStart,
@@ -2367,20 +3575,9 @@ function readThresholds(body, partial = false) {
 }
 
 // functions/src/utils/provider.ts
-var PROVIDERS = ["openai", "anthropic", "xai"];
+var PROVIDERS = ["openai", "anthropic", "xai", "opencode_go"];
 function isProvider(value) {
   return typeof value === "string" && PROVIDERS.includes(value);
-}
-function getDefaultBaseUrl(provider) {
-  switch (provider) {
-    case "anthropic":
-      return "https://api.anthropic.com";
-    case "xai":
-      return "https://api.x.ai";
-    case "openai":
-    default:
-      return "https://api.openai.com";
-  }
 }
 function getProviderAuthHeaders(provider, apiKey) {
   if (provider === "anthropic") {
@@ -2394,6 +3591,11 @@ function getProbeModel(provider) {
       return "claude-opus-5";
     case "xai":
       return "grok-2-latest";
+    // glm-5.3 is Chat Completions native on Go, which is the same protocol the
+    // probe speaks, so a dead credential fails for being dead rather than for
+    // hitting a responses-only model.
+    case "opencode_go":
+      return "glm-5.3";
     case "openai":
     default:
       return "gpt-5.6-terra";
@@ -2401,6 +3603,13 @@ function getProbeModel(provider) {
 }
 
 // functions/src/utils/healthcheck.ts
+function withProtocol(models, provider) {
+  if (provider === "anthropic") return models.map((model) => ({ ...model, protocol: "anthropic" }));
+  if (provider === "opencode_go") {
+    return models.map((model) => ({ ...model, protocol: openCodeGoModelProtocol(model.id) }));
+  }
+  return models.map((model) => ({ ...model, protocol: "chat_completions" }));
+}
 var PROBE_TIMEOUT_MS = 15e3;
 var MODEL_CACHE_TTL_MS = 24 * 60 * 60 * 1e3;
 var PROBE_PROMPT = "1+1=?";
@@ -2429,22 +3638,24 @@ async function listUpstreamModels(db, accountId, refresh = false) {
   if (!account) throw new Error("\u8D26\u53F7\u4E0D\u5B58\u5728");
   const cached = readCachedModels(account);
   if (cached && !refresh && !isStale(cached.fetchedAt)) {
-    return { models: cached.models, cached: true, fetchedAt: cached.fetchedAt };
+    return { models: withProtocol(cached.models, account.provider), cached: true, fetchedAt: cached.fetchedAt };
   }
   const apiKey = String(account.api_key || "").trim();
   if (!apiKey) throw new Error("\u8D26\u53F7\u6CA1\u6709\u914D\u7F6E\u5BC6\u94A5");
-  const baseUrl = (String(account.base_url || "").trim() || getDefaultBaseUrl(account.provider)).replace(/\/+$/, "");
+  const baseUrl = getUpstreamBaseUrl(account.base_url, account.provider);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
   try {
+    const listHeaders = { ...getProviderAuthHeaders(account.provider, apiKey) };
+    if (account.provider === "opencode_go") applyOpenCodeProbeHeaders(listHeaders);
     const response = await fetch(`${baseUrl}/v1/models`, {
       method: "GET",
-      headers: getProviderAuthHeaders(account.provider, apiKey),
+      headers: listHeaders,
       signal: controller.signal
     });
     const raw = await response.text().catch(() => "");
     if (!response.ok) {
-      if (cached) return { models: cached.models, cached: true, fetchedAt: cached.fetchedAt };
+      if (cached) return { models: withProtocol(cached.models, account.provider), cached: true, fetchedAt: cached.fetchedAt };
       throw new Error(`\u83B7\u53D6\u6A21\u578B\u5931\u8D25\uFF08HTTP ${response.status}\uFF09`);
     }
     let payload = null;
@@ -2456,13 +3667,13 @@ async function listUpstreamModels(db, accountId, refresh = false) {
     const rows = Array.isArray(payload?.data) ? payload.data : Array.isArray(payload) ? payload : [];
     const models = rows.map((row) => ({ id: String(row.id || row.name || "").trim(), name: row.name ? String(row.name) : void 0 })).filter((row) => row.id).slice(0, 200);
     if (!models.length) {
-      if (cached) return { models: cached.models, cached: true, fetchedAt: cached.fetchedAt };
+      if (cached) return { models: withProtocol(cached.models, account.provider), cached: true, fetchedAt: cached.fetchedAt };
       throw new Error("\u4E0A\u6E38\u6CA1\u6709\u8FD4\u56DE\u53EF\u7528\u6A21\u578B");
     }
     await db.saveUpstreamModels(accountId, models).catch(() => {
     });
     const stored = await db.getAccount(accountId);
-    return { models, cached: false, fetchedAt: String(stored?.upstream_models_at || "") };
+    return { models: withProtocol(models, account.provider), cached: false, fetchedAt: String(stored?.upstream_models_at || "") };
   } finally {
     clearTimeout(timer);
   }
@@ -2496,27 +3707,34 @@ async function probeAccount(db, accountId, selectedModel) {
     await persist(db, result);
     return result;
   }
-  const baseUrl = (String(account.base_url || "").trim() || getDefaultBaseUrl(account.provider)).replace(/\/+$/, "");
+  const baseUrl = getUpstreamBaseUrl(account.base_url, account.provider);
   const isAnthropic = account.provider === "anthropic";
   const probeModel = resolveProbeModel(account, selectedModel);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
   const startedAt = Date.now();
-  const endpoint = isAnthropic ? `${baseUrl}/v1/messages` : `${baseUrl}/v1/chat/completions`;
-  const payload = {
+  const protocol = account.provider === "opencode_go" ? openCodeGoModelProtocol(probeModel) : isAnthropic ? "anthropic" : "chat_completions";
+  const endpoint = protocol === "anthropic" ? `${baseUrl}/v1/messages` : protocol === "responses" ? `${baseUrl}/v1/responses` : `${baseUrl}/v1/chat/completions`;
+  const chatPayload = {
     model: probeModel,
     max_tokens: PROBE_MAX_TOKENS,
     stream: true,
     messages: [{ role: "user", content: PROBE_PROMPT }]
   };
+  const payload = protocol === "responses" ? chatCompletionsToResponses(chatPayload) : protocol === "anthropic" ? { model: probeModel, max_tokens: PROBE_MAX_TOKENS, stream: true, messages: [{ role: "user", content: PROBE_PROMPT }] } : chatPayload;
+  const probeHeaders = {
+    ...getProviderAuthHeaders(account.provider, apiKey),
+    "content-type": "application/json",
+    accept: "text/event-stream"
+  };
+  if (protocol === "anthropic" && account.provider === "opencode_go") {
+    probeHeaders["anthropic-version"] = "2023-06-01";
+  }
+  if (account.provider === "opencode_go") applyOpenCodeProbeHeaders(probeHeaders);
   try {
     const response = await fetch(endpoint, {
       method: "POST",
-      headers: {
-        ...getProviderAuthHeaders(account.provider, apiKey),
-        "content-type": "application/json",
-        accept: "text/event-stream"
-      },
+      headers: probeHeaders,
       body: JSON.stringify(payload),
       signal: controller.signal
     });
@@ -2703,8 +3921,8 @@ async function handleAccountsRequest(request, env) {
     if (!name || !provider || !groupId) {
       return jsonError2("\u8BF7\u586B\u5199\u8D26\u53F7\u540D\u79F0\uFF0C\u5E76\u9009\u62E9\u670D\u52A1\u5546\u548C\u5206\u7EC4", 400);
     }
-    if (!["openai", "anthropic", "xai"].includes(provider)) {
-      return jsonError2("\u670D\u52A1\u5546\u5FC5\u987B\u662F openai\u3001anthropic \u6216 xai", 400);
+    if (!["openai", "anthropic", "xai", "opencode_go"].includes(provider)) {
+      return jsonError2("\u670D\u52A1\u5546\u5FC5\u987B\u662F openai\u3001anthropic\u3001xai \u6216 opencode_go", 400);
     }
     if (!await db.getGroup(groupId)) return jsonError2("\u6240\u9009\u5206\u7EC4\u4E0D\u5B58\u5728", 400);
     const baseUrl = normalizeBaseUrl(body.base_url);
@@ -2748,8 +3966,8 @@ async function handleAccountsRequest(request, env) {
       updates.name = name;
     }
     if (body.provider !== void 0) {
-      if (!["openai", "anthropic", "xai"].includes(String(body.provider))) {
-        return jsonError2("\u670D\u52A1\u5546\u5FC5\u987B\u662F openai\u3001anthropic \u6216 xai", 400);
+      if (!["openai", "anthropic", "xai", "opencode_go"].includes(String(body.provider))) {
+        return jsonError2("\u670D\u52A1\u5546\u5FC5\u987B\u662F openai\u3001anthropic\u3001xai \u6216 opencode_go", 400);
       }
       updates.provider = String(body.provider);
     }
@@ -2916,7 +4134,7 @@ async function handleModelsRequest(request, env) {
     const provider = String(body.provider || "").trim();
     const groupId = Number(body.group_id);
     if (!requestedModel || !upstreamModel) return jsonError3("\u8BF7\u586B\u5199\u5BA2\u6237\u7AEF\u6A21\u578B\u540D\u548C\u4E0A\u6E38\u6A21\u578B\u540D", 400);
-    if (!PROVIDERS2.includes(provider)) return jsonError3("\u670D\u52A1\u5546\u5FC5\u987B\u662F openai\u3001anthropic \u6216 xai", 400);
+    if (!PROVIDERS2.includes(provider)) return jsonError3("\u670D\u52A1\u5546\u5FC5\u987B\u662F openai\u3001anthropic\u3001xai \u6216 opencode_go", 400);
     if (!groupId) return jsonError3("\u8BF7\u9009\u62E9\u76EE\u6807\u5206\u7EC4", 400);
     if (!await db.getGroup(groupId)) return jsonError3("\u6240\u9009\u5206\u7EC4\u4E0D\u5B58\u5728", 400);
     if (requestedModel.includes("*") && !requestedModel.endsWith("*")) {
@@ -2963,7 +4181,7 @@ async function handleModelsRequest(request, env) {
     }
     if (body.provider !== void 0) {
       const provider = String(body.provider).trim();
-      if (!PROVIDERS2.includes(provider)) return jsonError3("\u670D\u52A1\u5546\u5FC5\u987B\u662F openai\u3001anthropic \u6216 xai", 400);
+      if (!PROVIDERS2.includes(provider)) return jsonError3("\u670D\u52A1\u5546\u5FC5\u987B\u662F openai\u3001anthropic\u3001xai \u6216 opencode_go", 400);
       updates.provider = provider;
     }
     if (body.group_id !== void 0) {
@@ -2990,7 +4208,7 @@ async function handleModelsRequest(request, env) {
   }
   return jsonError3("Method not allowed", 405);
 }
-var PROVIDERS2 = ["openai", "anthropic", "xai"];
+var PROVIDERS2 = ["openai", "anthropic", "xai", "opencode_go"];
 var JSON_HEADERS3 = { "Content-Type": "application/json" };
 function jsonData2(data, status = 200) {
   return new Response(JSON.stringify({ data }), { status, headers: JSON_HEADERS3 });
@@ -3465,10 +4683,31 @@ async function handleProviderModels(request, env) {
     return json({ error: "Invalid or disabled API key" }, 401);
   }
   const accounts = await db.listEnabledAccounts();
-  const mappings = await db.listModelMappings();
-  const ids = new Set(mappings.filter((m) => m.enabled).map((m) => m.requested_model));
-  accounts.forEach((account) => ids.add(account.provider === "anthropic" ? "claude-3-5-sonnet-20241022" : account.provider === "xai" ? "grok-2-latest" : "gpt-4o"));
-  return json({ object: "list", data: [...ids].map((id) => ({ id, object: "model", owned_by: "sub2api" })) });
+  const mappings = (await db.listModelMappings()).filter((m) => m.enabled);
+  const protocolFor = (provider, id) => provider === "opencode_go" ? openCodeGoModelProtocol(id) : provider === "anthropic" ? "anthropic" : "chat_completions";
+  const ids = [];
+  const protocolById = /* @__PURE__ */ new Map();
+  const note = (id, provider) => {
+    if (!id || protocolById.has(id)) return;
+    ids.push(id);
+    protocolById.set(id, protocolFor(provider, id));
+  };
+  mappings.forEach((m) => note(String(m.requested_model || ""), m.provider));
+  const catalogueAccounts = [
+    ...accounts.filter((a) => a.provider === "opencode_go"),
+    ...accounts.filter((a) => a.provider !== "opencode_go")
+  ];
+  catalogueAccounts.forEach((account) => {
+    for (const row of readCachedModels(account)?.models || []) note(row.id, account.provider);
+  });
+  accounts.forEach((account) => note(
+    account.provider === "anthropic" ? "claude-3-5-sonnet-20241022" : account.provider === "xai" ? "grok-2-latest" : account.provider === "opencode_go" ? "glm-5.3" : "gpt-4o",
+    account.provider
+  ));
+  return json({
+    object: "list",
+    data: ids.map((id) => ({ id, object: "model", owned_by: "sub2api", protocol: protocolById.get(id) }))
+  });
 }
 export {
   worker_default as default

@@ -9,7 +9,7 @@
  */
 
 const API_BASE = '/api/v1'
-const PROVIDERS = { openai: 'OpenAI', anthropic: 'Anthropic', xai: 'xAI' }
+const PROVIDERS = { openai: 'OpenAI', anthropic: 'Anthropic', xai: 'xAI', opencode_go: 'OpenCode Go' }
 const CHART_COLORS = ['#14b8a6', '#3b82f6', '#f59e0b', '#8b5cf6', '#ec4899', '#10b981', '#f97316', '#6366f1', '#84cc16', '#06b6d4', '#a855f7', '#ef4444']
 
 const state = {
@@ -265,7 +265,10 @@ function logout(notify = true) {
 async function detectSetupState() {
   try {
     const result = await api('/auth/setup', { method: 'GET' })
-    const needsSetup = result?.data?.needs_setup === true || result?.needs_setup === true
+    // The worker reports `setup_available` (no admin yet, or a legacy row setup
+    // may still claim). Reading a field it never sends left a fresh deployment
+    // showing the login form with no account to log in to.
+    const needsSetup = result?.data?.setup_available === true || result?.setup_available === true
     $('setup-form').classList.toggle('hidden', !needsSetup)
     $('login-form').classList.toggle('hidden', needsSetup)
     $('auth-title').textContent = needsSetup ? '初始化管理员' : '登录控制台'
@@ -1227,7 +1230,8 @@ function openAccountModal(account = null) {
 const PROBE_DEFAULTS = {
   openai: 'gpt-5.6-terra',
   anthropic: 'claude-opus-5',
-  xai: 'grok-2-latest'
+  xai: 'grok-2-latest',
+  opencode_go: 'glm-5.3'
 }
 
 function probeDefaultModel(provider) {
@@ -1237,11 +1241,15 @@ function probeDefaultModel(provider) {
 /**
  * Health-check dialog: confirm the model, then probe with it.
  *
- * The provider default is preselected and the dialog is usable immediately, so
- * fetching the upstream catalogue is optional and only needed when the default
- * is not on this account's plan. The result names the model it used, which is
- * what makes "key is dead" and "model unavailable" read differently.
+ * The provider default is preselected and the dialog is usable immediately.
+ * The full catalogue loads on open (cache-first, so a fresh list costs no
+ * upstream round trip) with each model labelled by its native message format;
+ * the button forces a live refresh for the case where upstream really changed.
+ * The result names the model it used, which is what makes "key is dead" and
+ * "model unavailable" read differently.
  */
+const PROTOCOL_LABELS = { chat_completions: 'chat', responses: 'responses', anthropic: 'anthropic' }
+
 function openAccountTestModal(account) {
   const fallback = probeDefaultModel(account.provider)
 
@@ -1255,7 +1263,7 @@ function openAccountTestModal(account) {
         <button class="btn btn-secondary" type="button" data-fetch-models>${icon('i-refresh', 'ico-sm')}<span>获取模型</span></button>
       </div>`, {
         id: 'f-test_model', full: true,
-        hint: `默认用 <code>${esc(fallback)}</code> 发送一条流式请求。该模型不在此账号可用范围时，点“获取模型”从上游拉取列表另选一个。`
+        hint: `默认用 <code>${esc(fallback)}</code> 发送一条流式请求。打开时自动加载该账号可用模型并标注上游消息格式（chat / responses / anthropic）；点“获取模型”强制刷新列表。`
       })}
       <div class="test-result" data-test-result></div>
     </div>`,
@@ -1273,18 +1281,24 @@ function openAccountTestModal(account) {
     resultNode.textContent = message
   }
 
-  fetchButton.addEventListener('click', async () => {
+  const loadCatalog = async (refresh) => {
     fetchButton.disabled = true
-    setResult('正在获取上游模型…', 'pending')
+    setResult(refresh ? '正在刷新上游模型…' : '正在加载模型列表…', 'pending')
     try {
-      // The list is cached on the account, so pressing this again after
-      // reopening the dialog does not repeat the upstream round trip.
-      const result = await api(`/accounts/${account.id}/models`)
+      // The list is cached on the account, so the auto-load on open does not
+      // repeat an upstream round trip while the cache is fresh.
+      const result = await api(`/accounts/${account.id}/models${refresh ? '?refresh=1' : ''}`)
       const data = result?.data || {}
       const models = data.models || []
       if (!models.length) throw new Error('上游没有返回可用模型')
+      const labelOf = (entry) => {
+        const tag = PROTOCOL_LABELS[entry.protocol]
+        return `${entry.id}`
+          + (entry.name && entry.name !== entry.id ? `（${entry.name}）` : '')
+          + (tag ? `（${tag} 格式）` : '')
+      }
       select.innerHTML = `<option value="">${esc(`默认模型（${fallback}）`)}</option>`
-        + models.map(entry => option(entry.id, entry.name && entry.name !== entry.id ? `${entry.id}（${entry.name}）` : entry.id)).join('')
+        + models.map(entry => option(entry.id, labelOf(entry))).join('')
       // Preselect the default when the upstream serves it, so the dropdown
       // agrees with what pressing 开始测试 would actually send.
       if (models.some(entry => entry.id === fallback)) select.value = fallback
@@ -1299,7 +1313,10 @@ function openAccountTestModal(account) {
     } finally {
       fetchButton.disabled = false
     }
-  })
+  }
+
+  fetchButton.addEventListener('click', () => loadCatalog(true))
+  loadCatalog(false)
 
   runButton.addEventListener('click', async () => {
     runButton.disabled = true

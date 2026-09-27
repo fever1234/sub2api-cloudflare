@@ -337,6 +337,228 @@ control(PORT_A, status=401)
 status, payload = call(f'/accounts/{account_ids["gw-a"]}/test', 'POST', token=token)
 check('account connection test reports failure', status == 200 and payload.get('success') is False, payload)
 
+# ------------------------------------------- chat -> responses bridge (opencode)
+# muse-spark only exists on /v1/responses upstream, but the client speaks
+# /v1/chat/completions: the gateway must convert the request, hit the
+# Responses endpoint, and convert the reply (and stream) back to chat shape.
+_, opencode_created = call('/accounts', 'POST', {
+    'name': 'gw-opencode-acct', 'provider': 'opencode_go', 'api_key': 'sk-opencode-acct',
+    'base_url': f'http://127.0.0.1:{PORT_C}',
+    'group_id': primary_id, 'priority': 0,
+}, token=token)
+opencode_acct_id = opencode_created.get('data', {}).get('id')
+# The mapping pins the model to the opencode_go provider so account selection
+# is deterministic regardless of the other accounts' error history.
+call('/models', 'POST', {
+    'requested_model': 'muse-spark-1.3', 'provider': 'opencode_go',
+    'upstream_model': 'muse-spark-1.3', 'group_id': primary_id,
+}, token=token)
+
+reset_upstreams()
+status, payload = call('/v1/chat/completions', 'POST',
+                       {'model': 'muse-spark-1.3', 'stream': False,
+                        'prompt_cache_key': 'sess-e2e-bridge',
+                        'messages': [{'role': 'user', 'content': 'hi'}]},
+                       token=client_key, base=BASE)
+check('bridged chat request returns 200', status == 200, (status, payload))
+check('bridged reply is a chat.completion', payload.get('object') == 'chat.completion', payload.get('object'))
+check('bridged reply keeps the client model', payload.get('model') == 'muse-spark-1.3', payload.get('model'))
+check('bridged reply content came back', payload.get('choices', [{}])[0].get('message', {}).get('content') == 'from-responses',
+      payload.get('choices'))
+check('bridged reply usage mapped from responses usage',
+      payload.get('usage', {}).get('prompt_tokens') == 7 and payload.get('usage', {}).get('completion_tokens') == 3,
+      payload.get('usage'))
+
+bridge_seen = requests_seen(PORT_C)
+bridge_seen = [r for r in bridge_seen if r.get('model') == 'muse-spark-1.3']
+check('upstream was called on /v1/responses',
+      bool(bridge_seen) and bridge_seen[-1]['path'].endswith('/v1/responses'),
+      bridge_seen[-1]['path'] if bridge_seen else None)
+check('request was converted to input (no messages)',
+      bool(bridge_seen) and bridge_seen[-1]['has_input'] and not bridge_seen[-1]['has_messages'],
+      bridge_seen[-1] if bridge_seen else None)
+check('upstream always streams (bridge buffers for the client)',
+      bool(bridge_seen) and bridge_seen[-1]['stream'] is True)
+check('opencode session header forwarded from prompt_cache_key',
+      bool(bridge_seen) and bridge_seen[-1]['x_opencode_session'] == 'sess-e2e-bridge',
+      bridge_seen[-1]['x_opencode_session'] if bridge_seen else None)
+check('opencode user agent applied',
+      bool(bridge_seen) and bridge_seen[-1]['user_agent'] == 'opencode/1.0.0',
+      bridge_seen[-1]['user_agent'] if bridge_seen else None)
+
+# Streaming client: responses SSE must be re-emitted as chat chunks + [DONE].
+reset_upstreams()
+request = urllib.request.Request(f'{BASE}/v1/chat/completions', method='POST',
+                                 data=json.dumps({'model': 'muse-spark-1.3', 'stream': True,
+                                                  'prompt_cache_key': 'sess-e2e-bridge',
+                                                  'messages': [{'role': 'user', 'content': 'hi'}]}).encode())
+request.add_header('content-type', 'application/json')
+request.add_header('authorization', f'Bearer {client_key}')
+with urllib.request.urlopen(request, timeout=30) as response:
+    content_type = response.headers.get('content-type', '')
+    bridge_stream = response.read().decode()
+check('bridged stream keeps SSE content type', 'text/event-stream' in content_type, content_type)
+check('bridged stream emits chat chunks', 'chat.completion.chunk' in bridge_stream, bridge_stream[:120])
+check('bridged stream forwards text delta', 'from-responses' in bridge_stream, bridge_stream[:400])
+check('bridged stream ends with [DONE]', bridge_stream.rstrip().endswith('data: [DONE]'), bridge_stream[-80:])
+check('bridged stream carries usage for billing', '"prompt_tokens":7' in bridge_stream, bridge_stream[-300:])
+
+status, payload = call('/usage?limit=200', token=token)
+bridge_usage = [r for r in payload.get('data', []) if r.get('model') == 'muse-spark-1.3']
+check('bridge calls are usage-recorded', len(bridge_usage) > 0, len(bridge_usage))
+check('bridge usage captured tokens', any((r.get('prompt_tokens') or 0) > 0 for r in bridge_usage), bridge_usage)
+
+# Agent-style tool call round trip: client sends tools + a forced (nested)
+# tool_choice, the stub replies with a function call, the client must get it
+# back as chat tool_calls with finish_reason=tool_calls.
+agent_tools = [{'type': 'function', 'function': {
+    'name': 'get_weather', 'description': 'd', 'parameters': {'type': 'object'}}}]
+reset_upstreams()
+status, payload = call('/v1/chat/completions', 'POST', {
+    'model': 'muse-spark-1.3', 'prompt_cache_key': 'sess-e2e-bridge',
+    'messages': [{'role': 'user', 'content': 'weather?'}],
+    'tools': agent_tools,
+    'tool_choice': {'type': 'function', 'function': {'name': 'get_weather'}},
+}, token=client_key, base=BASE)
+choice = (payload.get('choices') or [{}])[0]
+tool_calls = (choice.get('message') or {}).get('tool_calls') or []
+check('agent tool call round-trip (non-stream)',
+      status == 200 and choice.get('finish_reason') == 'tool_calls'
+      and tool_calls and tool_calls[0].get('function', {}).get('name') == 'get_weather',
+      (status, choice))
+check('agent tool call arguments survive the round trip',
+      bool(tool_calls) and tool_calls[0].get('function', {}).get('arguments') == '{"city":"SF"}',
+      tool_calls)
+agent_seen = [r for r in requests_seen(PORT_C) if r.get('model') == 'muse-spark-1.3']
+check('agent request reached upstream with tools',
+      bool(agent_seen) and agent_seen[-1].get('has_tools') is True,
+      agent_seen[-1] if agent_seen else None)
+check('nested tool_choice flattened before upstream',
+      bool(agent_seen) and agent_seen[-1].get('tool_choice') == {'type': 'function', 'name': 'get_weather'},
+      agent_seen[-1].get('tool_choice') if agent_seen else None)
+
+# Same round trip over SSE: announce + arg deltas + tool_calls finish chunk.
+reset_upstreams()
+request = urllib.request.Request(f'{BASE}/v1/chat/completions', method='POST',
+                                 data=json.dumps({'model': 'muse-spark-1.3', 'stream': True,
+                                                  'prompt_cache_key': 'sess-e2e-bridge',
+                                                  'messages': [{'role': 'user', 'content': 'weather?'}],
+                                                  'tools': agent_tools,
+                                                  'tool_choice': 'auto'}).encode())
+request.add_header('content-type', 'application/json')
+request.add_header('authorization', f'Bearer {client_key}')
+with urllib.request.urlopen(request, timeout=30) as response:
+    agent_stream = response.read().decode()
+# Reassemble the tool call the way an agent would: announce + arg fragments.
+tool_announced = False
+tool_args = ''
+finish = None
+for line in agent_stream.splitlines():
+    if not line.startswith('data: ') or line == 'data: [DONE]':
+        continue
+    evt = json.loads(line[len('data: '):])
+    if evt.get('object') != 'chat.completion.chunk':
+        continue
+    for chunk_choice in evt.get('choices') or []:
+        for tool_call in (chunk_choice.get('delta') or {}).get('tool_calls') or []:
+            fn = tool_call.get('function') or {}
+            if fn.get('name'):
+                tool_announced = True
+            tool_args += fn.get('arguments') or ''
+        if chunk_choice.get('finish_reason'):
+            finish = chunk_choice['finish_reason']
+check('agent stream announces the tool call', tool_announced, tool_announced)
+check('agent stream tool arguments reconstruct exactly', tool_args == '{"city":"SF"}', tool_args)
+check('agent stream finishes with tool_calls', finish == 'tool_calls', finish)
+check('agent stream ends with [DONE]', agent_stream.rstrip().endswith('data: [DONE]'), agent_stream[-80:])
+
+# A client that sends no session signal at all (third-party harness: no
+# x-opencode-session, no prompt_cache_key) must still get ONE stable session
+# per conversation. A per-request random UUID makes every turn look like a new
+# conversation, which silently disables upstream prompt caching.
+reset_upstreams()
+session_seen = []
+for opening in ('Fix the failing test', 'Fix the failing test', 'Write a parser'):
+    call('/v1/chat/completions', 'POST',
+         {'model': 'muse-spark-1.3',
+          'messages': [{'role': 'system', 'content': 'You are a helpful agent.'},
+                       {'role': 'user', 'content': opening}]},
+         token=client_key, base=BASE)
+    no_signal = [r for r in requests_seen(PORT_C) if r.get('model') == 'muse-spark-1.3']
+    session_seen.append(no_signal[-1]['x_opencode_session'] if no_signal else None)
+check('no-signal request still carries a session', all(session_seen), session_seen)
+check('same conversation keeps one session across turns',
+      session_seen[0] is not None and session_seen[0] == session_seen[1], session_seen)
+check('different conversation gets a different session',
+      session_seen[0] is not None and session_seen[0] != session_seen[2], session_seen)
+check('derived session uses the content-seed prefix',
+      (session_seen[0] or '').startswith('compat_cs_'), session_seen)
+
+# The account's upstream catalogue carries each model's native message format,
+# and downstream GET /v1/models must then list every cached model — not just
+# the configured mappings — with the same format label.
+status, payload = call(f'/accounts/{opencode_acct_id}/models', token=token)
+catalog_rows = (payload.get('data') or {}).get('models') or []
+check('account catalogue fetch succeeds',
+      status == 200 and len(catalog_rows) >= 2, (status, payload))
+check('catalogue entries carry their message format',
+      all(row.get('protocol') for row in catalog_rows), catalog_rows)
+
+status, payload = call('/v1/models', token=client_key, base=BASE)
+downstream = {row.get('id'): row for row in payload.get('data') or []}
+check('downstream list includes the cached upstream catalogue',
+      'stub-model' in downstream and 'stub-model-2' in downstream, list(downstream))
+check('downstream catalogue models are format-labelled',
+      downstream.get('stub-model', {}).get('protocol') == 'chat_completions',
+      downstream.get('stub-model'))
+check('downstream list keeps the configured models format-labelled',
+      'glm-5.3' in downstream and downstream['glm-5.3'].get('protocol') == 'chat_completions',
+      downstream.get('glm-5.3'))
+
+# Chat-native models on the same account must NOT be bridged (glm speaks chat).
+call('/models', 'POST', {
+    'requested_model': 'glm-5.3', 'provider': 'opencode_go',
+    'upstream_model': 'glm-5.3', 'group_id': primary_id,
+}, token=token)
+reset_upstreams()
+status, payload = call('/v1/chat/completions', 'POST',
+                       {'model': 'glm-5.3', 'messages': [{'role': 'user', 'content': 'hi'}]},
+                       token=client_key, base=BASE)
+glm_seen = [r for r in requests_seen(PORT_C) if r.get('model') == 'glm-5.3']
+check('chat-native model keeps the direct chat path',
+      status == 200 and bool(glm_seen) and glm_seen[0]['path'].endswith('/chat/completions') and glm_seen[0]['has_messages'],
+      (status, glm_seen[0] if glm_seen else None))
+
+# The connection-test probe must speak each model's native protocol, otherwise
+# picking muse-spark in the dialog reports a healthy credential as dead
+# (HTTP 400 "Model does not support this protocol").
+reset_upstreams()
+status, payload = call(f'/accounts/{opencode_acct_id}/test', 'POST',
+                       {'model': 'muse-spark-1.3'}, token=token)
+check('probe of a responses-native model succeeds', status == 200 and payload.get('success') is True, payload)
+muse_probe = [r for r in requests_seen(PORT_C) if r.get('model') == 'muse-spark-1.3']
+check('responses-native probe hit /v1/responses',
+      bool(muse_probe) and muse_probe[0]['path'].endswith('/v1/responses'),
+      muse_probe[0]['path'] if muse_probe else None)
+
+reset_upstreams()
+status, payload = call(f'/accounts/{opencode_acct_id}/test', 'POST',
+                       {'model': 'minimax-m3'}, token=token)
+check('probe of an anthropic-native model succeeds', status == 200 and payload.get('success') is True, payload)
+mini_probe = [r for r in requests_seen(PORT_C) if r.get('model') == 'minimax-m3']
+check('anthropic-native probe hit /v1/messages',
+      bool(mini_probe) and mini_probe[0]['path'].endswith('/v1/messages'),
+      mini_probe[0]['path'] if mini_probe else None)
+
+reset_upstreams()
+status, payload = call(f'/accounts/{opencode_acct_id}/test', 'POST',
+                       {'model': 'deepseek-v4-pro'}, token=token)
+check('probe of a chat-native model succeeds', status == 200 and payload.get('success') is True, payload)
+ds_probe = [r for r in requests_seen(PORT_C) if r.get('model') == 'deepseek-v4-pro']
+check('chat-native probe hit /v1/chat/completions',
+      bool(ds_probe) and ds_probe[0]['path'].endswith('/chat/completions'),
+      ds_probe[0]['path'] if ds_probe else None)
+
 print()
 print(f'PASSED {passed} / {passed + len(failures)}')
 if failures:

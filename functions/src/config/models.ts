@@ -42,7 +42,7 @@ export async function handleModelsRequest(request: Request, env: Env): Promise<R
     const groupId = Number(body.group_id);
 
     if (!requestedModel || !upstreamModel) return jsonError('请填写客户端模型名和上游模型名', 400);
-    if (!PROVIDERS.includes(provider)) return jsonError('服务商必须是 openai、anthropic 或 xai', 400);
+      if (!PROVIDERS.includes(provider)) return jsonError('服务商必须是 openai、anthropic、xai 或 opencode_go', 400);
     if (!groupId) return jsonError('请选择目标分组', 400);
     if (!(await db.getGroup(groupId))) return jsonError('所选分组不存在', 400);
 
@@ -97,7 +97,7 @@ export async function handleModelsRequest(request: Request, env: Env): Promise<R
     }
     if (body.provider !== undefined) {
       const provider = String(body.provider).trim();
-      if (!PROVIDERS.includes(provider)) return jsonError('服务商必须是 openai、anthropic 或 xai', 400);
+    if (!PROVIDERS.includes(provider)) return jsonError('服务商必须是 openai、anthropic、xai 或 opencode_go', 400);
       updates.provider = provider;
     }
     if (body.group_id !== undefined) {
@@ -131,7 +131,7 @@ export async function handleModelsRequest(request: Request, env: Env): Promise<R
   return jsonError('Method not allowed', 405);
 }
 
-const PROVIDERS = ['openai', 'anthropic', 'xai'];
+const PROVIDERS = ['openai', 'anthropic', 'xai', 'opencode_go'];
 
 const JSON_HEADERS = { 'Content-Type': 'application/json' } as const;
 
