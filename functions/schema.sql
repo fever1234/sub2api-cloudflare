@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS accounts (
   upstream_models TEXT,
   upstream_models_at TEXT,
   probe_model TEXT,
+  protocol_rules TEXT,
   created_at TEXT DEFAULT (datetime('now'))
 );
 

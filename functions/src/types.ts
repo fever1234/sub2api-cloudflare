@@ -44,6 +44,11 @@ export interface Account {
   last_check_ok?: number | null;
   /** ISO timestamp of the most recent health probe. */
   last_check_at?: string | null;
+  /**
+   * opencode_go only: JSON rules ([{pattern, protocol}]) that replace the
+   * built-in protocol table for this account; NULL/empty means the defaults.
+   */
+  protocol_rules?: string | null;
   created_at: string;
 }
 

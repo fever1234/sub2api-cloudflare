@@ -17,7 +17,7 @@
  * exception". The version is recorded in `settings` once the work succeeds, and
  * later requests spend a single cheap read confirming there is nothing to do.
  */
-export const SCHEMA_VERSION = '13';
+export const SCHEMA_VERSION = '14';
 
 /**
  * The accounts table DDL.
@@ -48,6 +48,7 @@ export const ACCOUNTS_TABLE_DDL = `CREATE TABLE IF NOT EXISTS accounts (
   upstream_models TEXT,
   upstream_models_at TEXT,
   probe_model TEXT,
+  protocol_rules TEXT,
   created_at TEXT DEFAULT (datetime('now'))
 )`;
 
@@ -236,5 +237,10 @@ export const ADDITIVE_COLUMNS: Array<{ table: string; column: string; definition
   // text so entries can carry trailing `*` wildcards; the enabled flag keeps
   // an emptied list visible instead of silently repurposing it.
   { table: 'groups', column: 'model_allowlist_enabled', definition: 'INTEGER DEFAULT 0' },
-  { table: 'groups', column: 'model_allowlist', definition: 'TEXT' }
+  { table: 'groups', column: 'model_allowlist', definition: 'TEXT' },
+
+  // opencode_go: per-account protocol rules that replace the built-in default
+  // table for this account (Go: credentials.protocol_rules). JSON array of
+  // {pattern, protocol}; NULL means "use the defaults".
+  { table: 'accounts', column: 'protocol_rules', definition: 'TEXT' }
 ];

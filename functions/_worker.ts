@@ -13,7 +13,7 @@ import { handleAccountsRequest } from './src/config/accounts'
 import { handleModelsRequest } from './src/config/models'
 import { encryptApiKey, decryptApiKey, resolveApiKeyEncryptionSecret } from './src/key-crypto'
 import { routingCacheMetrics, invalidateRoutingSnapshot, loadRoutingSnapshot } from './src/utils/routing-cache'
-import { openCodeGoModelProtocol } from './src/utils/responses-bridge'
+import { resolveOpenCodeGoProtocol, DEFAULT_OPENCODE_GO_MODEL_IDS } from './src/utils/responses-bridge'
 import { readCachedModels } from './src/utils/healthcheck'
 import { modelAllowed, modelAllowlistDenied } from './src/utils/model-allowlist'
 import { clientIp, checkLoginThrottle, recordLoginFailure, clearLoginThrottle } from './src/utils/login-throttle'
@@ -614,24 +614,26 @@ function allowlistGroupFor(keyRecord: any, groups: Array<{ id: number }>): any |
 
 /**
  * The downstream model list: explicit mappings first (they define how an id
- * routes), then each upstream's cached catalogue, then one fallback per
- * provider, deduped in that order with the native protocol labelled per id.
+ * routes), then each upstream's cached catalogue, then a per-provider
+ * fallback — the whole official catalogue for opencode_go, one id elsewhere —
+ * deduped in that order with the native protocol labelled per id.
  */
 function buildProviderModelEntries(accounts: any[], mappings: any[]): Array<{ id: string; object: string; owned_by: string; protocol: string }> {
   // Native message format per id, derived from where the id came from.
   // opencode_go owns the only rule table (glm=chat, muse-spark/grok/gpt=
-  // responses, minimax/qwen=anthropic); other providers serve one family.
-  const protocolFor = (provider: string, id: string): string =>
-    provider === 'opencode_go' ? openCodeGoModelProtocol(id)
+  // responses, minimax/qwen=anthropic), and an account may replace it with its
+  // own rules; other providers serve one family.
+  const protocolFor = (provider: string, id: string, account?: any): string =>
+    provider === 'opencode_go' ? resolveOpenCodeGoProtocol(account, id)
       : provider === 'anthropic' ? 'anthropic'
         : 'chat_completions'
 
   const ids: string[] = []
   const protocolById = new Map<string, string>()
-  const note = (id: string, provider: string) => {
+  const note = (id: string, provider: string, account?: any) => {
     if (!id || protocolById.has(id)) return
     ids.push(id)
-    protocolById.set(id, protocolFor(provider, id))
+    protocolById.set(id, protocolFor(provider, id, account))
   }
 
   mappings.forEach(m => note(String(m.requested_model || ''), m.provider))
@@ -644,16 +646,27 @@ function buildProviderModelEntries(accounts: any[], mappings: any[]): Array<{ id
     ...accounts.filter(a => a.provider !== 'opencode_go'),
   ]
   catalogueAccounts.forEach(account => {
-    for (const row of readCachedModels(account)?.models || []) note(row.id, account.provider)
+    for (const row of readCachedModels(account)?.models || []) note(row.id, account.provider, account)
   })
-  // One fallback per provider so a fresh install still answers with something.
-  accounts.forEach(account => note(
-    account.provider === 'anthropic' ? 'claude-3-5-sonnet-20241022'
-      : account.provider === 'xai' ? 'grok-2-latest'
-        : account.provider === 'opencode_go' ? 'glm-5.3'
+  // Fresh-install fallback: an opencode_go account that has not synced its own
+  // list yet answers with the official catalogue (Go: DefaultOpenCodeGoModelIDs)
+  // instead of a single placeholder; the other providers still get one id so
+  // the list is never empty.
+  accounts.forEach(account => {
+    if (account.provider === 'opencode_go') {
+      if (!readCachedModels(account)) {
+        for (const id of DEFAULT_OPENCODE_GO_MODEL_IDS) note(id, 'opencode_go', account)
+      }
+      return
+    }
+    note(
+      account.provider === 'anthropic' ? 'claude-3-5-sonnet-20241022'
+        : account.provider === 'xai' ? 'grok-2-latest'
           : 'gpt-4o',
-    account.provider
-  ))
+      account.provider,
+      account
+    )
+  })
 
   return ids.map(id => ({ id, object: 'model', owned_by: 'sub2api', protocol: protocolById.get(id) || 'chat_completions' }))
 }

@@ -128,13 +128,13 @@ export class Database {
     return this.queryOne<any>('SELECT * FROM accounts WHERE id = ?', [id]);
   }
 
-  async createAccount(name: string, provider: string, apiKey: string, groupId: number, baseUrl?: string, priority = 0, clientSpoofing?: string, enabled = 1, rateMultiplier = 1) {
+  async createAccount(name: string, provider: string, apiKey: string, groupId: number, baseUrl?: string, priority = 0, clientSpoofing?: string, enabled = 1, rateMultiplier = 1, protocolRules: string | null = null) {
     return this.insert(
       // channel_id is a retired column that older databases still declare
       // NOT NULL, so a literal 0 is written to satisfy both shapes.
-      `INSERT INTO accounts (name, provider, api_key, base_url, group_id, channel_id, priority, client_spoofing, enabled, rate_multiplier)
-       VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?)`,
-      [name, provider, apiKey, baseUrl || '', groupId, priority, clientSpoofing || '', enabled, rateMultiplier]
+      `INSERT INTO accounts (name, provider, api_key, base_url, group_id, channel_id, priority, client_spoofing, enabled, rate_multiplier, protocol_rules)
+       VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)`,
+      [name, provider, apiKey, baseUrl || '', groupId, priority, clientSpoofing || '', enabled, rateMultiplier, protocolRules]
     );
   }
 
@@ -153,6 +153,7 @@ export class Database {
     if (updates.error_rate !== undefined) { fields.push('error_rate = ?'); values.push(updates.error_rate); }
     if (updates.client_spoofing !== undefined) { fields.push('client_spoofing = ?'); values.push(updates.client_spoofing); }
     if (updates.rate_multiplier !== undefined) { fields.push('rate_multiplier = ?'); values.push(updates.rate_multiplier); }
+    if (updates.protocol_rules !== undefined) { fields.push('protocol_rules = ?'); values.push(updates.protocol_rules); }
     
     if (fields.length === 0) return { changes: 0 };
     values.push(id);

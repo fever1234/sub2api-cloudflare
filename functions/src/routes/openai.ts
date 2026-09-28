@@ -5,7 +5,7 @@ import { authenticateApiKey } from '../auth';
 import { FailoverManager } from '../failover';
 import { proxyRequest, buildUpstreamHeaders, getUpstreamBaseUrl, findModelMapping, resolveUpstreamCredentials , accountRateMultiplier, stripBodyHeaders, ensureChatStreamUsage } from '../utils/proxy';
 import { applyOpenCodeHeaders, resolveOpenCodeSessionId } from '../utils/opencode-session';
-import { openCodeGoModelProtocol, chatCompletionsToResponses, responsesSseToChatStream, bufferResponsesSseAsChat } from '../utils/responses-bridge';
+import { resolveOpenCodeGoProtocol, chatCompletionsToResponses, responsesSseToChatStream, bufferResponsesSseAsChat } from '../utils/responses-bridge';
 import { createStripRetryState, sendWithRejectedFieldRetry, sanitizeToolSchemas, type StripRetryState } from '../utils/responses-compat';
 import { SilentRefusalDetector, guardSilentRefusalStream } from '../utils/silent-refusal';
 import { modelAllowed, modelAllowlistDenied } from '../utils/model-allowlist';
@@ -141,7 +141,7 @@ export async function handleOpenAIRequest(request: Request, env: Env, failover: 
   // client can still use them; every other model keeps the direct chat path.
   let bridged = false;
   let outboundBody: unknown = requestBody;
-  if (!isResponses && provider === 'opencode_go' && openCodeGoModelProtocol(upstreamModel) === 'responses') {
+  if (!isResponses && provider === 'opencode_go' && resolveOpenCodeGoProtocol(account, upstreamModel) === 'responses') {
     try {
       outboundBody = chatCompletionsToResponses(requestBody);
       endpoint = '/v1/responses';
@@ -367,7 +367,7 @@ async function handleFailover(
       let retryEndpoint = endpoint;
       let retrySendBody = body;
       let retryBridged = false;
-      if (!isResponses && currentProvider === 'opencode_go' && retryBody && openCodeGoModelProtocol(String(retryBody.model || upstreamModel)) === 'responses') {
+      if (!isResponses && currentProvider === 'opencode_go' && retryBody && resolveOpenCodeGoProtocol(account, String(retryBody.model || upstreamModel)) === 'responses') {
         try {
           retrySendBody = JSON.stringify(chatCompletionsToResponses(retryBody));
           retryEndpoint = '/v1/responses';

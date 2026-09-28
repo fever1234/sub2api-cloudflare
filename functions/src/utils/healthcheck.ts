@@ -3,7 +3,7 @@ import type { Database } from '../db';
 import { getProviderAuthHeaders, getProbeModel } from './provider';
 import { getUpstreamBaseUrl } from './proxy';
 import { applyOpenCodeProbeHeaders } from './opencode-session';
-import { openCodeGoModelProtocol, chatCompletionsToResponses } from './responses-bridge';
+import { resolveOpenCodeGoProtocol, chatCompletionsToResponses } from './responses-bridge';
 
 export interface HealthResult {
   accountId: number;
@@ -39,10 +39,10 @@ export interface UpstreamModel {
  * muse-spark/grok/gpt speak responses, minimax/qwen speak anthropic); every
  * other provider serves a single protocol family.
  */
-function withProtocol(models: UpstreamModel[], provider: string): UpstreamModel[] {
-  if (provider === 'anthropic') return models.map(model => ({ ...model, protocol: 'anthropic' }));
-  if (provider === 'opencode_go') {
-    return models.map(model => ({ ...model, protocol: openCodeGoModelProtocol(model.id) }));
+function withProtocol(models: UpstreamModel[], account: { provider: string; protocol_rules?: unknown }): UpstreamModel[] {
+  if (account.provider === 'anthropic') return models.map(model => ({ ...model, protocol: 'anthropic' }));
+  if (account.provider === 'opencode_go') {
+    return models.map(model => ({ ...model, protocol: resolveOpenCodeGoProtocol(account, model.id) }));
   }
   return models.map(model => ({ ...model, protocol: 'chat_completions' }));
 }
@@ -114,7 +114,7 @@ export async function listUpstreamModels(
 
   const cached = readCachedModels(account);
   if (cached && !refresh && !isStale(cached.fetchedAt)) {
-    return { models: withProtocol(cached.models, account.provider), cached: true, fetchedAt: cached.fetchedAt };
+    return { models: withProtocol(cached.models, account), cached: true, fetchedAt: cached.fetchedAt };
   }
 
   const apiKey = String(account.api_key || '').trim();
@@ -134,7 +134,7 @@ export async function listUpstreamModels(
     if (!response.ok) {
       // A stale list still lets the operator pick a model and test, which beats
       // an empty dialog when the listing endpoint is the only thing broken.
-      if (cached) return { models: withProtocol(cached.models, account.provider), cached: true, fetchedAt: cached.fetchedAt };
+      if (cached) return { models: withProtocol(cached.models, account), cached: true, fetchedAt: cached.fetchedAt };
       throw new Error(`获取模型失败（HTTP ${response.status}）`);
     }
     let payload: any = null;
@@ -145,13 +145,13 @@ export async function listUpstreamModels(
       .filter((row: UpstreamModel) => row.id)
       .slice(0, 200);
     if (!models.length) {
-      if (cached) return { models: withProtocol(cached.models, account.provider), cached: true, fetchedAt: cached.fetchedAt };
+      if (cached) return { models: withProtocol(cached.models, account), cached: true, fetchedAt: cached.fetchedAt };
       throw new Error('上游没有返回可用模型');
     }
 
     await db.saveUpstreamModels(accountId, models).catch(() => {});
     const stored = await db.getAccount(accountId);
-    return { models: withProtocol(models, account.provider), cached: false, fetchedAt: String(stored?.upstream_models_at || '') };
+    return { models: withProtocol(models, account), cached: false, fetchedAt: String(stored?.upstream_models_at || '') };
   } finally {
     clearTimeout(timer);
   }
@@ -217,7 +217,7 @@ export async function probeAccount(db: Database, accountId: number, selectedMode
   // responses-native model (muse-spark-*/grok-*/gpt-*) in the dialog must probe
   // it on /v1/responses, otherwise upstream answers 400 "does not support this
   // protocol" and a healthy credential reads as dead.
-  const protocol = account.provider === 'opencode_go' ? openCodeGoModelProtocol(probeModel) : (isAnthropic ? 'anthropic' : 'chat_completions');
+  const protocol = account.provider === 'opencode_go' ? resolveOpenCodeGoProtocol(account, probeModel) : (isAnthropic ? 'anthropic' : 'chat_completions');
   const endpoint = protocol === 'anthropic'
     ? `${baseUrl}/v1/messages`
     : protocol === 'responses'

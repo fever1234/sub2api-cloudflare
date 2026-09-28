@@ -52,6 +52,10 @@ rmSync(outDir, { recursive: true, force: true })
 const {
   normalizeOpenCodeModelId,
   openCodeGoModelProtocol,
+  normalizeProtocolRulesInput,
+  parseStoredProtocolRules,
+  resolveOpenCodeGoProtocol,
+  DEFAULT_OPENCODE_GO_MODEL_IDS,
   chatCompletionsToResponses,
   responsesToChatCompletion,
   newResponsesToChatState,
@@ -79,6 +83,70 @@ check('unknown future model defaults to chat_completions', openCodeGoModelProtoc
 check('opencode/muse-spark prefix normalizes', normalizeOpenCodeModelId('opencode/muse-spark-1.3') === 'muse-spark-1.3')
 check('prefixed muse-spark still resolves to responses', openCodeGoModelProtocol('opencode/muse-spark-1.3') === 'responses')
 check('pattern match is case-insensitive', openCodeGoModelProtocol('MUSE-SPARK-1.3') === 'responses')
+
+// ---- account protocol rules (opencode_go) ----------------------------------
+// Validation mirrors Go's NormalizeOpenCodeGoProtocolRulesCredentials.
+const goodRules = [{ pattern: 'grok-*', protocol: 'responses' }]
+let norm = normalizeProtocolRulesInput(JSON.stringify(goodRules))
+check('rules: JSON string parses to normalized rules',
+  'rules' in norm && norm.rules.length === 1 && norm.rules[0].pattern === 'grok-*', JSON.stringify(norm))
+norm = normalizeProtocolRulesInput(goodRules)
+check('rules: array accepted as-is', 'rules' in norm && norm.rules[0].protocol === 'responses')
+norm = normalizeProtocolRulesInput([{ pattern: ' GPT-* ', protocol: 'responses' }])
+check('rules: pattern lowercases and trims', 'rules' in norm && norm.rules[0].pattern === 'gpt-*', JSON.stringify(norm))
+norm = normalizeProtocolRulesInput('')
+check('rules: empty string is an empty rule set', 'rules' in norm && norm.rules.length === 0)
+check('rules: broken JSON rejects', 'error' in normalizeProtocolRulesInput('{nope'))
+check('rules: non-array rejects', 'error' in normalizeProtocolRulesInput({ pattern: 'x', protocol: 'responses' }))
+check('rules: missing pattern rejects', 'error' in normalizeProtocolRulesInput([{ protocol: 'responses' }]))
+check('rules: whitespace in pattern rejects',
+  'error' in normalizeProtocolRulesInput([{ pattern: 'gr ok*', protocol: 'responses' }]))
+check('rules: mid-string wildcard rejects',
+  'error' in normalizeProtocolRulesInput([{ pattern: 'g*t', protocol: 'responses' }]))
+check('rules: two wildcards reject',
+  'error' in normalizeProtocolRulesInput([{ pattern: 'g*t*', protocol: 'responses' }]))
+check('rules: unknown protocol rejects',
+  'error' in normalizeProtocolRulesInput([{ pattern: 'g*', protocol: 'grpc' }]))
+check('rules: non-object entry rejects', 'error' in normalizeProtocolRulesInput(['gpt*']))
+check('rules: over 64 entries reject',
+  'error' in normalizeProtocolRulesInput(Array.from({ length: 65 }, () => ({ pattern: `m${Math.random()}*`, protocol: 'responses' }))))
+check('rules: over 128-char pattern rejects',
+  'error' in normalizeProtocolRulesInput([{ pattern: 'a'.repeat(129), protocol: 'responses' }]))
+
+// Lenient read: unusable stored text falls back to the defaults instead of
+// breaking routing; empty/NULL means "no rules of its own".
+check('stored: NULL reads as no rules', parseStoredProtocolRules(null) === null)
+check('stored: empty string reads as no rules', parseStoredProtocolRules('') === null)
+check('stored: broken JSON reads as no rules', parseStoredProtocolRules('{broken') === null)
+check('stored: valid JSON returns the rules',
+  Array.isArray(parseStoredProtocolRules('[{"pattern":"grok-*","protocol":"responses"}]'))
+  && parseStoredProtocolRules('[{"pattern":"grok-*","protocol":"responses"}]')[0].protocol === 'responses')
+
+// Resolution chain: account rules present replace the defaults wholesale.
+check('resolve: no account uses the defaults',
+  resolveOpenCodeGoProtocol(null, 'grok-4.7') === 'responses'
+  && resolveOpenCodeGoProtocol({}, 'glm-5.3') === 'chat_completions')
+check('resolve: account rules override defaults',
+  resolveOpenCodeGoProtocol({ protocol_rules: '[{"pattern":"glm-*","protocol":"responses"}]' }, 'glm-5.3') === 'responses')
+check('resolve: account rules apply to models the defaults would answer',
+  resolveOpenCodeGoProtocol({ protocol_rules: '[{"pattern":"grok-*","protocol":"chat_completions"}]' }, 'grok-4.7') === 'chat_completions')
+check('resolve: miss under account rules falls to chat, not the defaults',
+  resolveOpenCodeGoProtocol({ protocol_rules: '[{"pattern":"kimi-*","protocol":"responses"}]' }, 'grok-4.7') === 'chat_completions')
+check('resolve: invalid stored rules fall back to the defaults',
+  resolveOpenCodeGoProtocol({ protocol_rules: '{not json' }, 'grok-4.7') === 'responses')
+check('resolve: stored empty rule set pins everything to chat',
+  resolveOpenCodeGoProtocol({ protocol_rules: '[]' }, 'grok-4.7') === 'chat_completions')
+check('resolve: opencode/ prefix still normalizes under account rules',
+  resolveOpenCodeGoProtocol({ protocol_rules: '[{"pattern":"grok-*","protocol":"responses"}]' }, 'opencode/grok-4.7') === 'responses')
+
+// ---- official catalogue fallback (Go: DefaultOpenCodeGoModelIDs) -----------
+check('defaults: 29 official ids', DEFAULT_OPENCODE_GO_MODEL_IDS.length === 29,
+  `got ${DEFAULT_OPENCODE_GO_MODEL_IDS.length}`)
+check('defaults: unique ids', new Set(DEFAULT_OPENCODE_GO_MODEL_IDS).size === 29)
+check('defaults: covers each family', ['glm-5.3', 'grok-4.7', 'minimax-m3', 'qwen3.8-max', 'kimi-k3', 'deepseek-v4-pro', 'mimo-v2.5', 'omen-alpha']
+  .every(id => DEFAULT_OPENCODE_GO_MODEL_IDS.includes(id)))
+check('defaults: every id keeps a default-table protocol', DEFAULT_OPENCODE_GO_MODEL_IDS.every(id =>
+  ['chat_completions', 'anthropic', 'responses'].includes(openCodeGoModelProtocol(id))))
 
 // ---- request conversion ----------------------------------------------------
 const chatRequest = {

@@ -242,6 +242,13 @@ html.dark .mini-btn:hover { color: var(--p300); background: rgba(20, 184, 166, .
   transition: border-color .15s, box-shadow .15s;
 }
 .field-input::placeholder { color: var(--text-3); }
+.field-textarea {
+  min-height: 84px;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 1.55;
+}
 .field-input:focus, .field-select:focus {
   outline: none;
   border-color: var(--p500);

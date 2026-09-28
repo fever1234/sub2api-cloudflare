@@ -5,6 +5,7 @@ import { verifySessionToken, resolveSessionSecret } from '../auth';
 import { probeAccount, probeAccounts, listUpstreamModels } from '../utils/healthcheck';
 import { invalidateAllRoutingSnapshots } from '../utils/routing-cache';
 import { isProvider, getProbeModel } from '../utils/provider';
+import { normalizeProtocolRulesInput } from '../utils/responses-bridge';
 
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
 
@@ -119,7 +120,7 @@ export async function handleAccountsRequest(request: Request, env: Env): Promise
     let body: {
       name?: string; provider?: string; api_key?: string; group_id?: number;
       base_url?: string; priority?: number; client_spoofing?: string; enabled?: number | boolean;
-      rate_multiplier?: number;
+      rate_multiplier?: number; protocol_rules?: unknown;
     };
     try { body = await request.json(); } catch { return jsonError('Invalid JSON body', 400); }
 
@@ -149,6 +150,16 @@ export async function handleAccountsRequest(request: Request, env: Env): Promise
     const multiplier = readRateMultiplier(body.rate_multiplier ?? 1);
     if (typeof multiplier === 'string') return jsonError(multiplier, 400);
 
+    // opencode_go protocol rules (Go: credentials.protocol_rules). Validated
+    // on write; an empty value stores NULL so the built-in table stays in
+    // charge for this account.
+    let protocolRules: string | null = null;
+    if (body.protocol_rules !== undefined && body.protocol_rules !== null) {
+      const normalized = normalizeProtocolRulesInput(body.protocol_rules);
+      if ('error' in normalized) return jsonError(normalized.error, 400);
+      if (normalized.rules.length) protocolRules = JSON.stringify(normalized.rules);
+    }
+
     const result = await db.createAccount(
       name,
       provider,
@@ -158,7 +169,8 @@ export async function handleAccountsRequest(request: Request, env: Env): Promise
       Number(body.priority) || 0,
       body.client_spoofing,
       body.enabled === false || body.enabled === 0 ? 0 : 1,
-      multiplier
+      multiplier,
+      protocolRules
     );
 
     const account = await db.getAccount(result.lastRowId);
@@ -203,6 +215,17 @@ export async function handleAccountsRequest(request: Request, env: Env): Promise
       const multiplier = readRateMultiplier(body.rate_multiplier);
       if (typeof multiplier === 'string') return jsonError(multiplier, 400);
       updates.rate_multiplier = multiplier;
+    }
+    // Protocol rules: absent keeps the stored value, null/empty clears it back
+    // to the built-in defaults, anything else is validated then re-serialized.
+    if (body.protocol_rules !== undefined) {
+      if (body.protocol_rules === null || (typeof body.protocol_rules === 'string' && !body.protocol_rules.trim())) {
+        updates.protocol_rules = null;
+      } else {
+        const normalized = normalizeProtocolRulesInput(body.protocol_rules);
+        if ('error' in normalized) return jsonError(normalized.error, 400);
+        updates.protocol_rules = normalized.rules.length ? JSON.stringify(normalized.rules) : null;
+      }
     }
     // A blank key means "keep the stored credential" so the masked list value
     // can never be written back over the real secret.

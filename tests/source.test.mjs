@@ -425,7 +425,7 @@ function blockAfter(source, startMarker, endMarker) {
 // both model endpoints (Go: group_model_allowlist.go).
 {
   const schema = readFileSync('functions/src/schema.ts', 'utf8')
-  check('schema version is bumped for the allowlist columns', schema.includes("SCHEMA_VERSION = '13'"))
+  check('schema version is bumped for the group allowlist columns', schema.includes("SCHEMA_VERSION = '14'"))
   const groupsDdl = schema.slice(schema.indexOf('CREATE TABLE IF NOT EXISTS groups'), schema.indexOf('CREATE TABLE IF NOT EXISTS channels'))
   check('fresh groups table carries the allowlist columns',
     groupsDdl.includes('model_allowlist_enabled INTEGER DEFAULT 0') && groupsDdl.includes('model_allowlist TEXT'))
@@ -494,7 +494,7 @@ function blockAfter(source, startMarker, endMarker) {
 // usage row is written, aggregated for the dashboard and never billed.
 {
   const schema = readFileSync('functions/src/schema.ts', 'utf8')
-  check('schema version is bumped for the cache-read column', schema.includes("SCHEMA_VERSION = '13'"))
+  check('schema version is bumped for the cache-read column', schema.includes("SCHEMA_VERSION = '14'"))
   const usageDdl = schema.slice(
     schema.indexOf('CREATE TABLE IF NOT EXISTS usage_records'),
     schema.indexOf('CREATE TABLE IF NOT EXISTS request_logs'))
@@ -522,6 +522,67 @@ function blockAfter(source, startMarker, endMarker) {
   }
   const record = readFileSync('functions/src/utils/record.ts', 'utf8')
   check('streaming records cache reads', record.includes('cache_read_tokens: outcome.cacheReadTokens'))
+}
+
+// ---- 21. Account protocol rules + official catalogue fallback --------------
+// An opencode_go account may carry its own rule table (Go: credentials.
+// protocol_rules). It is validated on write, read on every protocol decision,
+// and until an account syncs its catalogue the downstream list answers with
+// the official ids (Go: DefaultOpenCodeGoModelIDs) rather than one placeholder.
+{
+  const schema = readFileSync('functions/src/schema.ts', 'utf8')
+  check('schema version is bumped for the protocol-rules column', schema.includes("SCHEMA_VERSION = '14'"))
+  const accountsDdl = schema.slice(
+    schema.indexOf('export const ACCOUNTS_TABLE_DDL'),
+    schema.indexOf('export const SCHEMA_STATEMENTS'))
+  check('fresh accounts table carries protocol_rules', accountsDdl.includes('protocol_rules TEXT'))
+  check('existing accounts tables gain the column',
+    schema.includes("{ table: 'accounts', column: 'protocol_rules'"))
+
+  const sql = readFileSync('functions/schema.sql', 'utf8')
+  check('schema.sql carries the column too', sql.includes('protocol_rules TEXT'))
+
+  const types = readFileSync('functions/src/types.ts', 'utf8')
+  check('Account type carries the column', types.includes('protocol_rules?: string | null'))
+
+  const accounts = readFileSync('functions/src/config/accounts.ts', 'utf8')
+  check('writes validate the rules', accounts.includes('normalizeProtocolRulesInput(body.protocol_rules)'))
+  check('writes reject invalid rules with a 400',
+    (accounts.match(/normalizeProtocolRulesInput\(/g) || []).length >= 2
+    && accounts.includes('jsonError(normalized.error, 400)'))
+  check('writes store the normalized JSON', accounts.includes('JSON.stringify(normalized.rules)'))
+  check('update clears stored rules on empty input', accounts.includes('updates.protocol_rules = null'))
+
+  const db = readFileSync('functions/src/db.ts', 'utf8')
+  check('createAccount inserts the column', db.includes('enabled, rate_multiplier, protocol_rules)'))
+  check('updateAccount can write the column', db.includes('if (updates.protocol_rules !== undefined)'))
+
+  // Every protocol decision must read the account, not only the default table.
+  const bridge = readFileSync('functions/src/utils/responses-bridge.ts', 'utf8')
+  check('bridge exports the account resolver', bridge.includes('export function resolveOpenCodeGoProtocol'))
+  check('bridge exports the official catalogue', bridge.includes('export const DEFAULT_OPENCODE_GO_MODEL_IDS'))
+  check('bridge validates rules with the Go limits',
+    bridge.includes('MAX_PROTOCOL_RULES = 64') && bridge.includes('MAX_PROTOCOL_PATTERN_LENGTH = 128'))
+  for (const route of ['openai', 'gateway']) {
+    const source = readFileSync(`functions/src/routes/${route}.ts`, 'utf8')
+    check(`${route} decides per account`,
+      source.includes('resolveOpenCodeGoProtocol(account,') && !source.includes('openCodeGoModelProtocol('))
+  }
+  const health = readFileSync('functions/src/utils/healthcheck.ts', 'utf8')
+  check('probe decides per account', health.includes('resolveOpenCodeGoProtocol(account, probeModel)'))
+  check('catalogue labels per account', health.includes('resolveOpenCodeGoProtocol(account, model.id)'))
+  check('healthcheck has no default-only decision left', !health.includes('openCodeGoModelProtocol('))
+
+  const worker = readFileSync('functions/_worker.ts', 'utf8')
+  check('downstream list falls back to the official catalogue',
+    worker.includes('for (const id of DEFAULT_OPENCODE_GO_MODEL_IDS)'))
+  check('fallback is skipped once a catalogue is cached', worker.includes('if (!readCachedModels(account))'))
+  check('downstream labels per account', worker.includes('resolveOpenCodeGoProtocol(account, id)'))
+
+  const frontend = readFileSync('frontend/app.js', 'utf8')
+  check('account dialog offers the rules field', frontend.includes("textareaInput('protocol_rules'"))
+  check('cleared field is sent back to clear storage',
+    frontend.includes("else if (editing) payload.protocol_rules = ''"))
 }
 
 console.log()

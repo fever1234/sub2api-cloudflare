@@ -1061,6 +1061,19 @@ function field(label, control, options = {}) {
 function textInput(name, value = '', placeholder = '', type = 'text', attrs = '') {
   return `<input class="field-input" id="f-${name}" name="${name}" type="${type}" value="${esc(value)}" placeholder="${esc(placeholder)}" ${attrs}>`
 }
+function textareaInput(name, value = '', placeholder = '', attrs = '') {
+  return `<textarea class="field-input field-textarea" id="f-${name}" name="${name}" rows="4" placeholder="${esc(placeholder)}" ${attrs}>${esc(value)}</textarea>`
+}
+/** Pretty-print stored protocol rules so the textarea shows valid JSON. */
+function formatProtocolRules(raw) {
+  if (!raw) return ''
+  try {
+    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw
+    return Array.isArray(parsed) ? JSON.stringify(parsed, null, 2) : ''
+  } catch {
+    return ''
+  }
+}
 function selectInput(name, optionsHtml, attrs = '') {
   return `<select class="field-select" id="f-${name}" name="${name}" ${attrs}>${optionsHtml}</select>`
 }
@@ -1222,6 +1235,10 @@ function openAccountModal(account = null) {
       field('客户端伪装', textInput('client_spoofing', account?.client_spoofing || '', '可选，例如 claude-code'), {
         id: 'f-client_spoofing', full: true, hint: '支持预设名或 JSON 请求头对象。'
       }) +
+      field('协议规则', textareaInput('protocol_rules', formatProtocolRules(account?.protocol_rules), '[{"pattern":"grok-*","protocol":"responses"}]'), {
+        id: 'f-protocol_rules', full: true,
+        hint: '仅 OpenCode Go 生效：JSON 数组，pattern 可用结尾 * 通配（每个 pattern 至多一个，不许空格）。留空使用内置默认表；填了则完全取代默认表，未命中一律按 chat_completions。'
+      }) +
       field('状态', switchField('enabled', editing ? isOn(account.enabled) : true), { full: true })
     ),
     async onSubmit(form) {
@@ -1243,6 +1260,11 @@ function openAccountModal(account = null) {
         rate_multiplier: num(values.rate_multiplier, 1)
       }
       if (values.api_key) payload.api_key = String(values.api_key).trim()
+      // Rules: non-empty sends JSON text for validation; an emptied field on
+      // edit clears the stored value back to the built-in defaults.
+      const rulesRaw = String(values.protocol_rules || '').trim()
+      if (rulesRaw) payload.protocol_rules = rulesRaw
+      else if (editing) payload.protocol_rules = ''
 
       await api(editing ? `/accounts/${account.id}` : '/accounts', { method: editing ? 'PUT' : 'POST', body: payload })
       await loadPage('accounts', true)

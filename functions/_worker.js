@@ -1,5 +1,5 @@
 // functions/src/schema.ts
-var SCHEMA_VERSION = "13";
+var SCHEMA_VERSION = "14";
 var ACCOUNTS_TABLE_DDL = `CREATE TABLE IF NOT EXISTS accounts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
@@ -21,6 +21,7 @@ var ACCOUNTS_TABLE_DDL = `CREATE TABLE IF NOT EXISTS accounts (
   upstream_models TEXT,
   upstream_models_at TEXT,
   probe_model TEXT,
+  protocol_rules TEXT,
   created_at TEXT DEFAULT (datetime('now'))
 )`;
 var SCHEMA_STATEMENTS = [
@@ -188,7 +189,11 @@ var ADDITIVE_COLUMNS = [
   // text so entries can carry trailing `*` wildcards; the enabled flag keeps
   // an emptied list visible instead of silently repurposing it.
   { table: "groups", column: "model_allowlist_enabled", definition: "INTEGER DEFAULT 0" },
-  { table: "groups", column: "model_allowlist", definition: "TEXT" }
+  { table: "groups", column: "model_allowlist", definition: "TEXT" },
+  // opencode_go: per-account protocol rules that replace the built-in default
+  // table for this account (Go: credentials.protocol_rules). JSON array of
+  // {pattern, protocol}; NULL means "use the defaults".
+  { table: "accounts", column: "protocol_rules", definition: "TEXT" }
 ];
 
 // functions/src/db.ts
@@ -315,13 +320,13 @@ var Database = class {
   async getAccount(id) {
     return this.queryOne("SELECT * FROM accounts WHERE id = ?", [id]);
   }
-  async createAccount(name, provider, apiKey, groupId, baseUrl, priority = 0, clientSpoofing, enabled = 1, rateMultiplier = 1) {
+  async createAccount(name, provider, apiKey, groupId, baseUrl, priority = 0, clientSpoofing, enabled = 1, rateMultiplier = 1, protocolRules = null) {
     return this.insert(
       // channel_id is a retired column that older databases still declare
       // NOT NULL, so a literal 0 is written to satisfy both shapes.
-      `INSERT INTO accounts (name, provider, api_key, base_url, group_id, channel_id, priority, client_spoofing, enabled, rate_multiplier)
-       VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?)`,
-      [name, provider, apiKey, baseUrl || "", groupId, priority, clientSpoofing || "", enabled, rateMultiplier]
+      `INSERT INTO accounts (name, provider, api_key, base_url, group_id, channel_id, priority, client_spoofing, enabled, rate_multiplier, protocol_rules)
+       VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)`,
+      [name, provider, apiKey, baseUrl || "", groupId, priority, clientSpoofing || "", enabled, rateMultiplier, protocolRules]
     );
   }
   async updateAccount(id, updates) {
@@ -370,6 +375,10 @@ var Database = class {
     if (updates.rate_multiplier !== void 0) {
       fields.push("rate_multiplier = ?");
       values.push(updates.rate_multiplier);
+    }
+    if (updates.protocol_rules !== void 0) {
+      fields.push("protocol_rules = ?");
+      values.push(updates.protocol_rules);
     }
     if (fields.length === 0) return { changes: 0 };
     values.push(id);
@@ -2004,6 +2013,94 @@ function openCodeGoModelProtocol(model) {
     if (protocolRuleMatches(rule.pattern, normalized)) return rule.protocol;
   }
   return "chat_completions";
+}
+var DEFAULT_OPENCODE_GO_MODEL_IDS = [
+  "grok-4.7",
+  "grok-4.6",
+  "gpt-5.6-luna",
+  "glm-5.3-flash",
+  "glm-5.3",
+  "glm-5.2",
+  "glm-5.1",
+  "kimi-k3",
+  "kimi-k2.7-code",
+  "kimi-k2.6",
+  "longcat-2.0",
+  "deepseek-v4-pro",
+  "deepseek-v4-flash",
+  "deepseek-v4-flash-vision-exp",
+  "mimo-v2.5",
+  "mimo-v2.5-pro",
+  "minimax-m3",
+  "minimax-m2.7",
+  "minimax-m2.5",
+  "muse-spark-1.3-contributor",
+  "muse-spark-1.2-contributor",
+  "qwen3.8-max",
+  "qwen3.8-flash",
+  "qwen3.7-max",
+  "qwen3.7-plus",
+  "qwen3.6-plus",
+  "hy4-preview",
+  "hy3",
+  "omen-alpha"
+];
+var PROTOCOL_VALUES = ["chat_completions", "anthropic", "responses"];
+var MAX_PROTOCOL_RULES = 64;
+var MAX_PROTOCOL_PATTERN_LENGTH = 128;
+function normalizeProtocolRulesInput(raw) {
+  let value = raw;
+  if (typeof value === "string") {
+    const text = value.trim();
+    if (!text) return { rules: [] };
+    try {
+      value = JSON.parse(text);
+    } catch {
+      return { error: "protocol_rules \u5FC5\u987B\u662F\u5408\u6CD5\u7684 JSON \u6570\u7EC4" };
+    }
+  }
+  if (!Array.isArray(value)) return { error: "protocol_rules \u5FC5\u987B\u662F\u6570\u7EC4" };
+  if (value.length > MAX_PROTOCOL_RULES) return { error: `protocol_rules \u6700\u591A ${MAX_PROTOCOL_RULES} \u6761` };
+  const rules = [];
+  for (let i = 0; i < value.length; i++) {
+    const entry = value[i];
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      return { error: `protocol_rules[${i}] \u5FC5\u987B\u662F\u5BF9\u8C61` };
+    }
+    const pattern = String(entry.pattern ?? "").toLowerCase().trim();
+    if (!pattern) return { error: `protocol_rules[${i}]: pattern \u5FC5\u586B` };
+    if (pattern.length > MAX_PROTOCOL_PATTERN_LENGTH) {
+      return { error: `protocol_rules[${i}]: pattern \u6700\u591A ${MAX_PROTOCOL_PATTERN_LENGTH} \u4E2A\u5B57\u7B26` };
+    }
+    if (/\s/.test(pattern)) return { error: `protocol_rules[${i}]: pattern \u4E0D\u80FD\u5305\u542B\u7A7A\u767D\u5B57\u7B26` };
+    const stars = pattern.split("*").length - 1;
+    if (stars > 1 || stars === 1 && !pattern.endsWith("*")) {
+      return { error: `protocol_rules[${i}]: pattern \u53EA\u80FD\u4F7F\u7528\u4E00\u4E2A\u7ED3\u5C3E\u7684 * \u901A\u914D\u7B26` };
+    }
+    const protocol = String(entry.protocol ?? "").trim();
+    if (!PROTOCOL_VALUES.includes(protocol)) {
+      return { error: `protocol_rules[${i}]: protocol \u5FC5\u987B\u662F chat_completions\u3001anthropic \u6216 responses` };
+    }
+    rules.push({ pattern, protocol });
+  }
+  return { rules };
+}
+function parseStoredProtocolRules(raw) {
+  if (raw === null || raw === void 0) return null;
+  if (typeof raw === "string" && !raw.trim()) return null;
+  const result = normalizeProtocolRulesInput(raw);
+  return "rules" in result ? result.rules : null;
+}
+function resolveOpenCodeGoProtocol(account, model) {
+  const custom = parseStoredProtocolRules(account?.protocol_rules);
+  if (custom) {
+    const normalized = normalizeOpenCodeModelId(model);
+    for (const rule of custom) {
+      if (protocolRuleMatches(rule.pattern, normalized)) return rule.protocol;
+    }
+    return "chat_completions";
+  }
+  return openCodeGoModelProtocol(model);
 }
 var MIN_MAX_OUTPUT_TOKENS = 128;
 function isReasoningModel(model) {
@@ -3715,7 +3812,7 @@ async function handleGatewayRequest(request, env, failover, ctx) {
   }
   const toolSchemaFixed = sanitizeToolSchemas(requestBody, { removeLookaround: provider === "openai" });
   let bridgedBody;
-  if (provider === "opencode_go" && request.method !== "GET" && request.method !== "HEAD" && !upstreamPath.includes("/responses") && !upstreamPath.includes("/v1/messages") && openCodeGoModelProtocol(upstreamModel) === "responses") {
+  if (provider === "opencode_go" && request.method !== "GET" && request.method !== "HEAD" && !upstreamPath.includes("/responses") && !upstreamPath.includes("/v1/messages") && resolveOpenCodeGoProtocol(account, upstreamModel) === "responses") {
     if (upstreamModel && upstreamModel !== model && requestBody.model) {
       requestBody.model = upstreamModel;
     }
@@ -3909,7 +4006,7 @@ async function handleFailover(body, request, env, failover, keyRecord, accounts,
       }
       let retrySendBody = body;
       let retryBridged = false;
-      if (provider === "opencode_go" && body !== void 0 && retryBody && !upstreamPath.includes("/responses") && !upstreamPath.includes("/v1/messages") && openCodeGoModelProtocol(String(retryBody?.model || upstreamModel)) === "responses") {
+      if (provider === "opencode_go" && body !== void 0 && retryBody && !upstreamPath.includes("/responses") && !upstreamPath.includes("/v1/messages") && resolveOpenCodeGoProtocol(account, String(retryBody?.model || upstreamModel)) === "responses") {
         try {
           retrySendBody = JSON.stringify(chatCompletionsToResponses(retryBody));
           upstreamPath = "/v1/responses";
@@ -4129,7 +4226,7 @@ async function handleOpenAIRequest(request, env, failover, ctx) {
   sanitizeToolSchemas(requestBody, { removeLookaround: provider === "openai" });
   let bridged = false;
   let outboundBody = requestBody;
-  if (!isResponses && provider === "opencode_go" && openCodeGoModelProtocol(upstreamModel) === "responses") {
+  if (!isResponses && provider === "opencode_go" && resolveOpenCodeGoProtocol(account, upstreamModel) === "responses") {
     try {
       outboundBody = chatCompletionsToResponses(requestBody);
       endpoint = "/v1/responses";
@@ -4304,7 +4401,7 @@ async function handleFailover2(body, request, env, failover, keyRecord, accounts
       let retryEndpoint = endpoint;
       let retrySendBody = body;
       let retryBridged = false;
-      if (!isResponses && currentProvider === "opencode_go" && retryBody && openCodeGoModelProtocol(String(retryBody.model || upstreamModel)) === "responses") {
+      if (!isResponses && currentProvider === "opencode_go" && retryBody && resolveOpenCodeGoProtocol(account, String(retryBody.model || upstreamModel)) === "responses") {
         try {
           retrySendBody = JSON.stringify(chatCompletionsToResponses(retryBody));
           retryEndpoint = "/v1/responses";
@@ -4935,10 +5032,10 @@ function getProbeModel(provider) {
 }
 
 // functions/src/utils/healthcheck.ts
-function withProtocol(models, provider) {
-  if (provider === "anthropic") return models.map((model) => ({ ...model, protocol: "anthropic" }));
-  if (provider === "opencode_go") {
-    return models.map((model) => ({ ...model, protocol: openCodeGoModelProtocol(model.id) }));
+function withProtocol(models, account) {
+  if (account.provider === "anthropic") return models.map((model) => ({ ...model, protocol: "anthropic" }));
+  if (account.provider === "opencode_go") {
+    return models.map((model) => ({ ...model, protocol: resolveOpenCodeGoProtocol(account, model.id) }));
   }
   return models.map((model) => ({ ...model, protocol: "chat_completions" }));
 }
@@ -4970,7 +5067,7 @@ async function listUpstreamModels(db, accountId, refresh = false) {
   if (!account) throw new Error("\u8D26\u53F7\u4E0D\u5B58\u5728");
   const cached = readCachedModels(account);
   if (cached && !refresh && !isStale(cached.fetchedAt)) {
-    return { models: withProtocol(cached.models, account.provider), cached: true, fetchedAt: cached.fetchedAt };
+    return { models: withProtocol(cached.models, account), cached: true, fetchedAt: cached.fetchedAt };
   }
   const apiKey = String(account.api_key || "").trim();
   if (!apiKey) throw new Error("\u8D26\u53F7\u6CA1\u6709\u914D\u7F6E\u5BC6\u94A5");
@@ -4987,7 +5084,7 @@ async function listUpstreamModels(db, accountId, refresh = false) {
     });
     const raw = await response.text().catch(() => "");
     if (!response.ok) {
-      if (cached) return { models: withProtocol(cached.models, account.provider), cached: true, fetchedAt: cached.fetchedAt };
+      if (cached) return { models: withProtocol(cached.models, account), cached: true, fetchedAt: cached.fetchedAt };
       throw new Error(`\u83B7\u53D6\u6A21\u578B\u5931\u8D25\uFF08HTTP ${response.status}\uFF09`);
     }
     let payload = null;
@@ -4999,13 +5096,13 @@ async function listUpstreamModels(db, accountId, refresh = false) {
     const rows = Array.isArray(payload?.data) ? payload.data : Array.isArray(payload) ? payload : [];
     const models = rows.map((row) => ({ id: String(row.id || row.name || "").trim(), name: row.name ? String(row.name) : void 0 })).filter((row) => row.id).slice(0, 200);
     if (!models.length) {
-      if (cached) return { models: withProtocol(cached.models, account.provider), cached: true, fetchedAt: cached.fetchedAt };
+      if (cached) return { models: withProtocol(cached.models, account), cached: true, fetchedAt: cached.fetchedAt };
       throw new Error("\u4E0A\u6E38\u6CA1\u6709\u8FD4\u56DE\u53EF\u7528\u6A21\u578B");
     }
     await db.saveUpstreamModels(accountId, models).catch(() => {
     });
     const stored = await db.getAccount(accountId);
-    return { models: withProtocol(models, account.provider), cached: false, fetchedAt: String(stored?.upstream_models_at || "") };
+    return { models: withProtocol(models, account), cached: false, fetchedAt: String(stored?.upstream_models_at || "") };
   } finally {
     clearTimeout(timer);
   }
@@ -5045,7 +5142,7 @@ async function probeAccount(db, accountId, selectedModel) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
   const startedAt = Date.now();
-  const protocol = account.provider === "opencode_go" ? openCodeGoModelProtocol(probeModel) : isAnthropic ? "anthropic" : "chat_completions";
+  const protocol = account.provider === "opencode_go" ? resolveOpenCodeGoProtocol(account, probeModel) : isAnthropic ? "anthropic" : "chat_completions";
   const endpoint = protocol === "anthropic" ? `${baseUrl}/v1/messages` : protocol === "responses" ? `${baseUrl}/v1/responses` : `${baseUrl}/v1/chat/completions`;
   const chatPayload = {
     model: probeModel,
@@ -5264,6 +5361,12 @@ async function handleAccountsRequest(request, env) {
     if (!apiKey) return jsonError2("\u8BF7\u586B\u5199\u4E0A\u6E38\u5BC6\u94A5", 400);
     const multiplier = readRateMultiplier(body.rate_multiplier ?? 1);
     if (typeof multiplier === "string") return jsonError2(multiplier, 400);
+    let protocolRules = null;
+    if (body.protocol_rules !== void 0 && body.protocol_rules !== null) {
+      const normalized = normalizeProtocolRulesInput(body.protocol_rules);
+      if ("error" in normalized) return jsonError2(normalized.error, 400);
+      if (normalized.rules.length) protocolRules = JSON.stringify(normalized.rules);
+    }
     const result = await db.createAccount(
       name,
       provider,
@@ -5273,7 +5376,8 @@ async function handleAccountsRequest(request, env) {
       Number(body.priority) || 0,
       body.client_spoofing,
       body.enabled === false || body.enabled === 0 ? 0 : 1,
-      multiplier
+      multiplier,
+      protocolRules
     );
     const account = await db.getAccount(result.lastRowId);
     return new Response(JSON.stringify({ data: maskAccount(account) }), {
@@ -5316,6 +5420,15 @@ async function handleAccountsRequest(request, env) {
       const multiplier = readRateMultiplier(body.rate_multiplier);
       if (typeof multiplier === "string") return jsonError2(multiplier, 400);
       updates.rate_multiplier = multiplier;
+    }
+    if (body.protocol_rules !== void 0) {
+      if (body.protocol_rules === null || typeof body.protocol_rules === "string" && !body.protocol_rules.trim()) {
+        updates.protocol_rules = null;
+      } else {
+        const normalized = normalizeProtocolRulesInput(body.protocol_rules);
+        if ("error" in normalized) return jsonError2(normalized.error, 400);
+        updates.protocol_rules = normalized.rules.length ? JSON.stringify(normalized.rules) : null;
+      }
     }
     if (typeof body.api_key === "string" && body.api_key.trim() && body.api_key.trim() !== "***") {
       updates.api_key = body.api_key.trim();
@@ -6129,13 +6242,13 @@ function allowlistGroupFor(keyRecord, groups) {
   return keyGroupId ? groups.find((group) => group.id === keyGroupId) : void 0;
 }
 function buildProviderModelEntries(accounts, mappings) {
-  const protocolFor = (provider, id) => provider === "opencode_go" ? openCodeGoModelProtocol(id) : provider === "anthropic" ? "anthropic" : "chat_completions";
+  const protocolFor = (provider, id, account) => provider === "opencode_go" ? resolveOpenCodeGoProtocol(account, id) : provider === "anthropic" ? "anthropic" : "chat_completions";
   const ids = [];
   const protocolById = /* @__PURE__ */ new Map();
-  const note = (id, provider) => {
+  const note = (id, provider, account) => {
     if (!id || protocolById.has(id)) return;
     ids.push(id);
-    protocolById.set(id, protocolFor(provider, id));
+    protocolById.set(id, protocolFor(provider, id, account));
   };
   mappings.forEach((m) => note(String(m.requested_model || ""), m.provider));
   const catalogueAccounts = [
@@ -6143,12 +6256,21 @@ function buildProviderModelEntries(accounts, mappings) {
     ...accounts.filter((a) => a.provider !== "opencode_go")
   ];
   catalogueAccounts.forEach((account) => {
-    for (const row of readCachedModels(account)?.models || []) note(row.id, account.provider);
+    for (const row of readCachedModels(account)?.models || []) note(row.id, account.provider, account);
   });
-  accounts.forEach((account) => note(
-    account.provider === "anthropic" ? "claude-3-5-sonnet-20241022" : account.provider === "xai" ? "grok-2-latest" : account.provider === "opencode_go" ? "glm-5.3" : "gpt-4o",
-    account.provider
-  ));
+  accounts.forEach((account) => {
+    if (account.provider === "opencode_go") {
+      if (!readCachedModels(account)) {
+        for (const id of DEFAULT_OPENCODE_GO_MODEL_IDS) note(id, "opencode_go", account);
+      }
+      return;
+    }
+    note(
+      account.provider === "anthropic" ? "claude-3-5-sonnet-20241022" : account.provider === "xai" ? "grok-2-latest" : "gpt-4o",
+      account.provider,
+      account
+    );
+  });
   return ids.map((id) => ({ id, object: "model", owned_by: "sub2api", protocol: protocolById.get(id) || "chat_completions" }));
 }
 async function handleProviderModelRetrieve(request, env, failover, path) {

@@ -15,7 +15,7 @@
 
 export type OpenCodeProtocol = 'chat_completions' | 'responses' | 'anthropic';
 
-interface ProtocolRule {
+export interface ProtocolRule {
   pattern: string;
   protocol: OpenCodeProtocol;
 }
@@ -59,6 +59,127 @@ export function openCodeGoModelProtocol(model: string): OpenCodeProtocol {
     if (protocolRuleMatches(rule.pattern, normalized)) return rule.protocol;
   }
   return 'chat_completions';
+}
+
+// ---------------------------------------------------------------------------
+// Account-level protocol rules (opencode_go)
+// ---------------------------------------------------------------------------
+
+// Official opencode_go catalog. Used as the downstream /v1/models answer for
+// an account that has not synced its own list yet, so a fresh install offers
+// the whole catalog instead of one placeholder. Ported from Go's
+// DefaultOpenCodeGoModelIDs().
+export const DEFAULT_OPENCODE_GO_MODEL_IDS: string[] = [
+  'grok-4.7',
+  'grok-4.6',
+  'gpt-5.6-luna',
+  'glm-5.3-flash',
+  'glm-5.3',
+  'glm-5.2',
+  'glm-5.1',
+  'kimi-k3',
+  'kimi-k2.7-code',
+  'kimi-k2.6',
+  'longcat-2.0',
+  'deepseek-v4-pro',
+  'deepseek-v4-flash',
+  'deepseek-v4-flash-vision-exp',
+  'mimo-v2.5',
+  'mimo-v2.5-pro',
+  'minimax-m3',
+  'minimax-m2.7',
+  'minimax-m2.5',
+  'muse-spark-1.3-contributor',
+  'muse-spark-1.2-contributor',
+  'qwen3.8-max',
+  'qwen3.8-flash',
+  'qwen3.7-max',
+  'qwen3.7-plus',
+  'qwen3.6-plus',
+  'hy4-preview',
+  'hy3',
+  'omen-alpha',
+];
+
+const PROTOCOL_VALUES: OpenCodeProtocol[] = ['chat_completions', 'anthropic', 'responses'];
+const MAX_PROTOCOL_RULES = 64;
+const MAX_PROTOCOL_PATTERN_LENGTH = 128;
+
+/**
+ * Validate operator-supplied rules (Go:
+ * NormalizeOpenCodeGoProtocolRulesCredentials). Accepts an array or a JSON
+ * string. An empty or absent value normalizes to an empty array, which the
+ * caller stores as NULL so the account falls back to the defaults.
+ */
+export function normalizeProtocolRulesInput(raw: unknown): { rules: ProtocolRule[] } | { error: string } {
+  let value = raw;
+  if (typeof value === 'string') {
+    const text = value.trim();
+    if (!text) return { rules: [] };
+    try {
+      value = JSON.parse(text);
+    } catch {
+      return { error: 'protocol_rules 必须是合法的 JSON 数组' };
+    }
+  }
+  if (!Array.isArray(value)) return { error: 'protocol_rules 必须是数组' };
+  if (value.length > MAX_PROTOCOL_RULES) return { error: `protocol_rules 最多 ${MAX_PROTOCOL_RULES} 条` };
+  const rules: ProtocolRule[] = [];
+  for (let i = 0; i < value.length; i++) {
+    const entry = value[i] as Record<string, unknown> | null;
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      return { error: `protocol_rules[${i}] 必须是对象` };
+    }
+    const pattern = String(entry.pattern ?? '').toLowerCase().trim();
+    if (!pattern) return { error: `protocol_rules[${i}]: pattern 必填` };
+    if (pattern.length > MAX_PROTOCOL_PATTERN_LENGTH) {
+      return { error: `protocol_rules[${i}]: pattern 最多 ${MAX_PROTOCOL_PATTERN_LENGTH} 个字符` };
+    }
+    if (/\s/.test(pattern)) return { error: `protocol_rules[${i}]: pattern 不能包含空白字符` };
+    const stars = pattern.split('*').length - 1;
+    if (stars > 1 || (stars === 1 && !pattern.endsWith('*'))) {
+      return { error: `protocol_rules[${i}]: pattern 只能使用一个结尾的 * 通配符` };
+    }
+    const protocol = String(entry.protocol ?? '').trim();
+    if (!PROTOCOL_VALUES.includes(protocol as OpenCodeProtocol)) {
+      return { error: `protocol_rules[${i}]: protocol 必须是 chat_completions、anthropic 或 responses` };
+    }
+    rules.push({ pattern, protocol: protocol as OpenCodeProtocol });
+  }
+  return { rules };
+}
+
+/**
+ * Lenient read of the stored column: an unusable value silently falls back to
+ * the defaults instead of breaking routing (Go: openCodeGoProtocolRules).
+ * Empty or NULL means the account keeps the built-in table.
+ */
+export function parseStoredProtocolRules(raw: unknown): ProtocolRule[] | null {
+  if (raw === null || raw === undefined) return null;
+  if (typeof raw === 'string' && !raw.trim()) return null;
+  const result = normalizeProtocolRulesInput(raw);
+  return 'rules' in result ? result.rules : null;
+}
+
+/**
+ * The native endpoint family for one model on one account. Rules stored on the
+ * account replace the built-in table entirely: when present, a miss falls back
+ * to chat completions rather than the defaults (Go: ResolveOpenCodeGoProtocol
+ * with the pinned api_protocol step removed — this schema has no such field).
+ */
+export function resolveOpenCodeGoProtocol(
+  account: { protocol_rules?: unknown } | null | undefined,
+  model: string
+): OpenCodeProtocol {
+  const custom = parseStoredProtocolRules(account?.protocol_rules);
+  if (custom) {
+    const normalized = normalizeOpenCodeModelId(model);
+    for (const rule of custom) {
+      if (protocolRuleMatches(rule.pattern, normalized)) return rule.protocol;
+    }
+    return 'chat_completions';
+  }
+  return openCodeGoModelProtocol(model);
 }
 
 // ---------------------------------------------------------------------------

@@ -175,6 +175,72 @@ check("group delete blocked while in use", st in (400, 409), (st, js))
 st, js = call("PUT", "/api/v1/accounts/%s" % aid, {"rate_multiplier": 0.5}, token)
 check("account multiplier updatable", st == 200 and js.get("data", {}).get("rate_multiplier") == 0.5, (st, js))
 
+# --- account protocol rules (opencode_go) + official catalogue fallback ---
+# Rules stored on an account replace the built-in table for that account (Go:
+# credentials.protocol_rules), and an opencode_go account that has not synced
+# its catalogue yet answers the downstream list with the official ids instead
+# of one placeholder (Go: DefaultOpenCodeGoModelIDs).
+st, js = call("POST", "/api/v1/accounts",
+              {"name": "opencode-rules", "provider": "opencode_go", "api_key": "sk-opc",
+               "group_id": gid,
+               "protocol_rules": '[{"pattern":"glm-*","protocol":"responses"}]'}, token)
+ocaid = js.get("data", {}).get("id")
+check("create opencode account with rules", st == 201 and ocaid, (st, js))
+check("stored rules round-trip",
+      json.loads(js.get("data", {}).get("protocol_rules") or "[]")
+      == [{"pattern": "glm-*", "protocol": "responses"}], js.get("data"))
+
+st, js = call("POST", "/api/v1/accounts",
+              {"name": "bad-rules", "provider": "opencode_go", "api_key": "sk-x",
+               "group_id": gid, "protocol_rules": '[{"pattern":"g*p","protocol":"responses"}]'}, token)
+check("mid-string wildcard in rules rejected", st == 400, (st, js))
+
+st, js = call("POST", "/api/v1/accounts",
+              {"name": "bad-rules", "provider": "opencode_go", "api_key": "sk-x",
+               "group_id": gid, "protocol_rules": '{"pattern":"glm-*"}'}, token)
+check("non-array rules rejected", st == 400, (st, js))
+
+st, js = call("POST", "/api/v1/accounts",
+              {"name": "bad-rules", "provider": "opencode_go", "api_key": "sk-x",
+               "group_id": gid, "protocol_rules": '[{"pattern":"glm-*","protocol":"grpc"}]'}, token)
+check("unknown protocol in rules rejected", st == 400, (st, js))
+
+st, js = call("PUT", "/api/v1/accounts/%s" % ocaid,
+              {"protocol_rules": '[{"pattern":"grok-*","protocol":"responses"}]'}, token)
+check("account rules updatable",
+      st == 200 and "grok-*" in (js.get("data", {}).get("protocol_rules") or ""), (st, js))
+
+st, js = call("POST", "/api/v1/keys", {"name": "opc-list-key", "quota_limit": 0}, token)
+opc_secret = js.get("data", {}).get("key", "")
+check("list client key issued", st == 201 and opc_secret.startswith("sk-"), (st, js))
+
+st, js = call("GET", "/v1/models", token=opc_secret)
+ids = {row.get("id"): row for row in js.get("data", [])}
+check("uncached opencode account lists the official catalogue",
+      st == 200 and all(i in ids for i in ("grok-4.7", "glm-5.3", "kimi-k3", "minimax-m3", "omen-alpha")),
+      (st, sorted(ids)[:8]))
+check("account rules relabel the catalogue",
+      ids.get("glm-5.3", {}).get("protocol") == "chat_completions"
+      and ids.get("grok-4.7", {}).get("protocol") == "responses",
+      ids.get("glm-5.3"))
+
+st, js = call("PUT", "/api/v1/accounts/%s" % ocaid,
+              {"protocol_rules": '[{"pattern":"glm-*","protocol":"responses"}]'}, token)
+check("rules swap on update",
+      st == 200 and "glm-*" in (js.get("data", {}).get("protocol_rules") or ""), (st, js))
+st, js = call("GET", "/v1/models", token=opc_secret)
+ids = {row.get("id"): row for row in js.get("data", [])}
+check("swapped rules relabel the catalogue",
+      ids.get("glm-5.3", {}).get("protocol") == "responses", ids.get("glm-5.3"))
+
+st, js = call("PUT", "/api/v1/accounts/%s" % ocaid, {"protocol_rules": ""}, token)
+check("empty rules clear back to defaults",
+      st == 200 and not js.get("data", {}).get("protocol_rules"), (st, js))
+st, js = call("GET", "/v1/models", token=opc_secret)
+ids = {row.get("id"): row for row in js.get("data", [])}
+check("cleared rules restore the default label",
+      ids.get("glm-5.3", {}).get("protocol") == "chat_completions", ids.get("glm-5.3"))
+
 # --- stats ---
 st, js = call("GET", "/api/v1/stats?hours=24", token=token)
 data = js.get("data", {})

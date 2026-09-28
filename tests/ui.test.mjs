@@ -235,6 +235,7 @@ const multiplierInput = form.querySelector('[name="rate_multiplier"]')
 check('account dialog has provider + group', Boolean(providerSelect && groupSelect))
 check('account dialog carries its own credentials', Boolean(keyInput && baseInput))
 check('account dialog exposes rate multiplier', Boolean(multiplierInput))
+check('account dialog offers protocol rules', Boolean(form.querySelector('[name="protocol_rules"]')))
 check('account dialog has no channel field', !form.querySelector('[name="channel_id"]'))
 
 providerSelect.value = 'anthropic'

@@ -589,8 +589,8 @@ check('downstream catalogue models are format-labelled',
       downstream.get('stub-model', {}).get('protocol') == 'chat_completions',
       downstream.get('stub-model'))
 check('downstream list keeps the configured models format-labelled',
-      'glm-5.3' in downstream and downstream['glm-5.3'].get('protocol') == 'chat_completions',
-      downstream.get('glm-5.3'))
+      'muse-spark-1.3' in downstream and downstream['muse-spark-1.3'].get('protocol') == 'responses',
+      downstream.get('muse-spark-1.3'))
 
 # Chat-native models on the same account must NOT be bridged (glm speaks chat).
 call('/models', 'POST', {
@@ -605,6 +605,39 @@ glm_seen = [r for r in requests_seen(PORT_C) if r.get('model') == 'glm-5.3']
 check('chat-native model keeps the direct chat path',
       status == 200 and bool(glm_seen) and glm_seen[0]['path'].endswith('/chat/completions') and glm_seen[0]['has_messages'],
       (status, glm_seen[0] if glm_seen else None))
+
+# Account-owned rules replace the built-in table wholesale (Go:
+# credentials.protocol_rules): pinning glm-* to responses bridges the same
+# chat request, and clearing the field puts the defaults back in charge.
+status, payload = call(f'/accounts/{opencode_acct_id}', 'PUT',
+                       {'protocol_rules': '[{"pattern":"glm-*","protocol":"responses"}]'},
+                       token=token)
+check('account protocol rules save',
+      status == 200 and 'glm-*' in (payload.get('data', {}).get('protocol_rules') or ''),
+      (status, payload))
+
+reset_upstreams()
+status, payload = call('/v1/chat/completions', 'POST',
+                       {'model': 'glm-5.3', 'messages': [{'role': 'user', 'content': 'hi'}]},
+                       token=client_key, base=BASE)
+glm_rules_seen = [r for r in requests_seen(PORT_C) if r.get('model') == 'glm-5.3']
+check('account rules bridge what the defaults kept direct',
+      status == 200 and bool(glm_rules_seen) and glm_rules_seen[-1]['path'].endswith('/v1/responses'),
+      glm_rules_seen[-1]['path'] if glm_rules_seen else status)
+
+status, payload = call(f'/accounts/{opencode_acct_id}', 'PUT',
+                       {'protocol_rules': ''}, token=token)
+check('clearing the rules restores the defaults',
+      status == 200 and not payload.get('data', {}).get('protocol_rules'), (status, payload))
+
+reset_upstreams()
+status, payload = call('/v1/chat/completions', 'POST',
+                       {'model': 'glm-5.3', 'messages': [{'role': 'user', 'content': 'hi'}]},
+                       token=client_key, base=BASE)
+glm_cleared = [r for r in requests_seen(PORT_C) if r.get('model') == 'glm-5.3']
+check('cleared rules put glm back on the direct chat path',
+      status == 200 and bool(glm_cleared) and glm_cleared[-1]['path'].endswith('/chat/completions'),
+      glm_cleared[-1]['path'] if glm_cleared else status)
 
 # The connection-test probe must speak each model's native protocol, otherwise
 # picking muse-spark in the dialog reports a healthy credential as dead
