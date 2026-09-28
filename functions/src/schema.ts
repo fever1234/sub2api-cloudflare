@@ -17,7 +17,7 @@
  * exception". The version is recorded in `settings` once the work succeeds, and
  * later requests spend a single cheap read confirming there is nothing to do.
  */
-export const SCHEMA_VERSION = '10';
+export const SCHEMA_VERSION = '12';
 
 /**
  * The accounts table DDL.
@@ -67,6 +67,8 @@ export const SCHEMA_STATEMENTS: string[] = [
     error_threshold REAL DEFAULT 0.5,
     error_count_threshold INTEGER DEFAULT 5,
     window_seconds INTEGER DEFAULT 300,
+    model_allowlist_enabled INTEGER DEFAULT 0,
+    model_allowlist TEXT,
     created_at TEXT DEFAULT (datetime('now'))
   )`,
   `CREATE TABLE IF NOT EXISTS channels (
@@ -120,6 +122,8 @@ export const SCHEMA_STATEMENTS: string[] = [
     status INTEGER DEFAULT 200,
     error_message TEXT,
     latency_ms INTEGER,
+    reasoning_effort TEXT,
+    user_agent TEXT,
     created_at TEXT DEFAULT (datetime('now'))
   )`,
   `CREATE TABLE IF NOT EXISTS request_logs (
@@ -213,5 +217,17 @@ export const ADDITIVE_COLUMNS: Array<{ table: string; column: string; definition
   { table: 'usage_records', column: 'rate_multiplier', definition: 'REAL DEFAULT 1' },
   { table: 'usage_records', column: 'base_cost', definition: 'REAL DEFAULT 0' },
   { table: 'usage_records', column: 'cost_estimated', definition: 'INTEGER DEFAULT 0' },
-  { table: 'usage_records', column: 'cache_status', definition: 'TEXT' }
+  { table: 'usage_records', column: 'cache_status', definition: 'TEXT' },
+
+  // Request shape observability. Which reasoning budget was asked for, and
+  // which client sent the request — the two questions a usage row could not
+  // answer when investigating an unexpected bill or a misbehaving integration.
+  { table: 'usage_records', column: 'reasoning_effort', definition: 'TEXT' },
+  { table: 'usage_records', column: 'user_agent', definition: 'TEXT' },
+
+  // Per-group model allowlist (Go: group_model_allowlist). The list is JSON
+  // text so entries can carry trailing `*` wildcards; the enabled flag keeps
+  // an emptied list visible instead of silently repurposing it.
+  { table: 'groups', column: 'model_allowlist_enabled', definition: 'INTEGER DEFAULT 0' },
+  { table: 'groups', column: 'model_allowlist', definition: 'TEXT' }
 ];

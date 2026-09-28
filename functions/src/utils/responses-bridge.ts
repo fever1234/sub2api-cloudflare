@@ -485,6 +485,9 @@ export interface ResponsesToChatState {
   sawToolCall: boolean;
   sawText: boolean;
   finalized: boolean;
+  /** Set when the upstream reported response.failed; carries its message. */
+  failed: boolean;
+  failedMessage: string;
   nextToolCallIndex: number;
   outputIndexToToolIndex: Record<number, number>;
   outputIndexToArguments: Record<number, string>;
@@ -502,6 +505,8 @@ export function newResponsesToChatState(model: string): ResponsesToChatState {
     sawToolCall: false,
     sawText: false,
     finalized: false,
+    failed: false,
+    failedMessage: '',
     nextToolCallIndex: 0,
     outputIndexToToolIndex: {},
     outputIndexToArguments: {},
@@ -613,6 +618,19 @@ function handleReasoningDelta(evt: any, state: ResponsesToChatState): any[] {
 }
 
 function handleCompleted(evt: any, state: ResponsesToChatState): any[] {
+  const type = String(evt?.type || '');
+  if (type === 'response.failed') {
+    // A failed response is an upstream error, not a stop: fabricating
+    // finish_reason: stop would let a failed generation masquerade as a
+    // complete answer. Mark the state so the stream errors instead.
+    state.failed = true;
+    state.finalized = true;
+    const response = isObject(evt.response) ? evt.response : undefined;
+    const err = response && isObject(response.error) ? response.error : null;
+    state.failedMessage = (err && err.message) || 'Upstream response failed';
+    return [];
+  }
+
   state.finalized = true;
   let finishReason = 'stop';
 
@@ -877,7 +895,19 @@ export function responsesSseToChatStream(
                 for (const chunk of responsesEventToChatChunks(event, state)) controller.enqueue(encoder.encode(chatChunkToSse(chunk)));
               }
             }
-            for (const chunk of finalizeResponsesChatStream(state)) controller.enqueue(encoder.encode(chatChunkToSse(chunk)));
+            if (state.failed) {
+              controller.error(new Error(state.failedMessage));
+              return;
+            }
+            if (!state.finalized) {
+              // Upstream vanished mid-generation. Synthesizing a stop here
+              // would hand the client a truncated answer as a complete one,
+              // so the stream is broken instead — and, because the error
+              // surfaces before the Response settles, the request can still
+              // be failed over to another account.
+              controller.error(new Error('Upstream stream ended before a terminal event'));
+              return;
+            }
             controller.enqueue(encoder.encode('data: [DONE]\n\n'));
             controller.close();
             return;
@@ -890,6 +920,10 @@ export function responsesSseToChatStream(
               controller.enqueue(encoder.encode(chatChunkToSse(chunk)));
               produced = true;
             }
+          }
+          if (state.failed) {
+            controller.error(new Error(state.failedMessage));
+            return;
           }
           if (produced) return;
         }

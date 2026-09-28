@@ -1,8 +1,15 @@
 // Shared request/usage bookkeeping for the gateway routes.
 import type { Database } from '../db';
 import type { FailoverManager } from '../failover';
+import type { Env } from '../index';
 import { calculateCostBreakdown } from '../billing';
-import { measureStreamTiming, StreamOutcome } from './proxy';
+import {
+  measureStreamTiming,
+  stageFirstChunk,
+  streamGuardFromEnv,
+  stripBodyHeaders,
+  StreamOutcome
+} from './proxy';
 import { Deferrable } from './background';
 
 /** Upper bound on how long the post-response bookkeeping may wait for a stream. */
@@ -20,6 +27,11 @@ export interface RecordContext {
   startedAt: number;
   /** Keeps the post-stream writes alive after the Response is returned. */
   ctx?: Deferrable;
+  /** Env for the stream watchdog budgets; absent means library defaults. */
+  env?: Env;
+  /** Request-shape telemetry carried onto the usage row; see billing.ts. */
+  reasoningEffort?: string | null;
+  userAgent?: string | null;
 }
 
 /**
@@ -30,27 +42,45 @@ export interface RecordContext {
  * the dashboard totals and quota accounting. The body is forwarded unbuffered;
  * the record is written once the upstream closes.
  *
+ * Before the Response exists the first upstream chunk is staged, so an upstream
+ * that opens a stream and then stalls is still failover-eligible: this function
+ * throws (rejects) and the caller moves to the next account. Once it returns,
+ * the attempt is committed.
+ *
  * The `waitUntil` registration has to happen here, synchronously, before the
  * Response is handed back. Calling it from the stream's completion callback
  * throws, because by then the fetch handler has already returned and the
  * runtime refuses to extend a request that is over.
  */
-export function streamWithRecording(
+export async function streamWithRecording(
   body: ReadableStream<Uint8Array>,
   status: number,
   headers: Record<string, string>,
   context: RecordContext
-): Response {
+): Promise<Response> {
   const isError = status >= 400;
+  const guard = streamGuardFromEnv(context.env || {});
+  const contentType = String(headers['content-type'] || headers['Content-Type'] || '');
+  const keepalive = contentType.includes('text/event-stream');
 
-  // Resolved by the stream's flush/cancel handler below.
+  // Error responses carry their payload as JSON, not a live stream; only
+  // successes get the first-output watchdog, so a 4xx body still streams out.
+  const source = isError ? body : await stageFirstChunk(body, guard);
+
+  // Resolved by the stream's settle handler below.
   let settle: (outcome: StreamOutcome) => void;
   const finished = new Promise<StreamOutcome>(resolve => { settle = resolve; });
 
-  const measured = measureStreamTiming(body, context.startedAt, outcome => settle(outcome));
+  const measured = measureStreamTiming(
+    source,
+    context.startedAt,
+    outcome => settle(outcome),
+    guard,
+    keepalive
+  );
 
   // A stream that is never drained — an abandoned connection, or a runtime that
-  // does not deliver the transformer's cancel callback — would leave `finished`
+  // does not deliver the cancel callback — would leave `finished`
   // pending forever, and a `waitUntil` promise that never settles holds the
   // request open until the edge kills it. Cap the wait so the isolate is always
   // released; a partial record is better than a dropped request. The timer is
@@ -98,7 +128,9 @@ export function streamWithRecording(
       status,
       error_message: isError ? 'Upstream error' : '',
       latency_ms: outcome.totalMs,
-      ttft_ms: outcome.ttftMs ?? undefined
+      ttft_ms: outcome.ttftMs ?? undefined,
+      reasoning_effort: context.reasoningEffort ?? null,
+      user_agent: context.userAgent ?? null
     }).catch(() => {});
 
     await context.db.createRequestLog({
@@ -120,8 +152,18 @@ export function streamWithRecording(
 
   context.failover.recordRequest(context.accountId, context.groupId, isError);
 
+  // Body framing belongs to the bytes that were sent, not the bytes forwarded:
+  // keepalive comments and re-serialization change the length, so content-length
+  // and content-encoding must not travel with them. no-store keeps intermediaries
+  // from caching a partial stream.
+  const outHeaders: Record<string, string> = {
+    ...stripBodyHeaders(headers),
+    'content-type': contentType || headers['Content-Type'] || 'text/event-stream',
+    'cache-control': 'no-store, no-transform'
+  };
+
   return new Response(measured, {
     status,
-    headers: { ...headers, 'content-type': headers['content-type'] || 'text/event-stream' }
+    headers: outHeaders
   });
 }

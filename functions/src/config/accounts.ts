@@ -3,6 +3,7 @@ import type { Env } from '../index';
 import { createDatabase } from '../db';
 import { verifySessionToken, resolveSessionSecret } from '../auth';
 import { probeAccount, probeAccounts, listUpstreamModels } from '../utils/healthcheck';
+import { invalidateAllRoutingSnapshots } from '../utils/routing-cache';
 import { isProvider, getProbeModel } from '../utils/provider';
 
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
@@ -80,6 +81,10 @@ export async function handleAccountsRequest(request: Request, env: Env): Promise
     const refresh = url.searchParams.get('refresh') === '1';
     try {
       const result = await listUpstreamModels(db, id, refresh);
+      // A fresh fetch persists the catalogue onto the account row; the routing
+      // snapshot must drop it now or /v1/models keeps listing the pre-fetch
+      // view for the rest of the TTL.
+      if (!result.cached) invalidateAllRoutingSnapshots();
       const account = await db.getAccount(id);
       return new Response(JSON.stringify({
         data: {

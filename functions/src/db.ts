@@ -65,10 +65,12 @@ export class Database {
     error_threshold?: number;
     error_count_threshold?: number;
     window_seconds?: number;
+    model_allowlist_enabled?: number;
+    model_allowlist?: string;
   } = {}) {
     return this.insert(
-      `INSERT INTO groups (name, description, priority, enabled, error_threshold, error_count_threshold, window_seconds)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO groups (name, description, priority, enabled, error_threshold, error_count_threshold, window_seconds, model_allowlist_enabled, model_allowlist)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         name,
         description || '',
@@ -76,7 +78,9 @@ export class Database {
         options.enabled ?? 1,
         options.error_threshold ?? 0.5,
         options.error_count_threshold ?? 5,
-        options.window_seconds ?? 300
+        options.window_seconds ?? 300,
+        options.model_allowlist_enabled ?? 0,
+        options.model_allowlist ?? null
       ]
     );
   }
@@ -92,6 +96,8 @@ export class Database {
     if (updates.error_threshold !== undefined) { fields.push('error_threshold = ?'); values.push(updates.error_threshold); }
     if (updates.error_count_threshold !== undefined) { fields.push('error_count_threshold = ?'); values.push(updates.error_count_threshold); }
     if (updates.window_seconds !== undefined) { fields.push('window_seconds = ?'); values.push(updates.window_seconds); }
+    if (updates.model_allowlist_enabled !== undefined) { fields.push('model_allowlist_enabled = ?'); values.push(updates.model_allowlist_enabled); }
+    if (updates.model_allowlist !== undefined) { fields.push('model_allowlist = ?'); values.push(updates.model_allowlist); }
     
     if (fields.length === 0) return { changes: 0 };
     values.push(id);
@@ -355,8 +361,8 @@ export class Database {
   async createUsageRecord(record: Partial<UsageRecord>) {
     return this.insert(
       `INSERT INTO usage_records
-       (api_key_id, model, provider, prompt_tokens, completion_tokens, total_tokens, cost, base_cost, rate_multiplier, cost_estimated, cache_status, status, error_message, latency_ms, ttft_ms, group_id, account_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (api_key_id, model, provider, prompt_tokens, completion_tokens, total_tokens, cost, base_cost, rate_multiplier, cost_estimated, cache_status, status, error_message, latency_ms, ttft_ms, group_id, account_id, reasoning_effort, user_agent)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         record.api_key_id ?? 0,
         record.model,
@@ -374,7 +380,9 @@ export class Database {
         record.latency_ms ?? 0,
         record.ttft_ms ?? null,
         record.group_id ?? null,
-        record.account_id ?? null
+        record.account_id ?? null,
+        record.reasoning_effort ?? null,
+        record.user_agent ?? null
       ]
     );
   }

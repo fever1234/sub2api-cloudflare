@@ -21,6 +21,7 @@ BASE = sys.argv[1] if len(sys.argv) > 1 else 'http://127.0.0.1:8788'
 API = f'{BASE}/api/v1'
 ADMIN = ('admin', 'StrongPass123')
 PORT_FAST, PORT_SLOW, PORT_FALLBACK = 9201, 9202, 9203
+PORT_COUNT, PORT_OPS, PORT_SPARE = 9204, 9205, 9206
 
 passed = 0
 failures = []
@@ -71,7 +72,7 @@ def seen(port):
 
 
 # ------------------------------------------------------------------ fixtures
-for port in (PORT_FAST, PORT_SLOW, PORT_FALLBACK):
+for port in (PORT_FAST, PORT_SLOW, PORT_FALLBACK, PORT_COUNT, PORT_OPS, PORT_SPARE):
     serve(port)
 time.sleep(0.4)
 
@@ -230,6 +231,14 @@ with urllib.request.urlopen(request, timeout=30) as response:
 check('stream returns SSE', 'text/event-stream' in content_type, content_type)
 check('stream carries frames', 'data:' in stream_body, stream_body[:60])
 
+# The client asked for a stream but not for usage. Real providers omit the
+# usage frame unless stream_options.include_usage is set, so the gateway must
+# force it upstream or this streamed call would bill at zero tokens.
+stream_seen = seen(PORT_FAST)
+last_stream_opts = (stream_seen[-1].get('stream_options') or {}) if stream_seen else {}
+check('stream forces upstream usage reporting',
+      last_stream_opts.get('include_usage') is True, last_stream_opts)
+
 # The record is written from the stream completion callback, so allow a moment.
 time.sleep(1.5)
 _, usage = call('/usage?limit=20', token=token)
@@ -267,6 +276,20 @@ plain = (usage2.get('data') or [{}])[0]
 check('non-streaming record is also attributed',
       plain.get('group_id') == primary_id and bool(plain.get('account_id')),
       (plain.get('group_id'), plain.get('account_id')))
+
+# Request-shape telemetry: none of the providers echo the reasoning setting,
+# and without the User-Agent an unexpected caller is unidentifiable after the
+# fact. Both are read from the request the gateway already parsed.
+control(PORT_FAST, reset=True, status=200, stream=False)
+call('/v1/chat/completions', 'POST',
+     {'model': 'gpt-4o', 'messages': [{'role': 'user', 'content': 'hi'}],
+      'reasoning_effort': 'high'},
+     token=client_key, base=BASE, headers={'User-Agent': 'sub2api-e2e/9'})
+time.sleep(0.8)
+_, telemetry = call('/usage?limit=50', token=token)
+latest = next((row for row in telemetry.get('data', []) if row.get('user_agent') == 'sub2api-e2e/9'), {})
+check('usage row records the reasoning effort', latest.get('reasoning_effort') == 'high', latest)
+check('usage row records the client user agent', bool(latest), latest)
 
 # ------------------------------------------------------------- health probing
 control(PORT_FAST, reset=True, status=200)
@@ -540,6 +563,132 @@ check('a tripped breaker diverts to the healthy account',
       (status, payload.get('id')))
 check('the circuit-broken account is not attempted at all',
       len(seen(PORT_SLOW)) == 0, seen(PORT_SLOW))
+
+# The bulk cleanup above emptied usage_records, so these four requests are the
+# only rows: three from the loop (the first failed over) plus the healed one.
+# A successful retry bills here just like the main path — without that, the
+# failed-over call would be missing from quota accounting.
+time.sleep(0.8)
+_, failover_usage = call('/usage?limit=50', token=token)
+check('a failed-over call still writes a usage record',
+      len(failover_usage.get('data', [])) == 4, len(failover_usage.get('data', [])))
+
+# ------------------------------------------------- token-count preflights
+# count_tokens and /v1/responses/input_tokens are advisory: they must never
+# generate, never bill, and never let a relay without the endpoint 400 the
+# client. Anthropic accounts forward the count; everything else degrades to a
+# local estimate. See also the source guards in tests/source.test.mjs.
+_, count_group = call('/groups', 'POST', {'name': 'feat-count', 'priority': 0}, token=token)
+count_group_id = count_group.get('data', {}).get('id')
+_, count_acct = call('/accounts', 'POST', {
+    'name': 'feat-count-acct', 'provider': 'anthropic', 'api_key': 'sk-count',
+    'base_url': f'http://127.0.0.1:{PORT_COUNT}',
+    'group_id': count_group_id, 'priority': 0,
+}, token=token)
+# A lower-priority spare exists so health is observable: a circuit-broken
+# preferred account is skipped only when an alternative is available (a single
+# unhealthy account is still selected as the least-bad one).
+_, count_spare = call('/accounts', 'POST', {
+    'name': 'feat-count-spare', 'provider': 'anthropic', 'api_key': 'sk-count-spare',
+    'base_url': f'http://127.0.0.1:{PORT_SPARE}',
+    'group_id': count_group_id, 'priority': 1,
+}, token=token)
+count_spare_id = count_spare.get('data', {}).get('id')
+check('count fixtures created', bool(count_group_id) and bool(count_acct.get('data', {}).get('id')),
+      (count_group_id, count_acct))
+_, count_key_payload = call('/keys', 'POST', {'name': 'feat-count-key', 'group_id': count_group_id}, token=token)
+count_key = count_key_payload.get('data', {}).get('key')
+
+control(PORT_COUNT, reset=True, status=200)
+status, payload = call('/v1/messages/count_tokens', 'POST',
+                       {'model': 'claude-3-5-sonnet-20241022',
+                        'messages': [{'role': 'user', 'content': 'hello world'}]},
+                       token=count_key, base=BASE)
+check('count_tokens answers with the upstream count', status == 200 and payload.get('input_tokens') == 42,
+      (status, payload))
+hits = seen(PORT_COUNT)
+last_count_path = hits[-1].get('path', '').split('?')[0] if hits else ''
+check('count_tokens forwards the count endpoint, not /v1/messages',
+      last_count_path.endswith('/count_tokens'), last_count_path)
+
+# The count must not bill. Preceding usage records are flushed after a pause
+# so the before/after comparison is not racing a deferred write.
+time.sleep(1.5)
+_, usage_before_count = call('/usage?limit=50', token=token)
+control(PORT_COUNT, reset=True, status=404)
+status, payload = call('/v1/messages/count_tokens', 'POST',
+                       {'model': 'claude-3-5-sonnet-20241022',
+                        'messages': [{'role': 'user', 'content': 'hello world'}]},
+                       token=count_key, base=BASE)
+check('a relay without count_tokens still gets a number',
+      status == 200 and (payload.get('input_tokens') or 0) >= 1, (status, payload))
+# With the only other candidate disabled, an account-level failure has
+# nowhere left to rotate. Answering 200 at all proves the preflight degraded
+# to an estimate: a passthrough would have surfaced the 500.
+call(f'/accounts/{count_spare_id}', 'PUT', {'enabled': 0}, token=token)
+control(PORT_COUNT, reset=True, status=500)
+status, payload = call('/v1/messages/count_tokens', 'POST',
+                       {'model': 'claude-3-5-sonnet-20241022',
+                        'messages': [{'role': 'user', 'content': 'hello world'}]},
+                       token=count_key, base=BASE)
+check('an exhausted count failure degrades to an estimate',
+      status == 200 and (payload.get('input_tokens') or 0) >= 1, (status, payload))
+call(f'/accounts/{count_spare_id}', 'PUT', {'enabled': 1}, token=token)
+check('the preflight is never rewritten to a generation path',
+      all(entry.get('path', '').split('?')[0].endswith('/count_tokens') for entry in seen(PORT_COUNT)),
+      [entry.get('path') for entry in seen(PORT_COUNT)])
+time.sleep(0.5)
+_, usage_after_count = call('/usage?limit=50', token=token)
+check('count_tokens writes no usage record',
+      len(usage_after_count.get('data', [])) == len(usage_before_count.get('data', [])),
+      (len(usage_before_count.get('data', [])), len(usage_after_count.get('data', []))))
+
+# The failed counts above must not have marked the preferred account
+# unhealthy: if they had, the circuit would divert this generation to the
+# lower-priority spare and the preferred stub would see nothing.
+control(PORT_COUNT, reset=True, status=200)
+control(PORT_SPARE, reset=True, status=200)
+status, payload = call('/v1/messages', 'POST',
+                       {'model': 'claude-3-5-sonnet-20241022', 'max_tokens': 16,
+                        'messages': [{'role': 'user', 'content': 'hi'}]},
+                       token=count_key, base=BASE)
+check('count failures never poison account health', status == 200, (status, payload))
+msg_hits = seen(PORT_COUNT)
+msg_path = msg_hits[-1].get('path', '').split('?')[0] if msg_hits else ''
+check('the real message reaches the preferred upstream',
+      msg_path.endswith('/v1/messages'), msg_path)
+check('the spare was not needed', len(seen(PORT_SPARE)) == 0, seen(PORT_SPARE))
+
+# OpenCode has no count endpoint at all: its layer is answered locally with
+# zero upstream traffic rather than a 404 fed into account health.
+_, ops_group = call('/groups', 'POST', {'name': 'feat-ops-count', 'priority': 0}, token=token)
+ops_group_id = ops_group.get('data', {}).get('id')
+call('/accounts', 'POST', {
+    'name': 'feat-ops-acct', 'provider': 'opencode_go', 'api_key': 'sk-ops',
+    'base_url': f'http://127.0.0.1:{PORT_OPS}',
+    'group_id': ops_group_id, 'priority': 0,
+}, token=token)
+_, ops_key_payload = call('/keys', 'POST', {'name': 'feat-ops-key', 'group_id': ops_group_id}, token=token)
+ops_key = ops_key_payload.get('data', {}).get('key')
+control(PORT_OPS, reset=True, status=200)
+status, payload = call('/v1/messages/count_tokens', 'POST',
+                       {'model': 'claude-3-5-sonnet-20241022',
+                        'messages': [{'role': 'user', 'content': 'hello world'}]},
+                       token=ops_key, base=BASE)
+check('opencode count_tokens is answered locally', status == 200 and (payload.get('input_tokens') or 0) >= 1,
+      (status, payload))
+check('opencode count_tokens hits no upstream', len(seen(PORT_OPS)) == 0, seen(PORT_OPS))
+
+# Codex sizes its context with /responses/input_tokens. A miss would either 400
+# the client or — worse — POST the preflight to /v1/responses and generate a
+# billable completion instead of counting one.
+control(PORT_FAST, reset=True, status=200)
+status, payload = call('/v1/responses/input_tokens', 'POST',
+                       {'input': 'hello world'}, token=client_key, base=BASE)
+check('responses input_tokens answered locally',
+      status == 200 and payload.get('object') == 'response.input_tokens'
+      and (payload.get('input_tokens') or 0) >= 1, (status, payload))
+check('input_tokens never reaches an upstream', len(seen(PORT_FAST)) == 0, seen(PORT_FAST))
 
 # ------------------------------------------------------------------- teardown
 print()

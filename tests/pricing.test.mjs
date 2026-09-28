@@ -28,7 +28,7 @@ await build({
   bundle: true, format: 'esm', platform: 'neutral', target: 'es2022',
   outfile: outFile, logLevel: 'silent'
 })
-const { calculateCostBreakdown, calculateCost, extractTokenUsage } = await import(pathToFileURL(outFile).href)
+const { calculateCostBreakdown, calculateCost, extractTokenUsage, extractReasoningEffort } = await import(pathToFileURL(outFile).href)
 
 // ---- the unit itself --------------------------------------------------------
 // gpt-5.5 publishes $5 per 1M input and $30 per 1M output. 1,000,000 input
@@ -125,6 +125,27 @@ const openaiUsage = extractTokenUsage({ usage: { prompt_tokens: 11, completion_t
 check('openai token fields are read',
   openaiUsage.promptTokens === 11 && openaiUsage.totalTokens === 16, openaiUsage)
 
+// ---- estimation fallback ---------------------------------------------------
+// An upstream that strips `usage` must still bill something — but the prompt
+// lives on the *request*: a response body has no `messages` field, so the old
+// fallback estimated two junk tokens from `""` and undercharged every one.
+const estimated = extractTokenUsage({}, {}, { messages: [{ role: 'user', content: 'hello world, this is a prompt' }] })
+check('usage-less responses fall back to a prompt estimate',
+  estimated.promptTokens > 0 && estimated.totalTokens >= estimated.promptTokens, estimated)
+
+const withContent = extractTokenUsage(
+  { choices: [{ message: { content: 'and here is the completion text' } }] },
+  {},
+  { messages: [{ role: 'user', content: 'hello' }] }
+)
+check('completion tokens are estimated from the response content',
+  withContent.completionTokens > 0 && withContent.promptTokens > 0, withContent)
+
+// A failed attempt carries an error envelope, not an answer; billing it would
+// charge the caller for upstream work that never happened.
+check('a response without a request body bills nothing',
+  extractTokenUsage({}, {}).totalTokens === 0)
+
 // ---- the scheduling-side multiplier ----------------------------------------
 // accountRateMultiplier reads the same column but feeds account selection as
 // well as billing, so a null there is worse than a mispriced row: 0 sorts as
@@ -135,7 +156,7 @@ await build({
   bundle: true, format: 'esm', platform: 'neutral', target: 'es2022',
   outfile: proxyFile, logLevel: 'silent'
 })
-const { accountRateMultiplier } = await import(pathToFileURL(proxyFile).href)
+const { accountRateMultiplier, ensureChatStreamUsage } = await import(pathToFileURL(proxyFile).href)
 
 check('a stored multiplier is used', accountRateMultiplier({ rate_multiplier: 0.5 }) === 0.5)
 check('an explicit free upstream stays free', accountRateMultiplier({ rate_multiplier: 0 }) === 0)
@@ -146,6 +167,50 @@ for (const bad of [null, undefined, '', NaN, -1, 'abc']) {
 }
 check('a missing column falls back to 1x', accountRateMultiplier({}) === 1)
 check('a missing account falls back to 1x', accountRateMultiplier(null) === 1)
+
+// ---- stream usage injection ------------------------------------------------
+// A streaming Chat Completions response carries a usage frame only when
+// stream_options.include_usage is set. Without it every streamed call — the
+// default for chat clients — is billed at zero tokens.
+const streamBody = { model: 'gpt-4o', stream: true }
+check('include_usage is injected for a streaming chat body',
+  ensureChatStreamUsage(streamBody) === true && streamBody.stream_options?.include_usage === true, streamBody)
+
+const explicitOn = { stream_options: { include_usage: true } }
+check('an explicit include_usage is left alone',
+  ensureChatStreamUsage(explicitOn) === false && explicitOn.stream_options.include_usage === true)
+
+const explicitOff = { stream_options: { include_usage: false, foo: 1 } }
+check('an explicit false is overridden, sibling fields survive',
+  ensureChatStreamUsage(explicitOff) === true
+    && explicitOff.stream_options.include_usage === true
+    && explicitOff.stream_options.foo === 1, explicitOff)
+
+const plainOptions = { stream_options: { temperature: 0 } }
+check('a missing include_usage is added beside existing options',
+  ensureChatStreamUsage(plainOptions) === true && plainOptions.stream_options.temperature === 0, plainOptions)
+
+check('a non-object body is untouched', ensureChatStreamUsage(null) === false && ensureChatStreamUsage('{"a":1}') === false)
+
+// ---- reasoning-effort telemetry --------------------------------------------
+// None of the providers echo the reasoning setting back, so a usage row can
+// only carry it when the request declared one — and each provider spells it
+// differently.
+check('chat-completions reasoning_effort is read',
+  extractReasoningEffort({ reasoning_effort: 'high' }) === 'high')
+check('responses reasoning.effort is read',
+  extractReasoningEffort({ reasoning: { effort: 'low' } }) === 'low')
+check("xai's reason field is read", extractReasoningEffort({ reason: 'auto' }) === 'auto')
+check('anthropic thinking budgets are recorded',
+  extractReasoningEffort({ thinking: { type: 'enabled', budget_tokens: 2048 } }) === 'thinking:2048')
+check('anthropic thinking without a budget is still recorded',
+  extractReasoningEffort({ thinking: { type: 'enabled' } }) === 'thinking')
+check('a request that declares no reasoning yields null',
+  extractReasoningEffort({ messages: [{ role: 'user', content: 'hi' }] }) === null)
+check('a missing body yields null', extractReasoningEffort(null) === null && extractReasoningEffort(undefined) === null)
+check('a non-object body yields null', extractReasoningEffort('reasoning_effort') === null)
+const longEffort = extractReasoningEffort({ reasoning_effort: 'x'.repeat(200) })
+check('an absurd effort string is bounded', longEffort.length === 64, longEffort.length)
 
 rmSync(outDir, { recursive: true, force: true })
 

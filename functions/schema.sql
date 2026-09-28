@@ -1,5 +1,5 @@
--- Sub2API 精简版 D1 Schema
--- 适用于 Cloudflare Pages + Functions
+-- Sub2API 精简�?D1 Schema
+-- 适用�?Cloudflare Pages + Functions
 
 -- 管理员（仅你一人）
 CREATE TABLE IF NOT EXISTS users (
@@ -19,6 +19,8 @@ CREATE TABLE IF NOT EXISTS groups (
   error_threshold REAL DEFAULT 0.5,
   error_count_threshold INTEGER DEFAULT 5,
   window_seconds INTEGER DEFAULT 300,
+    model_allowlist_enabled INTEGER DEFAULT 0,
+    model_allowlist TEXT,
   created_at TEXT DEFAULT (datetime('now'))
 );
 
@@ -117,7 +119,7 @@ CREATE TABLE IF NOT EXISTS request_logs (
   created_at TEXT DEFAULT (datetime('now'))
 );
 
--- 运行时设置（例如未配置 JWT_SECRET 时自动生成的会话密钥）
+-- 运行时设置（例如未配�?JWT_SECRET 时自动生成的会话密钥�?
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL,

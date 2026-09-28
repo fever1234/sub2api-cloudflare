@@ -19,29 +19,61 @@ export function estimateTokens(text: string): number {
   return Math.ceil(tokens);
 }
 
-// Extract token usage from response headers or body
-export function extractTokenUsage(body: any, headers: Headers | Record<string, string>): { promptTokens: number; completionTokens: number; totalTokens: number } {
+// Extract token usage from response headers or body.
+//
+// `request` is the parsed request body, used only by the estimation fallback:
+// a *response* body has no `messages` field, so estimating from it always
+// produced zero prompt tokens on an upstream that omits `usage`. Callers pass
+// the request only for successful responses — a failed attempt must not bill.
+export function extractTokenUsage(
+  body: any,
+  headers: Headers | Record<string, string>,
+  request?: any
+): { promptTokens: number; completionTokens: number; totalTokens: number } {
   let promptTokens = 0;
   let completionTokens = 0;
   let totalTokens = 0;
-  
+
   // Try to get from body first
   if (body?.usage) {
     promptTokens = body.usage.prompt_tokens || body.usage.input_tokens || 0;
     completionTokens = body.usage.completion_tokens || body.usage.output_tokens || 0;
     totalTokens = body.usage.total_tokens || (promptTokens + completionTokens);
   }
-  
+
   // Fallback to estimation
-  if (totalTokens === 0) {
-    const inputText = typeof body?.messages === 'string' ? body.messages : JSON.stringify(body?.messages || body?.input || '');
-    const outputText = typeof body?.output === 'string' ? body.output : JSON.stringify(body?.output || body?.content || '');
+  if (totalTokens === 0 && request !== undefined) {
+    const inputSource = request?.messages ?? request?.input ?? request?.content ?? '';
+    const inputText = typeof inputSource === 'string' ? inputSource : JSON.stringify(inputSource);
+    const outputSource = body?.choices?.[0]?.message?.content ?? body?.output ?? body?.content ?? '';
+    const outputText = typeof outputSource === 'string' ? outputSource : JSON.stringify(outputSource);
     promptTokens = estimateTokens(inputText);
     completionTokens = estimateTokens(outputText);
     totalTokens = promptTokens + completionTokens;
   }
-  
+
   return { promptTokens, completionTokens, totalTokens };
+}
+
+/**
+ * Reasoning setting a request asked for, stored on its usage row.
+ *
+ * Providers spell this differently — Chat Completions `reasoning_effort`,
+ * Responses `reasoning.effort`, xAI's `reason`, Anthropic's
+ * `thinking.budget_tokens` — and none echo it back, so it can only be read
+ * from the request. Null means the request did not declare one.
+ */
+export function extractReasoningEffort(body: any): string | null {
+  if (!body || typeof body !== 'object') return null;
+  const effort = body.reasoning_effort ?? body.reasoning?.effort ?? body.reason;
+  if (effort !== undefined && effort !== null && effort !== '') {
+    return String(effort).slice(0, 64);
+  }
+  const thinking = body.thinking;
+  if (thinking && typeof thinking === 'object' && (thinking.type === 'enabled' || thinking.budget_tokens)) {
+    return thinking.budget_tokens ? `thinking:${thinking.budget_tokens}` : 'thinking';
+  }
+  return null;
 }
 
 export interface CostBreakdown {

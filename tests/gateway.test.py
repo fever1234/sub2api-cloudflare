@@ -21,6 +21,14 @@ API = f'{BASE}/api/v1'
 ADMIN = ('gwadmin', 'gateway-pass-9911')
 
 PORT_A, PORT_B, PORT_C = 9101, 9102, 9103
+# Fresh upstreams for the sticky-routing and cooldown fixtures: their accounts
+# start with a clean error window, so account selection is decided by the
+# factors under test rather than by history left over from earlier cases.
+PORT_D, PORT_E = 9104, 9105
+# Dedicated upstream for the Responses field-strip fixture.
+PORT_F = 9106
+# Dedicated upstream for the OpenAI silent-refusal fixture.
+PORT_G = 9107
 
 passed = 0
 failures = []
@@ -82,15 +90,16 @@ def all_requests_seen():
 
 
 def reset_upstreams():
-    for port in (PORT_A, PORT_B, PORT_C):
-        control(port, reset=True, status=200, stream=False)
+    for port in (PORT_A, PORT_B, PORT_C, PORT_D, PORT_E, PORT_F, PORT_G):
+        control(port, reset=True, status=200, stream=False, retry_after=None,
+                reject_once=None, silent_refusal=None)
 
 
 # ---------------------------------------------------------------- fixtures
-for port in (PORT_A, PORT_B, PORT_C):
+for port in (PORT_A, PORT_B, PORT_C, PORT_D, PORT_E, PORT_F, PORT_G):
     serve(port)
 time.sleep(0.4)
-print(f'stub upstreams ready on {PORT_A}, {PORT_B}, {PORT_C}')
+print(f'stub upstreams ready on {PORT_A}, {PORT_B}, {PORT_C}, {PORT_D}, {PORT_E}, {PORT_F}, {PORT_G}')
 
 call('/auth/setup', 'POST', {'username': ADMIN[0], 'password': ADMIN[1]})
 status, payload = call('/auth/login', 'POST', {'username': ADMIN[0], 'password': ADMIN[1]})
@@ -312,6 +321,74 @@ check('disabled account is skipped',
       status == 200 and payload.get('id') != f'chatcmpl-{PORT_A}' and not requests_seen(PORT_A),
       (status, payload.get('id')))
 call(f'/accounts/{account_ids["gw-a"]}', 'PUT', {'enabled': 1}, token=token)
+
+# --------------------------------------------- 429 Retry-After cooldown ---
+# A rate-limited account must stay out of rotation for the advertised window.
+# The fresh account below has priority 0 and a clean error window, so it is
+# the one picked first; after its 429 + Retry-After the next request — with
+# the stub healthy again — must be served by a different account.
+_, cooled_created = call('/accounts', 'POST', {
+    'name': 'gw-cooldown-acct', 'provider': 'openai', 'api_key': 'sk-cooldown-acct',
+    'base_url': f'http://127.0.0.1:{PORT_D}',
+    'group_id': primary_id, 'priority': 0,
+}, token=token)
+cooled_id = cooled_created.get('data', {}).get('id')
+check('cooldown fixture created', bool(cooled_id), cooled_created)
+
+reset_upstreams()
+control(PORT_D, status=429, retry_after=60)
+status, payload = call('/v1/chat/completions', 'POST',
+                       {'model': 'gpt-4o', 'messages': [{'role': 'user', 'content': 'hi'}]},
+                       token=client_key, base=BASE)
+check('429 fails over to another account', status == 200, (status, payload))
+check('429 reply did not come from the limited account',
+      payload.get('id') != f'chatcmpl-{PORT_D}', payload.get('id'))
+
+reset_upstreams()  # stub is healthy again; only the cooldown keeps it out
+status, payload = call('/v1/chat/completions', 'POST',
+                       {'model': 'gpt-4o', 'messages': [{'role': 'user', 'content': 'hi'}]},
+                       token=client_key, base=BASE)
+check('rate-limited account stays cooled for the next request',
+      status == 200 and payload.get('id') != f'chatcmpl-{PORT_D}', (status, payload.get('id')))
+
+# ------------------------------------------------ sticky session routing --
+# Two fresh equal-priority accounts on a clean window: with nothing else to
+# distinguish them, only the session key decides. Without sticky routing the
+# LRU tie-break would rotate every turn, so this fails if stickiness regresses.
+_, sticky_one = call('/accounts', 'POST', {
+    'name': 'gw-sticky-1', 'provider': 'openai', 'api_key': 'sk-sticky-1',
+    'base_url': f'http://127.0.0.1:{PORT_D}',
+    'group_id': primary_id, 'priority': 0,
+}, token=token)
+_, sticky_two = call('/accounts', 'POST', {
+    'name': 'gw-sticky-2', 'provider': 'openai', 'api_key': 'sk-sticky-2',
+    'base_url': f'http://127.0.0.1:{PORT_E}',
+    'group_id': primary_id, 'priority': 0,
+}, token=token)
+check('sticky fixtures created',
+      bool(sticky_one.get('data', {}).get('id') and sticky_two.get('data', {}).get('id')))
+
+reset_upstreams()
+sticky_ports = []
+for turn in range(4):
+    status, payload = call('/v1/chat/completions', 'POST',
+                           {'model': 'gpt-4o', 'prompt_cache_key': 'sess-sticky-e2e',
+                            'messages': [{'role': 'user', 'content': f'turn {turn}'}]},
+                           token=client_key, base=BASE)
+    if status != 200:
+        break
+    try:
+        sticky_ports.append(int(str(payload.get('id', '')).rsplit('-', 1)[-1]))
+    except ValueError:
+        sticky_ports.append(None)
+check('sticky session turns all succeeded', len(sticky_ports) == 4, (status, sticky_ports))
+check('same session key lands on one account across turns',
+      len(sticky_ports) == 4 and len(set(sticky_ports)) == 1, sticky_ports)
+if sticky_ports:
+    landed = requests_seen(sticky_ports[-1])
+    check('sticky turn was served by a sticky credential',
+          bool(landed) and landed[-1].get('authorization') in ('Bearer sk-sticky-1', 'Bearer sk-sticky-2'),
+          landed[-1].get('authorization') if landed else None)
 
 # ------------------------------------------------------ usage + model probe
 status, payload = call('/v1/models', token=client_key, base=BASE)
@@ -558,6 +635,175 @@ ds_probe = [r for r in requests_seen(PORT_C) if r.get('model') == 'deepseek-v4-p
 check('chat-native probe hit /v1/chat/completions',
       bool(ds_probe) and ds_probe[0]['path'].endswith('/chat/completions'),
       ds_probe[0]['path'] if ds_probe else None)
+
+# ----------------------------------------- Responses 400 field-strip retry --
+# A relay that rejects max_output_tokens by name must be served, not handed a
+# hard 400: the gateway drops exactly the named field and re-sends once. The
+# priority -1 account pins the fixture to PORT_F so "which stub saw what" is
+# not left to scheduler tie-breaks.
+_, strip_created = call('/accounts', 'POST', {
+    'name': 'gw-strip-acct', 'provider': 'openai', 'api_key': 'sk-strip-acct',
+    'base_url': f'http://127.0.0.1:{PORT_F}',
+    'group_id': primary_id, 'priority': -1,
+}, token=token)
+check('strip fixture created', bool(strip_created.get('data', {}).get('id')), strip_created)
+
+reset_upstreams()
+control(PORT_F, reject_once={'param': 'max_output_tokens'})
+status, payload = call('/v1/responses', 'POST',
+                       {'model': 'gpt-5', 'input': 'hi', 'max_output_tokens': 64},
+                       token=client_key, base=BASE)
+check('field-strip retry turns the 400 into a served response',
+      status == 200 and payload.get('status') == 'completed', (status, payload))
+strip_seen = requests_seen(PORT_F)
+check('rejected attempt and rewritten re-send both reached upstream',
+      len(strip_seen) == 2, len(strip_seen))
+if len(strip_seen) == 2:
+    check('first attempt carried the rejected field',
+          strip_seen[0].get('max_output_tokens') == 64, strip_seen[0])
+    check('re-send dropped the rejected field',
+          strip_seen[1].get('max_output_tokens') is None, strip_seen[1])
+    check('re-send stayed on the responses endpoint',
+          strip_seen[0]['path'].endswith('/v1/responses') and strip_seen[1]['path'].endswith('/v1/responses'),
+          (strip_seen[0]['path'], strip_seen[1]['path']))
+
+# An unstrippable 400 must still reach the client as-is: no rewrite, no
+# second upstream call. Every stub answers 400 so the assertion does not
+# depend on which account the scheduler picks.
+reset_upstreams()
+for port in (PORT_A, PORT_B, PORT_C, PORT_D, PORT_E, PORT_F):
+    control(port, status=400)
+status, payload = call('/v1/responses', 'POST',
+                       {'model': 'gpt-5', 'input': 'hi'},
+                       token=client_key, base=BASE)
+check('non-strippable 400 passes through to the client',
+      status == 400, (status, payload))
+total_hits = sum(len(requests_seen(port)) for port in (PORT_A, PORT_B, PORT_C, PORT_D, PORT_E, PORT_F, PORT_G))
+check('non-strippable 400 was sent upstream exactly once',
+      total_hits == 1, total_hits)
+reset_upstreams()
+
+# ------------------------------------------- OpenAI silent-refusal failover --
+# A long request answered with a stream that stops on finish_reason=stop with
+# nothing in it must fail over, not be served (Go: openai_silent_refusal.go).
+# The priority -2 account pins the fixture to PORT_G; detection only arms at
+# 64KB, so the same empty stream under that gate reaches the client untouched.
+_, refusal_created = call('/accounts', 'POST', {
+    'name': 'gw-refuse-acct', 'provider': 'openai', 'api_key': 'sk-refuse-acct',
+    'base_url': f'http://127.0.0.1:{PORT_G}',
+    'group_id': primary_id, 'priority': -2,
+}, token=token)
+check('refusal fixture created', bool(refusal_created.get('data', {}).get('id')), refusal_created)
+
+
+def stream_chat(body):
+    request = urllib.request.Request(f'{BASE}/v1/chat/completions', method='POST',
+                                     data=json.dumps(body).encode())
+    request.add_header('content-type', 'application/json')
+    request.add_header('authorization', f'Bearer {client_key}')
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return response.status, response.read().decode()
+    except urllib.error.HTTPError as error:
+        return error.code, error.read().decode()
+
+
+reset_upstreams()
+control(PORT_G, silent_refusal=True)
+status, raw = stream_chat({'model': 'gpt-4o', 'stream': True,
+                           'messages': [{'role': 'user', 'content': 'hi'}]})
+check('a short prompt keeps the empty stream as-is',
+      status == 200 and 'finish_reason": "stop"' in raw and '"content"' not in raw,
+      (status, raw[:200]))
+check('short prompt still reached the refusal upstream',
+      len(requests_seen(PORT_G)) == 1, len(requests_seen(PORT_G)))
+
+# The same empty stream above the gate must never reach the client: the
+# attempt fails and a healthy account serves the response instead. Run while
+# the fixture is still clean, so priority -2 pins the first attempt to PORT_G.
+reset_upstreams()
+control(PORT_G, silent_refusal=True)
+status, raw = stream_chat({
+    'model': 'gpt-4o', 'stream': True,
+    'messages': [{'role': 'user', 'content': 'x' * 70000}],
+})
+check('silent refusal fails over to a healthy account',
+      status == 200 and '"content"' in raw, (status, raw[:200]))
+refusal_hits = requests_seen(PORT_G)
+check('refusal upstream was tried exactly once', len(refusal_hits) == 1, len(refusal_hits))
+check('refusal upstream saw a streaming request',
+      bool(refusal_hits) and refusal_hits[0]['stream'] is True and refusal_hits[0]['has_messages'],
+      refusal_hits[0] if refusal_hits else None)
+reset_upstreams()
+
+# ------------------------------------------- group model allowlist (admin) ---
+# A key's group may pin which models it can list, retrieve and generate
+# (Go: group_model_allowlist.go). The suite's own key is deliberately
+# unpinned (no group → no allowlist), so this section pins one. Run last: it
+# narrows the key it uses, and every case restores the gate before the next.
+_, pinned_payload = call('/keys', 'POST',
+                         {'name': 'gw-allowlist-key', 'quota_limit': 0, 'group_id': primary_id},
+                         token=token)
+pinned_key = pinned_payload.get('data', {}).get('key')
+check('pinned client api key issued', bool(pinned_key), pinned_payload)
+
+status, payload = call('/v1/models', token=pinned_key, base=BASE)
+unfiltered_ids = [m.get('id') for m in payload.get('data', [])]
+check('model list starts unfiltered',
+      'gpt-4o' in unfiltered_ids and 'claude-3-5-sonnet-20241022' in unfiltered_ids,
+      unfiltered_ids)
+status, payload = call('/v1/models/claude-3-5-sonnet-20241022', token=pinned_key, base=BASE)
+check('a model outside any allowlist retrieves first',
+      status == 200 and payload.get('id') == 'claude-3-5-sonnet-20241022', (status, payload))
+
+status, payload = call(f'/groups/{primary_id}', 'PUT',
+                       {'model_allowlist_enabled': 1, 'model_allowlist': [' gpt-4o ', 'GPT-4O']},
+                       token=token)
+check('group allowlist saved normalized',
+      status == 200 and payload.get('data', {}).get('model_allowlist') == '["gpt-4o"]',
+      (status, payload.get('data', {}).get('model_allowlist')))
+
+status, payload = call('/v1/models', token=pinned_key, base=BASE)
+filtered_ids = [m.get('id') for m in payload.get('data', [])]
+check('model list shows only allowed models', filtered_ids == ['gpt-4o'], filtered_ids)
+
+status, payload = call('/v1/chat/completions', 'POST',
+                       {'model': 'gpt-4o', 'messages': [{'role': 'user', 'content': 'hi'}]},
+                       token=pinned_key, base=BASE)
+check('allowed model still generates', status == 200, (status, payload))
+
+status, payload = call('/v1/chat/completions', 'POST',
+                       {'model': 'claude-3-5-sonnet-20241022', 'messages': [{'role': 'user', 'content': 'hi'}]},
+                       token=pinned_key, base=BASE)
+check('listed-out model is a 404 model_not_found',
+      status == 404 and payload.get('error', {}).get('code') == 'model_not_found'
+      and 'not available for this group' in payload.get('error', {}).get('message', ''),
+      (status, payload))
+
+status, payload = call('/v1/models/gpt-4o', token=pinned_key, base=BASE)
+check('allowed model retrieves', status == 200 and payload.get('id') == 'gpt-4o', (status, payload))
+status, payload = call('/v1/models/claude-3-5-sonnet-20241022', token=pinned_key, base=BASE)
+check('listed-out model reads as missing',
+      status == 404 and payload.get('error', {}).get('code') == 'model_not_found', (status, payload))
+
+status, payload = call(f'/groups/{primary_id}', 'PUT', {'model_allowlist': []}, token=token)
+check('enabling with an empty allowlist is rejected', status == 400, (status, payload))
+status, payload = call(f'/groups/{primary_id}', 'PUT', {'model_allowlist': ['gpt-*-turbo']}, token=token)
+check('mid-string wildcards are rejected', status == 400, (status, payload))
+
+call(f'/groups/{primary_id}', 'PUT', {'model_allowlist': ['gpt-*']}, token=token)
+status, payload = call('/v1/models', token=pinned_key, base=BASE)
+wildcard_ids = [m.get('id') for m in payload.get('data', [])]
+check('trailing wildcards admit every prefixed model',
+      'gpt-4o' in wildcard_ids and 'claude-3-5-sonnet-20241022' not in wildcard_ids,
+      wildcard_ids)
+
+call(f'/groups/{primary_id}', 'PUT',
+     {'model_allowlist_enabled': 0, 'model_allowlist': []}, token=token)
+status, payload = call('/v1/models', token=pinned_key, base=BASE)
+restored_ids = [m.get('id') for m in payload.get('data', [])]
+check('disabling the allowlist restores the full list',
+      status == 200 and len(restored_ids) > len(wildcard_ids), (status, restored_ids))
 
 print()
 print(f'PASSED {passed} / {passed + len(failures)}')

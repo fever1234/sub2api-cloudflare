@@ -2,20 +2,20 @@
 // This file acts as the unified entry for all requests in Cloudflare Pages Functions
 
 import { createDatabase } from './src/db'
-import { verifySessionToken, hashApiKey, hashPassword, verifyPassword, authenticateUser, authenticateApiKey, createSessionToken, resolveSessionSecret } from './src/auth'
+import { verifySessionToken, hashApiKey, hashPassword, verifyPassword, authenticateUser, authenticateApiKey, createSessionToken, resolveSessionSecret, invalidateApiKeyCache, apiKeyCacheMetrics } from './src/auth'
 import type { Env } from './src/index'
-import { FailoverManager } from './src/failover'
+import { FailoverManager, errorStatsCacheMetrics } from './src/failover'
 import { handleGatewayRequest } from './src/routes/gateway'
 import { handleOpenAIRequest } from './src/routes/openai'
 import { handleClaudeRequest } from './src/routes/claude'
-import { handleGrokRequest } from './src/routes/grok'
 import { handleGroupsRequest } from './src/config/groups'
 import { handleAccountsRequest } from './src/config/accounts'
 import { handleModelsRequest } from './src/config/models'
 import { encryptApiKey, decryptApiKey, resolveApiKeyEncryptionSecret } from './src/key-crypto'
-import { routingCacheMetrics, invalidateRoutingSnapshot } from './src/utils/routing-cache'
+import { routingCacheMetrics, invalidateRoutingSnapshot, loadRoutingSnapshot } from './src/utils/routing-cache'
 import { openCodeGoModelProtocol } from './src/utils/responses-bridge'
 import { readCachedModels } from './src/utils/healthcheck'
+import { modelAllowed, modelAllowlistDenied } from './src/utils/model-allowlist'
 
 // Keep an isolate-local scheduler between requests. Persistent request logs in
 // D1 are also consulted by FailoverManager, so this cache is only a fast path.
@@ -110,8 +110,10 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     return handleStats(request, env)
   }
 
-  // API Key management
+  // API Key management. Any write changes what authenticateApiKey may cache,
+  // so the isolate-local key cache is dropped with it.
   if (path.startsWith('/api/v1/keys')) {
+    if (request.method !== 'GET') invalidateApiKeyCache()
     return handleApiKeys(request, env)
   }
 
@@ -146,7 +148,12 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
 
   // OpenAI clients commonly probe this endpoint before sending a request.
   if (path === '/v1/models' && request.method === 'GET') {
-    return handleProviderModels(request, env)
+    return handleProviderModels(request, env, failover)
+  }
+  // Retrieving a single model shares the list's allowlist gate: a model the
+  // key's group excludes reads as nonexistent (Go: openai_models_handler 404).
+  if (path.startsWith('/v1/models/') && request.method === 'GET') {
+    return handleProviderModelRetrieve(request, env, failover, path)
   }
 
   if (path.startsWith('/v1/chat/completions')) {
@@ -305,7 +312,7 @@ async function handleStats(request: Request, env: Env): Promise<Response> {
 
   const db = createDatabase(env.DB)
   const stats = await db.getDashboardStats(hours, bucket)
-  return json({ data: { hours, bucket, cache: routingCacheMetrics(), ...stats } })
+  return json({ data: { hours, bucket, cache: routingCacheMetrics(), auth_cache: apiKeyCacheMetrics(), error_stats_cache: errorStatsCacheMetrics(), ...stats } })
 }
 
 async function handleApiKeys(request: Request, env: Env): Promise<Response> {
@@ -533,16 +540,40 @@ async function checkAuth(request: Request, env: Env): Promise<any> {
   return session
 }
 
-async function handleProviderModels(request: Request, env: Env): Promise<Response> {
+async function handleProviderModels(request: Request, env: Env, failover: FailoverManager): Promise<Response> {
   const authHeader = request.headers.get('authorization')
   if (!authHeader?.startsWith('Bearer ')) return json({ error: 'Missing API key' }, 401)
   const db = createDatabase(env.DB)
-  if (!await authenticateApiKey(db, authHeader.slice(7))) {
+  const keyRecord = await authenticateApiKey(db, authHeader.slice(7))
+  if (!keyRecord) {
     return json({ error: 'Invalid or disabled API key' }, 401)
   }
-  const accounts = await db.listEnabledAccounts()
-  const mappings = (await db.listModelMappings()).filter(m => m.enabled)
+  // The same 5s snapshot the gateway routes use: this probe fired a fresh
+  // accounts + mappings pair on every call, burning two D1 reads per client.
+  const routing = await loadRoutingSnapshot(db, failover)
+  const entries = buildProviderModelEntries(routing.accounts, routing.mappings.filter(m => m.enabled))
 
+  // A group's allowlist also filters discovery: a model the key may not call
+  // must not appear in its list at all (Go: gateway_handler listing filter).
+  const group = allowlistGroupFor(keyRecord, routing.groups)
+  return json({ object: 'list', data: entries.filter(entry => modelAllowed(entry.id, group)) })
+}
+
+/**
+ * The group whose allowlist governs this key: only the pinned group counts —
+ * an unpinned key may use every group, so nothing is denied for it.
+ */
+function allowlistGroupFor(keyRecord: any, groups: Array<{ id: number }>): any | undefined {
+  const keyGroupId = Number(keyRecord?.group_id) || 0
+  return keyGroupId ? groups.find(group => group.id === keyGroupId) : undefined
+}
+
+/**
+ * The downstream model list: explicit mappings first (they define how an id
+ * routes), then each upstream's cached catalogue, then one fallback per
+ * provider, deduped in that order with the native protocol labelled per id.
+ */
+function buildProviderModelEntries(accounts: any[], mappings: any[]): Array<{ id: string; object: string; owned_by: string; protocol: string }> {
   // Native message format per id, derived from where the id came from.
   // opencode_go owns the only rule table (glm=chat, muse-spark/grok/gpt=
   // responses, minimax/qwen=anthropic); other providers serve one family.
@@ -559,7 +590,6 @@ async function handleProviderModels(request: Request, env: Env): Promise<Respons
     protocolById.set(id, protocolFor(provider, id))
   }
 
-  // Explicit mappings first: they define how the id routes.
   mappings.forEach(m => note(String(m.requested_model || ''), m.provider))
   // Each upstream's own catalogue (cached from its /v1/models), so a client can
   // discover models that have no mapping yet. No network on this hot path —
@@ -581,8 +611,29 @@ async function handleProviderModels(request: Request, env: Env): Promise<Respons
     account.provider
   ))
 
-  return json({
-    object: 'list',
-    data: ids.map(id => ({ id, object: 'model', owned_by: 'sub2api', protocol: protocolById.get(id) }))
-  })
+  return ids.map(id => ({ id, object: 'model', owned_by: 'sub2api', protocol: protocolById.get(id) || 'chat_completions' }))
+}
+
+/**
+ * GET /v1/models/{id}. A model that is missing or outside the key's group
+ * allowlist gets Go's wording verbatim, so a client cannot tell the two apart
+ * from the response.
+ */
+async function handleProviderModelRetrieve(request: Request, env: Env, failover: FailoverManager, path: string): Promise<Response> {
+  const authHeader = request.headers.get('authorization')
+  if (!authHeader?.startsWith('Bearer ')) return json({ error: 'Missing API key' }, 401)
+  const db = createDatabase(env.DB)
+  const keyRecord = await authenticateApiKey(db, authHeader.slice(7))
+  if (!keyRecord) {
+    return json({ error: 'Invalid or disabled API key' }, 401)
+  }
+  const id = decodeURIComponent(path.slice('/v1/models/'.length)).trim()
+  const routing = await loadRoutingSnapshot(db, failover)
+  const group = allowlistGroupFor(keyRecord, routing.groups)
+  const entry = id
+    ? buildProviderModelEntries(routing.accounts, routing.mappings.filter(m => m.enabled))
+        .find(candidate => candidate.id === id)
+    : undefined
+  if (!entry || !modelAllowed(id, group)) return modelAllowlistDenied(id)
+  return json(entry)
 }

@@ -1,5 +1,5 @@
 // functions/src/schema.ts
-var SCHEMA_VERSION = "10";
+var SCHEMA_VERSION = "12";
 var ACCOUNTS_TABLE_DDL = `CREATE TABLE IF NOT EXISTS accounts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
@@ -39,6 +39,8 @@ var SCHEMA_STATEMENTS = [
     error_threshold REAL DEFAULT 0.5,
     error_count_threshold INTEGER DEFAULT 5,
     window_seconds INTEGER DEFAULT 300,
+    model_allowlist_enabled INTEGER DEFAULT 0,
+    model_allowlist TEXT,
     created_at TEXT DEFAULT (datetime('now'))
   )`,
   `CREATE TABLE IF NOT EXISTS channels (
@@ -92,6 +94,8 @@ var SCHEMA_STATEMENTS = [
     status INTEGER DEFAULT 200,
     error_message TEXT,
     latency_ms INTEGER,
+    reasoning_effort TEXT,
+    user_agent TEXT,
     created_at TEXT DEFAULT (datetime('now'))
   )`,
   `CREATE TABLE IF NOT EXISTS request_logs (
@@ -168,7 +172,17 @@ var ADDITIVE_COLUMNS = [
   { table: "usage_records", column: "rate_multiplier", definition: "REAL DEFAULT 1" },
   { table: "usage_records", column: "base_cost", definition: "REAL DEFAULT 0" },
   { table: "usage_records", column: "cost_estimated", definition: "INTEGER DEFAULT 0" },
-  { table: "usage_records", column: "cache_status", definition: "TEXT" }
+  { table: "usage_records", column: "cache_status", definition: "TEXT" },
+  // Request shape observability. Which reasoning budget was asked for, and
+  // which client sent the request — the two questions a usage row could not
+  // answer when investigating an unexpected bill or a misbehaving integration.
+  { table: "usage_records", column: "reasoning_effort", definition: "TEXT" },
+  { table: "usage_records", column: "user_agent", definition: "TEXT" },
+  // Per-group model allowlist (Go: group_model_allowlist). The list is JSON
+  // text so entries can carry trailing `*` wildcards; the enabled flag keeps
+  // an emptied list visible instead of silently repurposing it.
+  { table: "groups", column: "model_allowlist_enabled", definition: "INTEGER DEFAULT 0" },
+  { table: "groups", column: "model_allowlist", definition: "TEXT" }
 ];
 
 // functions/src/db.ts
@@ -222,8 +236,8 @@ var Database = class {
   }
   async createGroup(name, description, priority = 0, options = {}) {
     return this.insert(
-      `INSERT INTO groups (name, description, priority, enabled, error_threshold, error_count_threshold, window_seconds)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO groups (name, description, priority, enabled, error_threshold, error_count_threshold, window_seconds, model_allowlist_enabled, model_allowlist)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         name,
         description || "",
@@ -231,7 +245,9 @@ var Database = class {
         options.enabled ?? 1,
         options.error_threshold ?? 0.5,
         options.error_count_threshold ?? 5,
-        options.window_seconds ?? 300
+        options.window_seconds ?? 300,
+        options.model_allowlist_enabled ?? 0,
+        options.model_allowlist ?? null
       ]
     );
   }
@@ -265,6 +281,14 @@ var Database = class {
     if (updates.window_seconds !== void 0) {
       fields.push("window_seconds = ?");
       values.push(updates.window_seconds);
+    }
+    if (updates.model_allowlist_enabled !== void 0) {
+      fields.push("model_allowlist_enabled = ?");
+      values.push(updates.model_allowlist_enabled);
+    }
+    if (updates.model_allowlist !== void 0) {
+      fields.push("model_allowlist = ?");
+      values.push(updates.model_allowlist);
     }
     if (fields.length === 0) return { changes: 0 };
     values.push(id);
@@ -554,8 +578,8 @@ var Database = class {
   async createUsageRecord(record) {
     return this.insert(
       `INSERT INTO usage_records
-       (api_key_id, model, provider, prompt_tokens, completion_tokens, total_tokens, cost, base_cost, rate_multiplier, cost_estimated, cache_status, status, error_message, latency_ms, ttft_ms, group_id, account_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (api_key_id, model, provider, prompt_tokens, completion_tokens, total_tokens, cost, base_cost, rate_multiplier, cost_estimated, cache_status, status, error_message, latency_ms, ttft_ms, group_id, account_id, reasoning_effort, user_agent)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         record.api_key_id ?? 0,
         record.model,
@@ -573,7 +597,9 @@ var Database = class {
         record.latency_ms ?? 0,
         record.ttft_ms ?? null,
         record.group_id ?? null,
-        record.account_id ?? null
+        record.account_id ?? null,
+        record.reasoning_effort ?? null,
+        record.user_agent ?? null
       ]
     );
   }
@@ -1051,17 +1077,106 @@ async function hashApiKey(apiKey) {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(apiKey));
   return toHex(digest);
 }
+var API_KEY_CACHE_TTL_MS = 5e3;
+var apiKeyCache = /* @__PURE__ */ new Map();
+var apiKeyHits = 0;
+var apiKeyMisses = 0;
+function invalidateApiKeyCache() {
+  apiKeyCache.clear();
+}
+function apiKeyCacheMetrics() {
+  const samples = apiKeyHits + apiKeyMisses;
+  return {
+    hits: apiKeyHits,
+    misses: apiKeyMisses,
+    samples,
+    hit_rate: samples ? Math.round(apiKeyHits / samples * 1e4) / 100 : 0,
+    ttl_ms: API_KEY_CACHE_TTL_MS
+  };
+}
 async function authenticateApiKey(db, apiKey) {
-  const key = await db.getApiKeyByHash(await hashApiKey(apiKey));
-  if (!key || !key.enabled) return null;
-  if (key.quota_limit > 0 && key.balance >= key.quota_limit) return null;
-  return key;
+  const keyHash = await hashApiKey(apiKey);
+  const now = Date.now();
+  const cached = apiKeyCache.get(keyHash);
+  if (cached && now < cached.expires) {
+    apiKeyHits += 1;
+    return cached.key;
+  }
+  apiKeyMisses += 1;
+  const key = await db.getApiKeyByHash(keyHash);
+  const valid = key && key.enabled && !(key.quota_limit > 0 && key.balance >= key.quota_limit) ? key : null;
+  if (apiKeyCache.size >= 1024) {
+    for (const [hash, entry] of apiKeyCache) {
+      if (entry.expires <= now) apiKeyCache.delete(hash);
+    }
+    if (apiKeyCache.size >= 1024) apiKeyCache.clear();
+  }
+  apiKeyCache.set(keyHash, { expires: now + API_KEY_CACHE_TTL_MS, key: valid });
+  return valid;
+}
+
+// functions/src/utils/retry.ts
+function envInt(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : fallback;
+}
+function retryDelayMs(attempt, env) {
+  const base = envInt(env.RETRY_BASE_DELAY_MS, 300);
+  const max = envInt(env.RETRY_MAX_DELAY_MS, 3e3);
+  if (base <= 0) return 0;
+  const delay = Math.min(base * Math.pow(2, Math.max(0, attempt - 1)), max);
+  return Math.floor(delay / 2 + Math.random() * (delay / 2));
+}
+function retryBudgetMs(env) {
+  return envInt(env.RETRY_BUDGET_MS, 12e4);
+}
+function retryBudgetExceeded(originStartedAt, env) {
+  return Date.now() - originStartedAt >= retryBudgetMs(env);
+}
+function sleep(ms, signal) {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal?.addEventListener("abort", done, { once: true });
+  });
+}
+function parseRetryAfterMs(header) {
+  if (!header) return null;
+  const trimmed = String(header).trim();
+  if (trimmed === "") return null;
+  if (/^\d+$/.test(trimmed)) return Math.max(0, Number(trimmed) * 1e3);
+  const at = Date.parse(trimmed);
+  if (Number.isNaN(at)) return null;
+  return Math.max(0, at - Date.now());
 }
 
 // functions/src/utils/proxy.ts
 async function proxyRequest(request) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 6e4);
+  const timeoutMs = request.timeoutMs && request.timeoutMs > 0 ? request.timeoutMs : 6e4;
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  const clientSignal = request.signal;
+  const onClientAbort = () => controller.abort();
+  const detach = () => {
+    clearTimeout(timeout);
+    clientSignal?.removeEventListener("abort", onClientAbort);
+  };
+  if (clientSignal) {
+    if (clientSignal.aborted) {
+      detach();
+      throw new Error("client disconnected");
+    }
+    clientSignal.addEventListener("abort", onClientAbort, { once: true });
+  }
   try {
     const response = await fetch(request.url, {
       method: request.method,
@@ -1070,7 +1185,7 @@ async function proxyRequest(request) {
       redirect: "follow",
       signal: controller.signal
     });
-    clearTimeout(timeout);
+    detach();
     const headers = {};
     response.headers.forEach((value, key) => {
       headers[key] = value;
@@ -1082,7 +1197,10 @@ async function proxyRequest(request) {
       text: () => response.text()
     };
   } catch (error) {
-    clearTimeout(timeout);
+    detach();
+    if (timedOut) {
+      throw new Error(`upstream did not send response headers within ${timeoutMs}ms`);
+    }
     throw error;
   }
 }
@@ -1094,6 +1212,13 @@ function stripBodyHeaders(headers) {
     out[key] = value;
   }
   return out;
+}
+function ensureChatStreamUsage(body) {
+  if (!body || typeof body !== "object") return false;
+  const options = body.stream_options && typeof body.stream_options === "object" && !Array.isArray(body.stream_options) ? body.stream_options : {};
+  if (options.include_usage === true) return false;
+  body.stream_options = { ...options, include_usage: true };
+  return true;
 }
 function buildUpstreamHeaders(originalHeaders, provider, apiKey, baseUrl, clientSpoofing) {
   const headers = {};
@@ -1194,7 +1319,61 @@ function resolveUpstreamCredentials(account) {
     baseUrl: String(account?.base_url || "").trim()
   };
 }
-function measureStreamTiming(body, startedAt, onDone) {
+function streamGuardFromEnv(env) {
+  return {
+    firstOutputTimeoutMs: envInt(env.STREAM_FIRST_OUTPUT_TIMEOUT_MS, 18e4),
+    idleTimeoutMs: envInt(env.STREAM_IDLE_TIMEOUT_MS, 18e4),
+    keepaliveIntervalMs: envInt(env.STREAM_KEEPALIVE_INTERVAL_MS, 15e3),
+    totalTimeoutMs: envInt(env.STREAM_TOTAL_TIMEOUT_MS, 18e5)
+  };
+}
+var UpstreamStallError = class extends Error {
+  status = 0;
+  constructor(message) {
+    super(message);
+    this.name = "UpstreamStallError";
+  }
+};
+async function stageFirstChunk(body, guard) {
+  const reader = body.getReader();
+  let timer;
+  try {
+    const first = await Promise.race([
+      reader.read(),
+      new Promise((_, reject) => {
+        timer = setTimeout(
+          () => reject(new UpstreamStallError(`upstream sent no data within ${guard.firstOutputTimeoutMs}ms`)),
+          guard.firstOutputTimeoutMs
+        );
+      })
+    ]);
+    if (timer) clearTimeout(timer);
+    if (first.done) {
+      throw new UpstreamStallError("upstream stream ended before the first byte");
+    }
+    const firstChunk = first.value;
+    return new ReadableStream({
+      start(controller) {
+        controller.enqueue(firstChunk);
+      },
+      async pull(controller) {
+        const { done, value } = await reader.read();
+        if (done) controller.close();
+        else controller.enqueue(value);
+      },
+      async cancel(reason) {
+        await reader.cancel(reason).catch(() => {
+        });
+      }
+    });
+  } catch (error) {
+    if (timer) clearTimeout(timer);
+    await reader.cancel().catch(() => {
+    });
+    throw error;
+  }
+}
+function measureStreamTiming(body, startedAt, onDone, guard, keepalive = false) {
   let ttftMs = null;
   let settled = false;
   let tail = "";
@@ -1230,22 +1409,86 @@ function measureStreamTiming(body, startedAt, onDone) {
     } catch {
     }
   };
-  return body.pipeThrough(new TransformStream({
-    transform(chunk, controller) {
-      controller.enqueue(chunk);
-      if (ttftMs === null) ttftMs = Date.now() - startedAt;
+  const reader = body.getReader();
+  const encoder = new TextEncoder();
+  const PING = encoder.encode(": ping\n\n");
+  const idleMs = guard?.idleTimeoutMs ?? 0;
+  const totalMs = guard?.totalTimeoutMs ?? 0;
+  const keepaliveMs = keepalive ? guard?.keepaliveIntervalMs ?? 0 : 0;
+  let lastClientSend = Date.now();
+  let idleTimer;
+  let totalTimer;
+  let keepTimer;
+  let failed = false;
+  const clearTimers = () => {
+    clearTimeout(idleTimer ?? null);
+    clearTimeout(totalTimer ?? null);
+    clearInterval(keepTimer ?? null);
+  };
+  return new ReadableStream({
+    async pull(controller) {
+      if (failed) return;
+      const fail = (message) => {
+        if (failed) return;
+        failed = true;
+        clearTimers();
+        finish();
+        try {
+          controller.error(new UpstreamStallError(message));
+        } catch {
+        }
+      };
+      if (totalMs > 0 && totalTimer === void 0) {
+        totalTimer = setTimeout(() => fail(`upstream stream exceeded ${totalMs}ms`), totalMs);
+      }
+      if (idleMs > 0) {
+        idleTimer = setTimeout(() => fail(`upstream sent no data for ${idleMs}ms`), idleMs);
+      }
+      if (keepaliveMs > 0 && keepTimer === void 0) {
+        keepTimer = setInterval(() => {
+          if (failed || Date.now() - lastClientSend < keepaliveMs) return;
+          try {
+            controller.enqueue(PING);
+            lastClientSend = Date.now();
+          } catch {
+          }
+        }, keepaliveMs);
+      }
       try {
-        scan(decoder.decode(chunk, { stream: true }));
-      } catch {
+        const { done, value } = await reader.read();
+        clearTimeout(idleTimer ?? null);
+        if (failed) return;
+        if (done) {
+          clearTimers();
+          finish();
+          controller.close();
+          return;
+        }
+        controller.enqueue(value);
+        lastClientSend = Date.now();
+        if (ttftMs === null) ttftMs = Date.now() - startedAt;
+        try {
+          scan(decoder.decode(value, { stream: true }));
+        } catch {
+        }
+      } catch (error) {
+        if (failed) return;
+        clearTimers();
+        finish();
+        try {
+          controller.error(error);
+        } catch {
+        }
       }
     },
-    flush() {
+    async cancel() {
+      failed = true;
+      clearTimers();
       finish();
-    },
-    cancel() {
-      finish();
+      await reader.cancel().catch(() => {
+      });
     }
-  }));
+  });
 }
 function accountRateMultiplier(account) {
   const raw = account?.rate_multiplier;
@@ -1284,7 +1527,29 @@ function findModelMapping(requestedModel, mappings, provider) {
 }
 
 // functions/src/failover.ts
+function stickyHash(key, accountId) {
+  const seed = `${key}:${accountId}`;
+  let hash = 2166136261;
+  for (let i = 0; i < seed.length; i++) {
+    hash ^= seed.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
 var ACCOUNT_LEVEL_FAILURES = /* @__PURE__ */ new Set([401, 402, 403, 404, 408, 409, 425, 429]);
+var ERROR_STATS_TTL_MS = 5e3;
+var errorStatsHits = 0;
+var errorStatsMisses = 0;
+function errorStatsCacheMetrics() {
+  const samples = errorStatsHits + errorStatsMisses;
+  return {
+    hits: errorStatsHits,
+    misses: errorStatsMisses,
+    samples,
+    hit_rate: samples ? Math.round(errorStatsHits / samples * 1e4) / 100 : 0,
+    ttl_ms: ERROR_STATS_TTL_MS
+  };
+}
 var FailoverManager = class {
   errorWindows = /* @__PURE__ */ new Map();
   windowMs;
@@ -1292,6 +1557,13 @@ var FailoverManager = class {
   errorCountThreshold;
   db;
   lastUsed = /* @__PURE__ */ new Map();
+  /** accountId → timestamp until which the account is rate-limited. */
+  cooldowns = /* @__PURE__ */ new Map();
+  defaultCooldownMs;
+  probeFailTtlMs;
+  stickyEnabled;
+  /** accountId → still-fresh D1 health row (see ERROR_STATS_TTL_MS). */
+  statsCache = /* @__PURE__ */ new Map();
   constructor(env) {
     const windowSeconds = Number(env.WINDOW_SECONDS);
     const errorRateThreshold = Number(env.ERROR_RATE_THRESHOLD);
@@ -1299,9 +1571,52 @@ var FailoverManager = class {
     this.windowMs = (Number.isFinite(windowSeconds) && windowSeconds > 0 ? windowSeconds : 300) * 1e3;
     this.errorRateThreshold = Number.isFinite(errorRateThreshold) ? Math.min(Math.max(errorRateThreshold, 0), 1) : 0.5;
     this.errorCountThreshold = Number.isFinite(errorCountThreshold) && errorCountThreshold > 0 ? Math.floor(errorCountThreshold) : 5;
+    this.defaultCooldownMs = envInt(env.RATE_LIMIT_COOLDOWN_MS, 3e4);
+    this.probeFailTtlMs = envInt(env.PROBE_FAIL_TTL_MS, 9e5);
+    this.stickyEnabled = (env.SESSION_STICKY ?? "1") !== "0";
   }
   setDb(db) {
     this.db = db;
+  }
+  /**
+   * Cool an account down after a rate-limit rejection. The upstream's own
+   * Retry-After wins when present; otherwise the default window applies.
+   * RATE_LIMIT_COOLDOWN_MS=0 disables cooldowns entirely.
+   */
+  noteRateLimit(accountId, status, retryAfter) {
+    if (this.defaultCooldownMs <= 0) return;
+    const parsed = parseRetryAfterMs(retryAfter);
+    if (status !== 429 && parsed === null) return;
+    const ttl = parsed ?? this.defaultCooldownMs;
+    if (ttl <= 0) return;
+    const until = Date.now() + ttl;
+    if (until > (this.cooldowns.get(accountId) ?? 0)) {
+      this.cooldowns.set(accountId, until);
+    }
+  }
+  inCooldown(accountId) {
+    const until = this.cooldowns.get(accountId);
+    return until !== void 0 && until > Date.now();
+  }
+  /** True when the account's most recent health probe failed within the TTL. */
+  probeFailed(acc) {
+    if (acc.last_check_ok === null || acc.last_check_ok === void 0) return false;
+    if (Number(acc.last_check_ok) !== 0) return false;
+    const raw = String(acc.last_check_at || "");
+    if (!raw) return false;
+    const iso = /^\d{4}-\d{2}-\d{2}[ T]/.test(raw) ? raw.replace(" ", "T") + (/[Zz]|[+-]\d\d:?\d\d$/.test(raw) ? "" : "Z") : raw;
+    const at = Date.parse(iso);
+    if (!Number.isFinite(at)) return false;
+    return Date.now() - at <= this.probeFailTtlMs;
+  }
+  alive(acc) {
+    return !this.inCooldown(acc.id) && !this.probeFailed(acc);
+  }
+  pruneCooldowns() {
+    const now = Date.now();
+    for (const [id, until] of this.cooldowns) {
+      if (until <= now) this.cooldowns.delete(id);
+    }
   }
   // Record request result for error tracking
   recordRequest(accountId, groupId, isError) {
@@ -1324,6 +1639,7 @@ var FailoverManager = class {
     }
     window.timestamps.push(now);
     window.errors.push(isError ? 1 : 0);
+    if (isError) this.statsCache.delete(accountId);
   }
   // Get error stats for an account
   getMemoryErrorStats(accountId, group) {
@@ -1357,28 +1673,44 @@ var FailoverManager = class {
   async getErrorStats(accountId, group) {
     const windowSeconds = Math.max(1, Number(group?.window_seconds) || this.windowMs / 1e3);
     if (this.db) {
+      const now = Date.now();
+      const cached = this.statsCache.get(accountId);
+      if (cached && cached.windowSeconds === windowSeconds && now < cached.expires) {
+        errorStatsHits += 1;
+        return { ...cached.stats, groupId: group?.id ?? 0 };
+      }
       try {
         const persisted = await this.db.getAccountErrorStats(accountId, windowSeconds);
         const totalRequests = Number(persisted.total_requests || 0);
         const errorCount = Number(persisted.error_count || 0);
         const errorRate = totalRequests > 0 ? errorCount / totalRequests : 0;
-        return {
+        const stats = {
           accountId,
           groupId: group?.id ?? 0,
-          windowStart: Date.now() - windowSeconds * 1e3,
+          windowStart: now - windowSeconds * 1e3,
           totalRequests,
           errorCount,
           errorRate,
           isUnhealthy: errorRate > (group?.error_threshold ?? this.errorRateThreshold) || errorCount >= (group?.error_count_threshold ?? this.errorCountThreshold)
         };
+        errorStatsMisses += 1;
+        if (this.statsCache.size >= 512) {
+          for (const [id, entry] of this.statsCache) {
+            if (entry.expires <= now) this.statsCache.delete(id);
+          }
+          if (this.statsCache.size >= 512) this.statsCache.clear();
+        }
+        this.statsCache.set(accountId, { expires: now + ERROR_STATS_TTL_MS, windowSeconds, stats });
+        return stats;
       } catch {
       }
     }
     return this.getMemoryErrorStats(accountId, group);
   }
   // Select best account from available accounts
-  async selectAccount(accounts, groups, preferredGroupId, fallbackGroupIds = []) {
+  async selectAccount(accounts, groups, preferredGroupId, fallbackGroupIds = [], opts = {}) {
     if (accounts.length === 0) return null;
+    this.pruneCooldowns();
     const usableAccounts = accounts.filter((acc) => {
       const group2 = groups.get(acc.group_id);
       return acc.enabled === 1 && Boolean(group2 && group2.enabled === 1);
@@ -1388,13 +1720,21 @@ var FailoverManager = class {
     const hasFallbackPolicy = Boolean(preferredGroupId && fallbackGroupIds.length);
     const initialAccounts = primary.length > 0 ? primary : hasFallbackPolicy ? usableAccounts.filter((acc) => fallbackGroupIds.includes(acc.group_id)) : usableAccounts;
     if (initialAccounts.length === 0) return null;
+    let candidates = initialAccounts.filter((acc) => this.alive(acc));
+    if (candidates.length === 0 && hasFallbackPolicy && primary.length > 0) {
+      const fallbackAlive = usableAccounts.filter(
+        (acc) => fallbackGroupIds.includes(acc.group_id) && this.alive(acc)
+      );
+      if (fallbackAlive.length > 0) candidates = fallbackAlive;
+    }
+    if (candidates.length === 0) candidates = initialAccounts;
     const statsByAccount = new Map(
-      await Promise.all(initialAccounts.map(async (acc) => [
+      await Promise.all(candidates.map(async (acc) => [
         acc.id,
         await this.getErrorStats(acc.id, groups.get(acc.group_id))
       ]))
     );
-    let healthyAccounts = initialAccounts.filter((acc) => !statsByAccount.get(acc.id).isUnhealthy);
+    let healthyAccounts = candidates.filter((acc) => !statsByAccount.get(acc.id).isUnhealthy);
     if (healthyAccounts.length === 0 && hasFallbackPolicy && primary.length > 0) {
       const fallback = usableAccounts.filter((acc) => fallbackGroupIds.includes(acc.group_id));
       if (fallback.length === 0) return null;
@@ -1407,18 +1747,19 @@ var FailoverManager = class {
       if (healthyAccounts.length === 0) healthyAccounts = fallback;
     }
     if (healthyAccounts.length === 0) {
-      healthyAccounts = [...initialAccounts].sort((a, b) => {
+      healthyAccounts = [...candidates].sort((a, b) => {
         const statsA = statsByAccount.get(a.id);
         const statsB = statsByAccount.get(b.id);
         return statsA.errorRate - statsB.errorRate || statsA.errorCount - statsB.errorCount;
       });
     }
+    const stickyKey = this.stickyEnabled && opts.stickyKey ? opts.stickyKey : void 0;
     healthyAccounts.sort((a, b) => {
       const groupA = groups.get(a.group_id);
       const groupB = groups.get(b.group_id);
       const statsA = statsByAccount.get(a.id);
       const statsB = statsByAccount.get(b.id);
-      return groupA.priority - groupB.priority || a.priority - b.priority || accountRateMultiplier(a) - accountRateMultiplier(b) || statsA.errorRate - statsB.errorRate || statsA.errorCount - statsB.errorCount || (this.lastUsed.get(a.id) ?? 0) - (this.lastUsed.get(b.id) ?? 0) || a.id - b.id;
+      return groupA.priority - groupB.priority || a.priority - b.priority || accountRateMultiplier(a) - accountRateMultiplier(b) || statsA.errorRate - statsB.errorRate || statsA.errorCount - statsB.errorCount || (stickyKey ? stickyHash(stickyKey, a.id) - stickyHash(stickyKey, b.id) : (this.lastUsed.get(a.id) ?? 0) - (this.lastUsed.get(b.id) ?? 0)) || a.id - b.id;
     });
     const selected = healthyAccounts[0];
     const group = groups.get(selected.group_id);
@@ -1993,6 +2334,8 @@ function newResponsesToChatState(model) {
     sawToolCall: false,
     sawText: false,
     finalized: false,
+    failed: false,
+    failedMessage: "",
     nextToolCallIndex: 0,
     outputIndexToToolIndex: {},
     outputIndexToArguments: {},
@@ -2092,6 +2435,15 @@ function handleReasoningDelta(evt, state) {
   return [makeChatDeltaChunk(state, { reasoning_content: evt.delta })];
 }
 function handleCompleted(evt, state) {
+  const type = String(evt?.type || "");
+  if (type === "response.failed") {
+    state.failed = true;
+    state.finalized = true;
+    const response2 = isObject(evt.response) ? evt.response : void 0;
+    const err = response2 && isObject(response2.error) ? response2.error : null;
+    state.failedMessage = err && err.message || "Upstream response failed";
+    return [];
+  }
   state.finalized = true;
   let finishReason = "stop";
   if (isObject(evt.usage)) state.usage = responsesUsageToChatUsage(evt.usage);
@@ -2139,13 +2491,6 @@ function responsesEventToChatChunks(event, state) {
     default:
       return [];
   }
-}
-function finalizeResponsesChatStream(state) {
-  if (state.finalized) return [];
-  state.finalized = true;
-  const chunks = [makeChatFinishChunk(state, state.sawToolCall ? "tool_calls" : "stop")];
-  if (state.includeUsage && state.usage) chunks.push(makeChatUsageChunk(state));
-  return chunks;
 }
 function chatChunkToSse(chunk) {
   return `data: ${JSON.stringify(chunk)}
@@ -2292,7 +2637,14 @@ function responsesSseToChatStream(body, model) {
                 for (const chunk of responsesEventToChatChunks(event, state)) controller.enqueue(encoder.encode(chatChunkToSse(chunk)));
               }
             }
-            for (const chunk of finalizeResponsesChatStream(state)) controller.enqueue(encoder.encode(chatChunkToSse(chunk)));
+            if (state.failed) {
+              controller.error(new Error(state.failedMessage));
+              return;
+            }
+            if (!state.finalized) {
+              controller.error(new Error("Upstream stream ended before a terminal event"));
+              return;
+            }
             controller.enqueue(encoder.encode("data: [DONE]\n\n"));
             controller.close();
             return;
@@ -2305,6 +2657,10 @@ function responsesSseToChatStream(body, model) {
               controller.enqueue(encoder.encode(chatChunkToSse(chunk)));
               produced = true;
             }
+          }
+          if (state.failed) {
+            controller.error(new Error(state.failedMessage));
+            return;
           }
           if (produced) return;
         }
@@ -2369,6 +2725,527 @@ function safeJson(text) {
   }
 }
 
+// functions/src/utils/responses-compat.ts
+var MAX_STRIP_RETRIES = 6;
+function createStripRetryState(initialBody) {
+  const seen = /* @__PURE__ */ new Set();
+  if (initialBody) seen.add(initialBody);
+  return { seen, attempts: 0 };
+}
+function allowStripRetry(state, nextBody) {
+  if (!nextBody || state.seen.has(nextBody) || state.attempts >= MAX_STRIP_RETRIES) return false;
+  state.seen.add(nextBody);
+  state.attempts += 1;
+  return true;
+}
+var RE_NAMESPACE_PARAM = /^input\[(\d+)\]\.namespace$/i;
+var RE_STATUS_PARAM = /^input\[(\d+)\]\.status$/i;
+var RE_CONTENT_PARAM = /^input\[(\d+)\]\.content$/i;
+var RE_CACHE_PARAM = /^input\[(\d+)\]\.prompt_cache_breakpoint$/i;
+var RE_REJECTED_MESSAGE_PARAM = /(?:unknown|unsupported)[ _-]+parameter\s*(?::|=|is)?\s*["']?(max_output_tokens|truncation|input\[\d+\]\.(?:namespace|status))(?:["']|\b)/i;
+var RE_INVALID_TYPE_CONTENT = /invalid[ _-]+type\s+for\s+["']?(input\[\d+\]\.content)(?:["']|\b)[^\n]*\b(?:got|received)\s+null\b/i;
+var RE_MAX_ZERO_CONTENT = /invalid\s+["']?(input\[\d+\]\.content)["']?\s*:\s*array too long\.[^\n]*maximum length 0\b/i;
+var RE_CACHE_MODEL_REJECTION = /["']?(prompt_cache_breakpoint|input\[\d+\]\.prompt_cache_breakpoint)["']?\s+is\s+not\s+supported\s+on\s+this\s+model\b/i;
+var RE_TOOL_PARAMETERS_PARAM = /^(?:tools|input)\[\d+\](?:\.tools\[\d+\])*(?:\.function)?\.parameters$/i;
+var RE_MISSING_SCHEMA_TYPE = /\bgot\s+["']?type\s*:\s*["']?none["']?/i;
+var TOOL_CALL_ITEM_TYPES = ["function_call", "tool_call", "custom_tool_call", "mcp_tool_call"];
+function asRecord(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : void 0;
+}
+function readInputItem(body, index) {
+  if (!Array.isArray(body?.input)) return void 0;
+  return asRecord(body.input[index]);
+}
+function extractErrorFields(errorBodyText) {
+  let parsed;
+  try {
+    parsed = JSON.parse(errorBodyText);
+  } catch {
+    return { code: "", message: "", param: "" };
+  }
+  const root = asRecord(parsed);
+  const error = asRecord(root?.error);
+  let message = String(error?.message ?? root?.detail ?? root?.message ?? "").trim();
+  let code = String(error?.code ?? "").trim();
+  const param = String(error?.param ?? "").trim();
+  if (message.startsWith("{")) {
+    try {
+      const inner = asRecord(JSON.parse(message));
+      const innerError = asRecord(inner?.error);
+      if (innerError?.code && !code) code = String(innerError.code).trim();
+      const innerMessage = String(innerError?.message ?? "").trim();
+      if (innerMessage) message = innerMessage;
+    } catch {
+    }
+  }
+  return { code, message, param };
+}
+function repairToolParameterRootTypes(body) {
+  const candidates = [];
+  const collectTools = (tools) => {
+    if (!Array.isArray(tools)) return;
+    for (const tool of tools) {
+      const record = asRecord(tool);
+      if (!record) continue;
+      const direct = asRecord(record.parameters);
+      if (direct) candidates.push(direct);
+      const nested = asRecord(asRecord(record.function)?.parameters);
+      if (nested) candidates.push(nested);
+    }
+  };
+  collectTools(body?.tools);
+  if (Array.isArray(body?.input)) {
+    for (const item of body.input) {
+      const record = asRecord(item);
+      if (!record) continue;
+      const direct = asRecord(record.parameters);
+      if (direct) candidates.push(direct);
+      collectTools(record.tools);
+    }
+  }
+  let changed = false;
+  for (const params of candidates) {
+    const hasType = Object.prototype.hasOwnProperty.call(params, "type");
+    if (!hasType || params.type === null) {
+      if (hasType) {
+        params.type = "object";
+        changed = true;
+      } else {
+        const union = Array.isArray(params.anyOf) ? params.anyOf : Array.isArray(params.oneOf) ? params.oneOf : void 0;
+        const objectOnly = !!union && union.length > 0 && union.every((member) => {
+          const record = asRecord(member);
+          return !!record && (record.type === void 0 || record.type === null || record.type === "object");
+        });
+        if (objectOnly) {
+          params.type = "object";
+          changed = true;
+        }
+      }
+    }
+    if ("required" in params && params.required === null) {
+      delete params.required;
+      changed = true;
+    }
+  }
+  return changed;
+}
+function stripRejectedResponseFields(errorBodyText, sentBody) {
+  if (!errorBodyText || !sentBody) return null;
+  const { code, message, param } = extractErrorFields(errorBodyText);
+  const lcCode = code.toLowerCase();
+  const lcMessage = message.toLowerCase();
+  let lcParam = param.toLowerCase();
+  if (!lcCode && !lcMessage && !lcParam) return null;
+  let body;
+  try {
+    body = JSON.parse(sentBody);
+  } catch {
+    return null;
+  }
+  if (!asRecord(body)) return null;
+  const rewrite = (reason) => ({ body: JSON.stringify(body), reason });
+  if (lcCode === "invalid_function_parameters" && RE_TOOL_PARAMETERS_PARAM.test(lcParam) && RE_MISSING_SCHEMA_TYPE.test(lcMessage)) {
+    if (repairToolParameterRootTypes(body)) return rewrite("tool parameter root type rejection");
+  }
+  const messageCacheParam = (RE_CACHE_MODEL_REJECTION.exec(lcMessage)?.[1] || "").toLowerCase();
+  const cacheParam = lcParam || messageCacheParam;
+  const cacheParamMatchesMessage = !messageCacheParam || cacheParam === messageCacheParam;
+  const cacheModelRejection = lcCode === "invalid_parameter" || !!messageCacheParam;
+  if (cacheParam && cacheParamMatchesMessage && cacheModelRejection) {
+    if (cacheParam === "prompt_cache_breakpoint" && Object.prototype.hasOwnProperty.call(body, "prompt_cache_breakpoint")) {
+      delete body.prompt_cache_breakpoint;
+      return rewrite("prompt_cache_breakpoint parameter rejection");
+    }
+    const cacheIndexMatch = RE_CACHE_PARAM.exec(cacheParam);
+    if (cacheIndexMatch) {
+      const item = readInputItem(body, Number(cacheIndexMatch[1]));
+      if (item && Object.prototype.hasOwnProperty.call(item, "prompt_cache_breakpoint")) {
+        delete item.prompt_cache_breakpoint;
+        return rewrite("indexed prompt_cache_breakpoint parameter rejection");
+      }
+      return null;
+    }
+  }
+  const explicitRejection = lcCode === "unknown_parameter" || lcCode === "unsupported_parameter" || lcMessage.includes("unknown parameter") || lcMessage.includes("unsupported parameter");
+  if (explicitRejection) {
+    const messageParam = (RE_REJECTED_MESSAGE_PARAM.exec(lcMessage)?.[1] || "").toLowerCase();
+    if (lcParam && messageParam && lcParam !== messageParam) return null;
+    if (!lcParam) lcParam = messageParam;
+    if (lcParam) {
+      const namespaceMatch = RE_NAMESPACE_PARAM.exec(lcParam);
+      if (namespaceMatch) {
+        const item = readInputItem(body, Number(namespaceMatch[1]));
+        if (!item) return null;
+        const itemType = String(item.type ?? "").toLowerCase().trim();
+        if (!TOOL_CALL_ITEM_TYPES.includes(itemType) || !Object.prototype.hasOwnProperty.call(item, "namespace")) return null;
+        delete item.namespace;
+        return rewrite("indexed namespace parameter rejection");
+      }
+      const statusMatch = RE_STATUS_PARAM.exec(lcParam);
+      if (statusMatch) {
+        const index = Number(statusMatch[1]);
+        const rejectedItem = readInputItem(body, index);
+        if (!rejectedItem || !Object.prototype.hasOwnProperty.call(rejectedItem, "status")) return null;
+        const rejectedType = String(rejectedItem.type ?? "").trim();
+        let cleared = 0;
+        if (Array.isArray(body.input) && rejectedType) {
+          for (const candidate of body.input) {
+            const record = asRecord(candidate);
+            if (!record || String(record.type ?? "").trim() !== rejectedType) continue;
+            if (!Object.prototype.hasOwnProperty.call(record, "status")) continue;
+            delete record.status;
+            cleared += 1;
+          }
+        }
+        if (cleared === 0) delete rejectedItem.status;
+        return rewrite("indexed status parameter rejection");
+      }
+      if (lcParam === "max_output_tokens" && Object.prototype.hasOwnProperty.call(body, "max_output_tokens")) {
+        delete body.max_output_tokens;
+        return rewrite("max_output_tokens parameter rejection");
+      }
+      if (lcParam === "truncation" && Object.prototype.hasOwnProperty.call(body, "truncation")) {
+        delete body.truncation;
+        return rewrite("truncation parameter rejection");
+      }
+    }
+  }
+  const messageContentParam = (RE_INVALID_TYPE_CONTENT.exec(lcMessage)?.[1] || "").toLowerCase();
+  const contentParam = lcParam || messageContentParam;
+  const contentMatch = RE_CONTENT_PARAM.exec(contentParam);
+  const explicitNullContent = (lcCode === "invalid_type" || lcCode === "invalid_request_error" || lcCode === "") && RE_INVALID_TYPE_CONTENT.test(lcMessage);
+  if (contentMatch && contentParam === messageContentParam && explicitNullContent) {
+    const item = readInputItem(body, Number(contentMatch[1]));
+    if (!item || !Object.prototype.hasOwnProperty.call(item, "content") || item.content !== null) return null;
+    const itemType = String(item.type ?? "").toLowerCase().trim();
+    const role = String(item.role ?? "").trim();
+    if (itemType === "reasoning") {
+      delete item.content;
+      return rewrite("indexed reasoning null content rejection");
+    }
+    if (itemType === "message" || role) {
+      item.content = "";
+      return rewrite("indexed message null content rejection");
+    }
+    return null;
+  }
+  const maxZeroParam = (RE_MAX_ZERO_CONTENT.exec(lcMessage)?.[1] || "").toLowerCase();
+  const maxZeroMatch = RE_CONTENT_PARAM.exec(lcParam);
+  if (maxZeroMatch && lcParam === maxZeroParam && lcCode === "array_above_max_length") {
+    const item = readInputItem(body, Number(maxZeroMatch[1]));
+    if (!item || String(item.type ?? "").toLowerCase().trim() !== "reasoning") return null;
+    if (!Array.isArray(item.content) || item.content.length === 0) return null;
+    delete item.content;
+    return rewrite("indexed reasoning content maximum-length rejection");
+  }
+  return null;
+}
+async function sendWithRejectedFieldRetry(send, initialBody, state) {
+  if (!state || initialBody === void 0) return send(initialBody);
+  let bodyText = initialBody;
+  for (; ; ) {
+    const response = await send(bodyText);
+    if (response.status !== 400) return response;
+    const errorText = await response.text().catch(() => "");
+    const stripped = stripRejectedResponseFields(errorText, bodyText);
+    if (!stripped || !allowStripRetry(state, stripped.body)) {
+      const headers = { ...response.headers };
+      delete headers["content-encoding"];
+      delete headers["Content-Encoding"];
+      delete headers["content-length"];
+      delete headers["Content-Length"];
+      return {
+        status: 400,
+        headers,
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(errorText));
+            controller.close();
+          }
+        }),
+        text: async () => errorText
+      };
+    }
+    bodyText = stripped.body;
+  }
+}
+
+// functions/src/utils/silent-refusal.ts
+var SILENT_REFUSAL_MIN_BODY_BYTES = 64 * 1024;
+var SILENT_REFUSAL_BUFFER_CAP = 1024 * 1024;
+var SILENT_REFUSAL_UPSTREAM_MESSAGE = "OpenAI upstream returned an empty completion stream with finish_reason=stop and no usage";
+function isObject2(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+var SilentRefusalDetector = class {
+  enabled;
+  sawContent = false;
+  sawToolCall = false;
+  sawFunctionCall = false;
+  sawUsage = false;
+  sawError = false;
+  sawReasoning = false;
+  sawFinish = false;
+  finishReason = "";
+  constructor(requestBodyLen, allowed = true) {
+    this.enabled = allowed && requestBodyLen >= SILENT_REFUSAL_MIN_BODY_BYTES;
+  }
+  observeEventType(eventType) {
+    if (!this.enabled) return;
+    const type = eventType.trim();
+    if (!type) return;
+    if (type === "error" || type === "response.failed") this.sawError = true;
+    if (type.includes("reasoning")) this.sawReasoning = true;
+  }
+  observePayload(payload) {
+    if (!this.enabled) return;
+    const text = payload.trim();
+    if (!text || text === "[DONE]") return;
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      return;
+    }
+    if (!isObject2(data)) return;
+    if (typeof data.type === "string") this.observeEventType(data.type);
+    if (data.error != null) this.sawError = true;
+    if (isObject2(data.usage)) this.sawUsage = true;
+    if (isObject2(data.response) && isObject2(data.response.usage)) this.sawUsage = true;
+    this.observeChatChoices(data);
+    this.observeResponses(data, typeof data.type === "string" ? data.type : "");
+  }
+  shouldReleaseClientOutput() {
+    if (!this.enabled) return true;
+    if (this.sawContent || this.sawToolCall || this.sawFunctionCall || this.sawUsage || this.sawError || this.sawReasoning) return true;
+    return this.sawFinish && this.finishReason !== "" && this.finishReason !== "stop";
+  }
+  isSilentRefusal() {
+    return this.enabled && !this.sawContent && !this.sawToolCall && !this.sawFunctionCall && !this.sawUsage && !this.sawError && !this.sawReasoning && this.sawFinish && this.finishReason === "stop";
+  }
+  observeFinishReason(reason) {
+    const trimmed = reason.trim();
+    if (!trimmed) return;
+    this.sawFinish = true;
+    this.finishReason = trimmed;
+  }
+  observeChatChoices(data) {
+    if (!Array.isArray(data.choices)) return;
+    for (const raw of data.choices) {
+      if (!isObject2(raw)) continue;
+      if (typeof raw.finish_reason === "string") this.observeFinishReason(raw.finish_reason);
+      const delta = raw.delta;
+      if (!isObject2(delta)) continue;
+      if (typeof delta.content === "string" && delta.content !== "") this.sawContent = true;
+      if (delta.tool_calls != null) this.sawToolCall = true;
+      if (delta.function_call != null) this.sawFunctionCall = true;
+      if (delta.reasoning != null || delta.reasoning_content != null || delta.reasoning_summary != null) this.sawReasoning = true;
+    }
+  }
+  observeResponses(data, eventType) {
+    switch (eventType.trim()) {
+      case "response.output_text.delta":
+        if (typeof data.delta === "string" && data.delta !== "") this.sawContent = true;
+        break;
+      case "response.output_item.added": {
+        const item = isObject2(data.item) && typeof data.item.type === "string" ? data.item.type.trim() : "";
+        if (item === "function_call") this.sawToolCall = true;
+        else if (item === "reasoning") this.sawReasoning = true;
+        break;
+      }
+      case "response.function_call_arguments.delta":
+        this.sawToolCall = true;
+        break;
+      case "response.reasoning_summary_text.delta":
+      case "response.reasoning_summary_text.done":
+        this.sawReasoning = true;
+        break;
+      case "response.completed":
+      case "response.done":
+        this.observeFinishReason("stop");
+        break;
+      case "response.incomplete":
+        this.observeFinishReason("length");
+        break;
+      case "response.failed":
+        this.sawError = true;
+        break;
+      default:
+        break;
+    }
+    const response = data.response;
+    if (!isObject2(response) || !Array.isArray(response.output)) return;
+    for (const raw of response.output) {
+      if (!isObject2(raw)) continue;
+      const itemType = typeof raw.type === "string" ? raw.type.trim() : "";
+      if (itemType === "function_call") this.sawToolCall = true;
+      else if (itemType === "reasoning") this.sawReasoning = true;
+      else if (itemType === "message" && Array.isArray(raw.content)) {
+        for (const part of raw.content) {
+          if (isObject2(part) && typeof part.text === "string" && part.text !== "") {
+            this.sawContent = true;
+            break;
+          }
+        }
+      }
+    }
+  }
+};
+function makeFrameSink(detector) {
+  let pending = "";
+  const observeFrame = (frame) => {
+    for (const line of frame.split(/\r?\n/)) {
+      if (line.startsWith("event:")) {
+        detector.observeEventType(line.slice("event:".length));
+      } else if (line.startsWith("data:")) {
+        const payload = line.slice("data:".length);
+        detector.observePayload(payload.startsWith(" ") ? payload.slice(1) : payload);
+      }
+    }
+  };
+  return {
+    push(text) {
+      pending += text;
+      for (; ; ) {
+        const match = /\r?\n\r?\n/.exec(pending);
+        if (!match) break;
+        observeFrame(pending.slice(0, match.index));
+        pending = pending.slice(match.index + match[0].length);
+      }
+    },
+    flush() {
+      if (pending.trim()) observeFrame(pending);
+      pending = "";
+    }
+  };
+}
+function guardSilentRefusalStream(stream, detector) {
+  if (!detector.enabled) return stream;
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  const sink = makeFrameSink(detector);
+  let buffered = [];
+  let bufferedBytes = 0;
+  let released = false;
+  const flushBuffered = (controller) => {
+    for (const chunk of buffered) controller.enqueue(chunk);
+    buffered = [];
+    bufferedBytes = 0;
+  };
+  return new ReadableStream({
+    async pull(controller) {
+      for (; ; ) {
+        let chunk;
+        try {
+          chunk = await reader.read();
+        } catch (error) {
+          controller.error(error);
+          return;
+        }
+        if (chunk.done) {
+          sink.push(decoder.decode());
+          sink.flush();
+          if (!released && detector.isSilentRefusal()) {
+            await reader.cancel().catch(() => {
+            });
+            controller.error(new Error(SILENT_REFUSAL_UPSTREAM_MESSAGE));
+            return;
+          }
+          flushBuffered(controller);
+          controller.close();
+          return;
+        }
+        sink.push(decoder.decode(chunk.value, { stream: true }));
+        if (released) {
+          controller.enqueue(chunk.value);
+          return;
+        }
+        buffered.push(chunk.value);
+        bufferedBytes += chunk.value.byteLength;
+        if (detector.shouldReleaseClientOutput() || bufferedBytes >= SILENT_REFUSAL_BUFFER_CAP) {
+          released = true;
+          flushBuffered(controller);
+          return;
+        }
+      }
+    },
+    async cancel(reason) {
+      await reader.cancel(reason).catch(() => {
+      });
+    }
+  });
+}
+
+// functions/src/utils/model-allowlist.ts
+function modelAllowlistCandidates(model) {
+  const trimmed = model.trim();
+  const candidates = [trimmed];
+  const lower = trimmed.toLowerCase();
+  if (lower.startsWith("models/")) candidates.push(trimmed.slice("models/".length));
+  if (lower.endsWith("-thinking")) candidates.push(trimmed.slice(0, -"-thinking".length));
+  return candidates;
+}
+function normalizeModelAllowlist(raw) {
+  if (!Array.isArray(raw)) return { error: "\u6A21\u578B\u767D\u540D\u5355\u5FC5\u987B\u662F\u5B57\u7B26\u4E32\u6570\u7EC4" };
+  const seen = /* @__PURE__ */ new Set();
+  const list = [];
+  for (const item of raw) {
+    if (typeof item !== "string") return { error: "\u6A21\u578B\u767D\u540D\u5355\u5FC5\u987B\u662F\u5B57\u7B26\u4E32\u6570\u7EC4" };
+    const value = item.trim();
+    if (!value) continue;
+    const stars = value.split("*").length - 1;
+    if (stars > 0 && (stars > 1 || !value.endsWith("*") || value.length === 1)) {
+      return { error: `\u901A\u914D\u7B26\u53EA\u80FD\u51FA\u73B0\u5728\u6A21\u578B\u540D\u79F0\u672B\u5C3E\u4E14\u53EA\u80FD\u6709\u4E00\u4E2A\uFF1A\u300C${value}\u300D` };
+    }
+    const key = value.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    list.push(value);
+  }
+  return { list };
+}
+function parseModelAllowlist(text) {
+  if (typeof text !== "string" || !text.trim()) return [];
+  try {
+    const parsed = JSON.parse(text);
+    return Array.isArray(parsed) ? parsed.filter((entry) => typeof entry === "string") : [];
+  } catch {
+    return [];
+  }
+}
+function serializeModelAllowlist(list) {
+  return JSON.stringify(list);
+}
+function modelAllowed(model, group) {
+  if (!group || !Number(group.model_allowlist_enabled)) return true;
+  const allowlist = parseModelAllowlist(group.model_allowlist).map((entry) => entry.toLowerCase());
+  if (allowlist.length === 0) return false;
+  if (!model.trim()) return true;
+  for (const candidate of modelAllowlistCandidates(model)) {
+    const lowered = candidate.toLowerCase();
+    for (const entry of allowlist) {
+      if (entry.endsWith("*")) {
+        if (lowered.startsWith(entry.slice(0, -1))) return true;
+      } else if (lowered === entry) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+function modelAllowlistDeniedMessage(model) {
+  return `Model "${model}" does not exist or is not available for this group`;
+}
+function modelAllowlistDenied(model) {
+  return new Response(JSON.stringify({
+    error: {
+      message: modelAllowlistDeniedMessage(model),
+      type: "invalid_request_error",
+      code: "model_not_found"
+    }
+  }), { status: 404, headers: { "Content-Type": "application/json" } });
+}
+
 // functions/src/pricing.ts
 var TOKENS_PER_UNIT = 1e6;
 var OPENAI_RATES = [
@@ -2422,7 +3299,7 @@ function estimateTokens(text) {
   }
   return Math.ceil(tokens);
 }
-function extractTokenUsage(body, headers) {
+function extractTokenUsage(body, headers, request) {
   let promptTokens = 0;
   let completionTokens = 0;
   let totalTokens = 0;
@@ -2431,14 +3308,28 @@ function extractTokenUsage(body, headers) {
     completionTokens = body.usage.completion_tokens || body.usage.output_tokens || 0;
     totalTokens = body.usage.total_tokens || promptTokens + completionTokens;
   }
-  if (totalTokens === 0) {
-    const inputText = typeof body?.messages === "string" ? body.messages : JSON.stringify(body?.messages || body?.input || "");
-    const outputText = typeof body?.output === "string" ? body.output : JSON.stringify(body?.output || body?.content || "");
+  if (totalTokens === 0 && request !== void 0) {
+    const inputSource = request?.messages ?? request?.input ?? request?.content ?? "";
+    const inputText = typeof inputSource === "string" ? inputSource : JSON.stringify(inputSource);
+    const outputSource = body?.choices?.[0]?.message?.content ?? body?.output ?? body?.content ?? "";
+    const outputText = typeof outputSource === "string" ? outputSource : JSON.stringify(outputSource);
     promptTokens = estimateTokens(inputText);
     completionTokens = estimateTokens(outputText);
     totalTokens = promptTokens + completionTokens;
   }
   return { promptTokens, completionTokens, totalTokens };
+}
+function extractReasoningEffort(body) {
+  if (!body || typeof body !== "object") return null;
+  const effort = body.reasoning_effort ?? body.reasoning?.effort ?? body.reason;
+  if (effort !== void 0 && effort !== null && effort !== "") {
+    return String(effort).slice(0, 64);
+  }
+  const thinking = body.thinking;
+  if (thinking && typeof thinking === "object" && (thinking.type === "enabled" || thinking.budget_tokens)) {
+    return thinking.budget_tokens ? `thinking:${thinking.budget_tokens}` : "thinking";
+  }
+  return null;
 }
 function calculateCostBreakdown(provider, model, promptTokens, completionTokens, multiplier = 1) {
   const published = findTokenRate(provider, model);
@@ -2464,13 +3355,23 @@ function round6(value) {
 
 // functions/src/utils/record.ts
 var STREAM_RECORD_TIMEOUT_MS = 15 * 60 * 1e3;
-function streamWithRecording(body, status, headers, context) {
+async function streamWithRecording(body, status, headers, context) {
   const isError = status >= 400;
+  const guard = streamGuardFromEnv(context.env || {});
+  const contentType = String(headers["content-type"] || headers["Content-Type"] || "");
+  const keepalive = contentType.includes("text/event-stream");
+  const source = isError ? body : await stageFirstChunk(body, guard);
   let settle;
   const finished = new Promise((resolve) => {
     settle = resolve;
   });
-  const measured = measureStreamTiming(body, context.startedAt, (outcome) => settle(outcome));
+  const measured = measureStreamTiming(
+    source,
+    context.startedAt,
+    (outcome) => settle(outcome),
+    guard,
+    keepalive
+  );
   let timer;
   const timeout = new Promise((resolve) => {
     timer = setTimeout(
@@ -2512,7 +3413,9 @@ function streamWithRecording(body, status, headers, context) {
       status,
       error_message: isError ? "Upstream error" : "",
       latency_ms: outcome.totalMs,
-      ttft_ms: outcome.ttftMs ?? void 0
+      ttft_ms: outcome.ttftMs ?? void 0,
+      reasoning_effort: context.reasoningEffort ?? null,
+      user_agent: context.userAgent ?? null
     }).catch(() => {
     });
     await context.db.createRequestLog({
@@ -2529,10 +3432,74 @@ function streamWithRecording(body, status, headers, context) {
   });
   context.ctx?.waitUntil?.(persist2);
   context.failover.recordRequest(context.accountId, context.groupId, isError);
+  const outHeaders = {
+    ...stripBodyHeaders(headers),
+    "content-type": contentType || headers["Content-Type"] || "text/event-stream",
+    "cache-control": "no-store, no-transform"
+  };
   return new Response(measured, {
     status,
-    headers: { ...headers, "content-type": headers["content-type"] || "text/event-stream" }
+    headers: outHeaders
   });
+}
+
+// functions/src/utils/cache-breakpoints.ts
+var MAX_BREAKPOINTS = 4;
+function hasCacheControl(node, depth = 0) {
+  if (!node || typeof node !== "object" || depth > 6) return false;
+  if (node.cache_control) return true;
+  if (Array.isArray(node)) {
+    return node.some((item) => hasCacheControl(item, depth + 1));
+  }
+  for (const key of Object.keys(node)) {
+    if (key === "cache_control") continue;
+    if (hasCacheControl(node[key], depth + 1)) return true;
+  }
+  return false;
+}
+function toBlocks(content) {
+  if (typeof content === "string") return [{ type: "text", text: content }];
+  if (Array.isArray(content)) return content;
+  return [];
+}
+function applyAnthropicCacheBreakpoints(body) {
+  if (!body || typeof body !== "object") return false;
+  if (hasCacheControl(body)) return false;
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  if (messages.length === 0) return false;
+  let placed = 0;
+  const mark = (block) => {
+    if (placed >= MAX_BREAKPOINTS || !block || typeof block !== "object") return false;
+    block.cache_control = { type: "ephemeral" };
+    placed += 1;
+    return true;
+  };
+  const markMessage = (message) => {
+    if (!message || typeof message !== "object") return false;
+    const blocks = toBlocks(message.content);
+    if (blocks.length === 0) return false;
+    if (typeof message.content === "string") message.content = blocks;
+    return mark(blocks[blocks.length - 1]);
+  };
+  let changed = false;
+  if (Array.isArray(body.tools) && body.tools.length > 0) {
+    const lastTool = body.tools[body.tools.length - 1];
+    if (lastTool && typeof lastTool === "object" && !lastTool.cache_control) {
+      changed = mark(lastTool) || changed;
+    }
+  }
+  changed = markMessage(messages[messages.length - 1]) || changed;
+  if (messages.length >= 4) {
+    const userIndexes = [];
+    for (let i = 0; i < messages.length - 1; i++) {
+      const message = messages[i];
+      if (message && typeof message === "object" && message.role === "user") userIndexes.push(i);
+    }
+    if (userIndexes.length >= 2) {
+      changed = markMessage(messages[userIndexes[userIndexes.length - 2]]) || changed;
+    }
+  }
+  return changed;
 }
 
 // functions/src/utils/background.ts
@@ -2547,6 +3514,7 @@ function defer(ctx, work) {
 // functions/src/utils/routing-cache.ts
 var TTL_MS = 5e3;
 var snapshots = /* @__PURE__ */ new WeakMap();
+var lastIdentity = null;
 var hits = 0;
 var misses = 0;
 async function loadRoutingSnapshot(db, identity) {
@@ -2564,10 +3532,16 @@ async function loadRoutingSnapshot(db, identity) {
   ]);
   const value = { accounts, groups, mappings };
   snapshots.set(identity, { loadedAt: now, value });
+  lastIdentity = identity;
   return value;
 }
 function invalidateRoutingSnapshot(identity) {
   snapshots.delete(identity);
+  if (lastIdentity === identity) lastIdentity = null;
+}
+function invalidateAllRoutingSnapshots() {
+  if (lastIdentity) snapshots.delete(lastIdentity);
+  lastIdentity = null;
 }
 function routingCacheMetrics() {
   const samples = hits + misses;
@@ -2602,6 +3576,9 @@ async function handleGatewayRequest(request, env, failover, ctx) {
   }
   const model = requestBody.model || "";
   const stream = requestBody.stream === true;
+  const stickyKey = resolveOpenCodeSessionId({ clientHeaders: request.headers, body: requestBody, allowGenerate: false }) || void 0;
+  const userAgent = request.headers.get("user-agent")?.slice(0, 255) || null;
+  const reasoningEffort = extractReasoningEffort(requestBody);
   let provider = "openai";
   const pathLower = url.pathname.toLowerCase();
   if (pathLower.includes("/claude") || pathLower.includes("/anthropic") || model.startsWith("claude-")) {
@@ -2625,8 +3602,11 @@ async function handleGatewayRequest(request, env, failover, ctx) {
     if (accounts.length === 0) {
       return new Response(JSON.stringify({
         error: "No available accounts",
-        message: "\uFFFD\uFFFD?API \u5BC6\u94A5\u7ED1\u5B9A\u7684\u4E3B\u5206\u7EC4\u548C\u515C\u5E95\u5206\u7EC4\u4E0B\u6CA1\u6709\u53EF\u7528\u8D26\u53F7"
+        message: "\u8BE5 API \u5BC6\u94A5\u7ED1\u5B9A\u7684\u4E3B\u5206\u7EC4\u548C\u515C\u5E95\u5206\u7EC4\u4E0B\u6CA1\u6709\u53EF\u7528\u8D26\u53F7"
       }), { status: 503, headers: { "Content-Type": "application/json" } });
+    }
+    if (!modelAllowed(model, groups.get(keyGroupId))) {
+      return modelAllowlistDenied(model);
     }
   }
   if (accounts.length === 0) {
@@ -2635,7 +3615,7 @@ async function handleGatewayRequest(request, env, failover, ctx) {
   const providerMapping = mapping && mapping.provider === provider ? mapping : findModelMapping(model, mappings, provider);
   let upstreamModel = providerMapping?.requested_model.endsWith("*") ? providerMapping.upstream_model + model.slice(providerMapping.requested_model.length - 1) : providerMapping?.upstream_model || model;
   const preferredGroupId = keyGroupId || providerMapping?.group_id || void 0;
-  const selection = await failover.selectAccount(accounts, groups, preferredGroupId, fallbackGroupId ? [fallbackGroupId] : []);
+  const selection = await failover.selectAccount(accounts, groups, preferredGroupId, fallbackGroupId ? [fallbackGroupId] : [], { stickyKey });
   if (!selection) {
     return new Response(JSON.stringify({ error: "No available accounts" }), { status: 503, headers: { "Content-Type": "application/json" } });
   }
@@ -2670,45 +3650,60 @@ async function handleGatewayRequest(request, env, failover, ctx) {
       return new Response(JSON.stringify({ error: { message, type: "invalid_request_error", param: null, code: null } }), { status: 400, headers: { "Content-Type": "application/json" } });
     }
   }
+  let usageInjected = false;
+  if (stream && bridgedBody === void 0 && (provider === "openai" || provider === "xai" || provider === "opencode_go") && upstreamPath.includes("/chat/completions")) {
+    usageInjected = ensureChatStreamUsage(requestBody);
+  }
   const upstreamUrl = new URL(`${baseUrl}${upstreamPath}`);
   if (provider === "anthropic") upstreamUrl.searchParams.set("beta", "true");
   const headers = buildUpstreamHeaders(request.headers, provider, credentials.apiKey, credentials.baseUrl, account.client_spoofing);
   if (provider === "opencode_go") {
     applyOpenCodeHeaders(headers, { clientHeaders: request.headers, body: requestBody, allowGenerate: true });
   }
+  let cacheInjected = false;
+  if (provider === "anthropic" && (env.CACHE_BREAKPOINTS ?? "1") !== "0") {
+    cacheInjected = applyAnthropicCacheBreakpoints(requestBody);
+  }
   if (upstreamModel && upstreamModel !== model && requestBody.model) {
     requestBody.model = upstreamModel;
   }
-  const chatBody = request.method === "GET" || request.method === "HEAD" ? void 0 : upstreamModel !== model ? JSON.stringify(requestBody) : body;
+  const chatBody = request.method === "GET" || request.method === "HEAD" ? void 0 : upstreamModel !== model || cacheInjected || usageInjected ? JSON.stringify(requestBody) : body;
   const upstreamBody = bridgedBody !== void 0 ? bridgedBody : chatBody;
   const startTime = Date.now();
   let isError = false;
   let errorMessage = "";
   let responseStatus = 200;
+  const stripState = provider !== "anthropic" && upstreamBody !== void 0 ? createStripRetryState(upstreamBody) : void 0;
+  const refusalDetector = new SilentRefusalDetector(upstreamBody?.length ?? 0, provider === "openai");
   try {
-    const proxyResponse = await proxyRequest({
+    const proxyResponse = await sendWithRejectedFieldRetry((bodyText) => proxyRequest({
       url: upstreamUrl.toString(),
       method: request.method,
       headers,
+      signal: request.signal,
+      timeoutMs: envInt(env.UPSTREAM_HEADER_TIMEOUT_MS, 6e4),
       body: new ReadableStream({
         start(controller) {
-          if (upstreamBody !== void 0) controller.enqueue(new TextEncoder().encode(upstreamBody));
+          if (bodyText !== void 0) controller.enqueue(new TextEncoder().encode(bodyText));
           controller.close();
         }
       })
-    });
+    }), upstreamBody, stripState);
     responseStatus = proxyResponse.status;
     isError = responseStatus >= 400;
+    if (isError && failover.shouldFailover({ status: responseStatus })) {
+      failover.noteRateLimit(account.id, responseStatus, proxyResponse.headers["retry-after"]);
+    }
     if (isError && failover.shouldFailover({ status: responseStatus }) && accounts.length > 1) {
       await proxyResponse.text().catch(() => "");
       failover.recordRequest(account.id, group.id, true);
       defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: responseStatus, error_message: `Upstream returned ${responseStatus}`, latency_ms: Date.now() - startTime }));
-      return handleFailover(chatBody, request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, model, `Upstream returned ${responseStatus}`, preferredGroupId, startTime, ctx, fallbackGroupId);
+      return handleFailover(chatBody, request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, model, `Upstream returned ${responseStatus}`, preferredGroupId, startTime, ctx, fallbackGroupId, stickyKey, stripState);
     }
     let finalBody;
     if (bridgedBody !== void 0 && !isError) {
       if (stream && proxyResponse.body) {
-        return streamWithRecording(responsesSseToChatStream(proxyResponse.body, model), proxyResponse.status, stripBodyHeaders(proxyResponse.headers), {
+        return await streamWithRecording(responsesSseToChatStream(guardSilentRefusalStream(proxyResponse.body, refusalDetector), model), proxyResponse.status, stripBodyHeaders(proxyResponse.headers), {
           db,
           failover,
           keyRecordId: keyRecord.id,
@@ -2718,7 +3713,10 @@ async function handleGatewayRequest(request, env, failover, ctx) {
           model: upstreamModel,
           rateMultiplier: accountRateMultiplier(account),
           startedAt: startTime,
-          ctx
+          reasoningEffort,
+          userAgent,
+          ctx,
+          env
         });
       }
       const buffered = await bufferResponsesSseAsChat(proxyResponse.body, model);
@@ -2727,7 +3725,7 @@ async function handleGatewayRequest(request, env, failover, ctx) {
       isError = responseStatus >= 400;
     }
     if (stream && finalBody === void 0 && proxyResponse.body) {
-      return streamWithRecording(proxyResponse.body, proxyResponse.status, proxyResponse.headers, {
+      return await streamWithRecording(guardSilentRefusalStream(proxyResponse.body, refusalDetector), proxyResponse.status, proxyResponse.headers, {
         db,
         failover,
         keyRecordId: keyRecord.id,
@@ -2737,7 +3735,10 @@ async function handleGatewayRequest(request, env, failover, ctx) {
         model: upstreamModel,
         rateMultiplier: accountRateMultiplier(account),
         startedAt: startTime,
-        ctx
+        reasoningEffort,
+        userAgent,
+        ctx,
+        env
       });
     }
     let responseText;
@@ -2752,28 +3753,28 @@ async function handleGatewayRequest(request, env, failover, ctx) {
       } catch {
       }
     }
-    const { promptTokens, completionTokens, totalTokens } = extractTokenUsage(responseBody, proxyResponse.headers);
+    const { promptTokens, completionTokens, totalTokens } = extractTokenUsage(responseBody, proxyResponse.headers, isError ? void 0 : requestBody);
     const breakdown = calculateCostBreakdown(provider, upstreamModel, promptTokens, completionTokens, accountRateMultiplier(account));
     const cost = breakdown.cost;
     if (cost > 0) {
       defer(ctx, db.incrementApiKeyUsage(keyRecord.id, cost));
     }
-    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cost, base_cost: breakdown.baseCost, rate_multiplier: breakdown.multiplier, cost_estimated: breakdown.estimated ? 1 : 0, cache_status: "bypass", status: responseStatus, error_message: isError ? responseBody?.error?.message || "Error" : "", latency_ms: Date.now() - startTime }));
+    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cost, base_cost: breakdown.baseCost, rate_multiplier: breakdown.multiplier, cost_estimated: breakdown.estimated ? 1 : 0, cache_status: "bypass", status: responseStatus, error_message: isError ? responseBody?.error?.message || "Error" : "", latency_ms: Date.now() - startTime, reasoning_effort: reasoningEffort, user_agent: userAgent }));
     defer(ctx, db.createRequestLog({
       account_id: account.id,
       group_id: group.id,
       model: upstreamModel,
       status: responseStatus,
-      error_message: isError ? errorMessage : "",
+      error_message: isError ? responseBody?.error?.message || `Upstream returned ${responseStatus}` : "",
       latency_ms: Date.now() - startTime
     }));
     failover.recordRequest(account.id, group.id, isError);
     return new Response(responseText, {
       status: responseStatus,
       headers: {
-        // The bridge re-serialized the body, so the upstream's framing headers
-        // describe bytes that are not being sent.
-        ...finalBody !== void 0 ? stripBodyHeaders(proxyResponse.headers) : proxyResponse.headers,
+        // The body was read (and possibly re-serialized), so the upstream's
+        // framing headers describe bytes that are not being sent.
+        ...stripBodyHeaders(proxyResponse.headers),
         "content-type": "application/json",
         "cache-control": "no-store, no-transform"
       }
@@ -2784,16 +3785,28 @@ async function handleGatewayRequest(request, env, failover, ctx) {
     responseStatus = 502;
     failover.recordRequest(account.id, group.id, true);
     defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: errorMessage, latency_ms: Date.now() - startTime }));
-    return handleFailover(chatBody, request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, model, errorMessage, preferredGroupId, startTime, ctx, fallbackGroupId);
+    return handleFailover(chatBody, request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, model, errorMessage, preferredGroupId, startTime, ctx, fallbackGroupId, stickyKey, stripState);
   }
 }
-async function handleFailover(body, request, env, failover, keyRecord, accounts, groups, mappings, provider, upstreamModel, stream, clientModel, errorMessage, preferredGroupId, originStart = Date.now(), ctx, fallbackGroupId = 0) {
+async function handleFailover(body, request, env, failover, keyRecord, accounts, groups, mappings, provider, upstreamModel, stream, clientModel, errorMessage, preferredGroupId, originStart = Date.now(), ctx, fallbackGroupId = 0, stickyKey, stripState) {
   const db = createDatabase(env.DB);
+  const userAgent = request.headers.get("user-agent")?.slice(0, 255) || null;
+  let requestMetaBody;
+  try {
+    requestMetaBody = body ? JSON.parse(body) : void 0;
+  } catch {
+    requestMetaBody = void 0;
+  }
+  const reasoningEffort = extractReasoningEffort(requestMetaBody);
   const attempted = /* @__PURE__ */ new Set();
   const maxRetries = Math.min(Math.max(Number(env.MAX_SAME_ACCOUNT_RETRIES) || 3, 1), 5);
   for (let i = 0; i < maxRetries; i++) {
+    if (request.signal?.aborted) break;
+    if (retryBudgetExceeded(originStart, env)) break;
+    await sleep(retryDelayMs(i + 1, env), request.signal);
+    if (request.signal?.aborted) break;
     const nextAccounts = accounts.filter((a) => a.enabled && !attempted.has(a.id));
-    const selection = await failover.selectAccount(nextAccounts, groups, preferredGroupId, fallbackGroupId ? [fallbackGroupId] : []);
+    const selection = await failover.selectAccount(nextAccounts, groups, preferredGroupId, fallbackGroupId ? [fallbackGroupId] : [], { stickyKey });
     if (!selection) {
       break;
     }
@@ -2835,27 +3848,33 @@ async function handleFailover(body, request, env, failover, keyRecord, accounts,
         applyOpenCodeHeaders(headers, { clientHeaders: request.headers, body: retryBody, allowGenerate: true });
       }
       const sendBody = retrySendBody;
-      const proxyResponse = await proxyRequest({
+      const refusalDetector = new SilentRefusalDetector(sendBody?.length ?? 0, provider === "openai");
+      const proxyResponse = await sendWithRejectedFieldRetry((bodyText) => proxyRequest({
         url: retryUrl.toString(),
         method: request.method,
         headers,
+        signal: request.signal,
+        timeoutMs: envInt(env.UPSTREAM_HEADER_TIMEOUT_MS, 6e4),
         body: new ReadableStream({
           start(controller) {
-            if (sendBody !== void 0) controller.enqueue(new TextEncoder().encode(sendBody));
+            if (bodyText !== void 0) controller.enqueue(new TextEncoder().encode(bodyText));
             controller.close();
           }
         })
-      });
+      }), sendBody, stripState);
       const isError = proxyResponse.status >= 400;
-      if (isError && failover.shouldFailover({ status: proxyResponse.status }) && i < maxRetries - 1) {
-        failover.recordRequest(account.id, group.id, true);
-        continue;
+      if (isError && failover.shouldFailover({ status: proxyResponse.status })) {
+        failover.noteRateLimit(account.id, proxyResponse.status, proxyResponse.headers["retry-after"]);
+        if (i < maxRetries - 1) {
+          failover.recordRequest(account.id, group.id, true);
+          continue;
+        }
       }
       let finalStatus = proxyResponse.status;
       let finalBody;
       if (retryBridged && !isError) {
         if (stream && proxyResponse.body) {
-          return streamWithRecording(responsesSseToChatStream(proxyResponse.body, clientModel), proxyResponse.status, stripBodyHeaders(proxyResponse.headers), {
+          return await streamWithRecording(responsesSseToChatStream(guardSilentRefusalStream(proxyResponse.body, refusalDetector), clientModel), proxyResponse.status, stripBodyHeaders(proxyResponse.headers), {
             db,
             failover,
             keyRecordId: keyRecord.id,
@@ -2865,7 +3884,10 @@ async function handleFailover(body, request, env, failover, keyRecord, accounts,
             model: upstreamModel,
             rateMultiplier: accountRateMultiplier(account),
             startedAt: originStart,
-            ctx
+            reasoningEffort,
+            userAgent,
+            ctx,
+            env
           });
         }
         const buffered = await bufferResponsesSseAsChat(proxyResponse.body, clientModel);
@@ -2874,7 +3896,7 @@ async function handleFailover(body, request, env, failover, keyRecord, accounts,
       }
       const finalError = isError || finalStatus >= 400;
       if (stream && !finalError && finalBody === void 0 && proxyResponse.body) {
-        return streamWithRecording(proxyResponse.body, proxyResponse.status, proxyResponse.headers, {
+        return await streamWithRecording(guardSilentRefusalStream(proxyResponse.body, refusalDetector), proxyResponse.status, proxyResponse.headers, {
           db,
           failover,
           keyRecordId: keyRecord.id,
@@ -2884,7 +3906,10 @@ async function handleFailover(body, request, env, failover, keyRecord, accounts,
           model: upstreamModel,
           rateMultiplier: accountRateMultiplier(account),
           startedAt: originStart,
-          ctx
+          reasoningEffort,
+          userAgent,
+          ctx,
+          env
         });
       }
       failover.recordRequest(account.id, group.id, finalError);
@@ -2893,14 +3918,25 @@ async function handleFailover(body, request, env, failover, keyRecord, accounts,
         group_id: group.id,
         model: upstreamModel,
         status: finalStatus,
-        error_message: finalError ? "Upstream error" : "",
+        error_message: finalError ? errorMessage || `Upstream returned ${finalStatus}` : "",
         latency_ms: 0
       }));
       const responseText = finalBody !== void 0 ? JSON.stringify(finalBody) : await proxyResponse.text();
+      let retryResponseBody = {};
+      try {
+        retryResponseBody = JSON.parse(responseText);
+      } catch {
+      }
+      const usage = extractTokenUsage(retryResponseBody, proxyResponse.headers, finalError ? void 0 : requestMetaBody);
+      const retryBreakdown = calculateCostBreakdown(provider, upstreamModel, usage.promptTokens, usage.completionTokens, accountRateMultiplier(account));
+      if (retryBreakdown.cost > 0) {
+        defer(ctx, db.incrementApiKeyUsage(keyRecord.id, retryBreakdown.cost));
+      }
+      defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: usage.promptTokens, completion_tokens: usage.completionTokens, total_tokens: usage.totalTokens, cost: retryBreakdown.cost, base_cost: retryBreakdown.baseCost, rate_multiplier: retryBreakdown.multiplier, cost_estimated: retryBreakdown.estimated ? 1 : 0, cache_status: "bypass", status: finalStatus, error_message: finalError ? retryResponseBody?.error?.message || errorMessage : "", latency_ms: Date.now() - originStart, reasoning_effort: reasoningEffort, user_agent: userAgent }));
       return new Response(responseText, {
         status: finalStatus,
         headers: {
-          ...finalBody !== void 0 ? stripBodyHeaders(proxyResponse.headers) : proxyResponse.headers,
+          ...stripBodyHeaders(proxyResponse.headers),
           "content-type": "application/json",
           "cache-control": "no-store, no-transform"
         }
@@ -2959,6 +3995,15 @@ async function handleOpenAIRequest(request, env, failover, ctx) {
   const model = requestBody.model || getModelFromHeader(request) || "";
   const stream = requestBody.stream === true;
   const isResponses = url.pathname.includes("/responses");
+  const stickyKey = resolveOpenCodeSessionId({ clientHeaders: request.headers, body: requestBody, allowGenerate: false }) || void 0;
+  const userAgent = request.headers.get("user-agent")?.slice(0, 255) || null;
+  const reasoningEffort = extractReasoningEffort(requestBody);
+  if (url.pathname.replace(/\/+$/, "").endsWith("/responses/input_tokens")) {
+    return new Response(JSON.stringify({
+      object: "response.input_tokens",
+      input_tokens: Math.max(1, estimateTokens(JSON.stringify(requestBody)))
+    }), { status: 200, headers: { "Content-Type": "application/json", "cache-control": "no-store" } });
+  }
   let endpoint = "/v1/chat/completions";
   if (isResponses) {
     endpoint = "/v1/responses";
@@ -2973,7 +4018,7 @@ async function handleOpenAIRequest(request, env, failover, ctx) {
     if (accounts.length === 0) {
       return new Response(JSON.stringify({
         error: "No available accounts",
-        message: "\uFFFD\uFFFD?API \u5BC6\u94A5\u7ED1\u5B9A\u7684\u4E3B\u5206\u7EC4\u548C\u515C\u5E95\u5206\u7EC4\u4E0B\u6CA1\u6709\u53EF\u7528\u8D26\u53F7"
+        message: "\u8BE5 API \u5BC6\u94A5\u7ED1\u5B9A\u7684\u4E3B\u5206\u7EC4\u548C\u515C\u5E95\u5206\u7EC4\u4E0B\u6CA1\u6709\u53EF\u7528\u8D26\u53F7"
       }), { status: 503, headers: { "Content-Type": "application/json" } });
     }
   }
@@ -2982,6 +4027,9 @@ async function handleOpenAIRequest(request, env, failover, ctx) {
   }
   const groups = new Map(routing.groups.map((g) => [g.id, g]));
   const mappings = routing.mappings;
+  if (keyGroupId && !modelAllowed(model, groups.get(keyGroupId))) {
+    return modelAllowlistDenied(model);
+  }
   const mapping = findModelMapping(model, mappings, "openai") || findModelMapping(model, mappings, "xai") || findModelMapping(model, mappings, "opencode_go");
   const requestedProvider = mapping?.provider || (model.toLowerCase().startsWith("grok-") ? "xai" : void 0);
   if (requestedProvider) {
@@ -2995,7 +4043,7 @@ async function handleOpenAIRequest(request, env, failover, ctx) {
   if (upstreamModel && upstreamModel !== model && requestBody.model) {
     requestBody.model = upstreamModel;
   }
-  const selection = await failover.selectAccount(accounts, groups, preferredGroupId, fallbackGroupId ? [fallbackGroupId] : []);
+  const selection = await failover.selectAccount(accounts, groups, preferredGroupId, fallbackGroupId ? [fallbackGroupId] : [], { stickyKey });
   if (!selection) {
     return new Response(JSON.stringify({ error: "No available accounts" }), { status: 503, headers: { "Content-Type": "application/json" } });
   }
@@ -3013,6 +4061,9 @@ async function handleOpenAIRequest(request, env, failover, ctx) {
       return new Response(JSON.stringify({ error: { message, type: "invalid_request_error", param: null, code: null } }), { status: 400, headers: { "Content-Type": "application/json" } });
     }
   }
+  if (stream && endpoint === "/v1/chat/completions") {
+    ensureChatStreamUsage(requestBody);
+  }
   const credentials = resolveUpstreamCredentials(account);
   const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, provider);
   const upstreamUrl = `${baseUrl}${endpoint}`;
@@ -3021,30 +4072,39 @@ async function handleOpenAIRequest(request, env, failover, ctx) {
     applyOpenCodeHeaders(headers, { clientHeaders: request.headers, body: requestBody, allowGenerate: true });
   }
   const startTime = Date.now();
+  const sentBody = JSON.stringify(outboundBody);
+  const stripState = createStripRetryState(sentBody);
+  const refusalDetector = new SilentRefusalDetector(sentBody.length, provider === "openai");
+  const sendUpstream = (bodyText) => proxyRequest({
+    url: upstreamUrl,
+    method: request.method,
+    headers,
+    signal: request.signal,
+    timeoutMs: envInt(env.UPSTREAM_HEADER_TIMEOUT_MS, 6e4),
+    body: new ReadableStream({
+      start(controller) {
+        if (bodyText !== void 0) controller.enqueue(new TextEncoder().encode(bodyText));
+        controller.close();
+      }
+    })
+  });
   try {
-    const proxyResponse = await proxyRequest({
-      url: upstreamUrl,
-      method: request.method,
-      headers,
-      body: new ReadableStream({
-        start(controller) {
-          controller.enqueue(new TextEncoder().encode(JSON.stringify(outboundBody)));
-          controller.close();
-        }
-      })
-    });
+    const proxyResponse = await sendWithRejectedFieldRetry(sendUpstream, sentBody, stripState);
     const isError = proxyResponse.status >= 400;
+    if (isError && failover.shouldFailover({ status: proxyResponse.status })) {
+      failover.noteRateLimit(account.id, proxyResponse.status, proxyResponse.headers["retry-after"]);
+    }
     if (isError && failover.shouldFailover({ status: proxyResponse.status }) && accounts.length > 1) {
       await proxyResponse.text().catch(() => "");
       failover.recordRequest(account.id, group.id, true);
       defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: proxyResponse.status, error_message: `Upstream returned ${proxyResponse.status}`, latency_ms: Date.now() - startTime }));
-      return handleFailover2(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, model, `Upstream returned ${proxyResponse.status}`, preferredGroupId, startTime, ctx, fallbackGroupId);
+      return handleFailover2(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, model, `Upstream returned ${proxyResponse.status}`, preferredGroupId, startTime, ctx, fallbackGroupId, stickyKey, stripState);
     }
     let finalStatus = proxyResponse.status;
     let finalBody;
     if (bridged && !isError) {
       if (stream && proxyResponse.body) {
-        return streamWithRecording(responsesSseToChatStream(proxyResponse.body, model), proxyResponse.status, stripBodyHeaders(proxyResponse.headers), {
+        return await streamWithRecording(responsesSseToChatStream(guardSilentRefusalStream(proxyResponse.body, refusalDetector), model), proxyResponse.status, stripBodyHeaders(proxyResponse.headers), {
           db,
           failover,
           keyRecordId: keyRecord.id,
@@ -3054,7 +4114,10 @@ async function handleOpenAIRequest(request, env, failover, ctx) {
           model: upstreamModel,
           rateMultiplier: accountRateMultiplier(account),
           startedAt: startTime,
-          ctx
+          reasoningEffort,
+          userAgent,
+          ctx,
+          env
         });
       }
       const buffered = await bufferResponsesSseAsChat(proxyResponse.body, model);
@@ -3062,7 +4125,7 @@ async function handleOpenAIRequest(request, env, failover, ctx) {
       finalStatus = buffered.status;
     }
     if (stream && finalBody === void 0 && proxyResponse.body) {
-      return streamWithRecording(proxyResponse.body, proxyResponse.status, proxyResponse.headers, {
+      return await streamWithRecording(guardSilentRefusalStream(proxyResponse.body, refusalDetector), proxyResponse.status, proxyResponse.headers, {
         db,
         failover,
         keyRecordId: keyRecord.id,
@@ -3072,7 +4135,10 @@ async function handleOpenAIRequest(request, env, failover, ctx) {
         model: upstreamModel,
         rateMultiplier: accountRateMultiplier(account),
         startedAt: startTime,
-        ctx
+        reasoningEffort,
+        userAgent,
+        ctx,
+        env
       });
     }
     let responseText;
@@ -3088,13 +4154,13 @@ async function handleOpenAIRequest(request, env, failover, ctx) {
       }
     }
     const finalError = finalStatus >= 400;
-    const { promptTokens, completionTokens, totalTokens } = extractTokenUsage(responseBody, proxyResponse.headers);
+    const { promptTokens, completionTokens, totalTokens } = extractTokenUsage(responseBody, proxyResponse.headers, finalError ? void 0 : requestBody);
     const breakdown = calculateCostBreakdown(provider, upstreamModel, promptTokens, completionTokens, accountRateMultiplier(account));
     const cost = breakdown.cost;
     if (cost > 0) {
       defer(ctx, db.incrementApiKeyUsage(keyRecord.id, cost));
     }
-    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cost, base_cost: breakdown.baseCost, rate_multiplier: breakdown.multiplier, cost_estimated: breakdown.estimated ? 1 : 0, cache_status: "bypass", status: finalStatus, error_message: finalError ? responseBody?.error?.message || "Error" : "", latency_ms: Date.now() - startTime }));
+    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cost, base_cost: breakdown.baseCost, rate_multiplier: breakdown.multiplier, cost_estimated: breakdown.estimated ? 1 : 0, cache_status: "bypass", status: finalStatus, error_message: finalError ? responseBody?.error?.message || "Error" : "", latency_ms: Date.now() - startTime, reasoning_effort: reasoningEffort, user_agent: userAgent }));
     defer(ctx, db.createRequestLog({
       account_id: account.id,
       group_id: group.id,
@@ -3107,9 +4173,9 @@ async function handleOpenAIRequest(request, env, failover, ctx) {
     return new Response(responseText, {
       status: finalStatus,
       headers: {
-        // The bridge re-serialized the body, so the upstream's framing headers
-        // describe bytes that are not being sent.
-        ...finalBody !== void 0 ? stripBodyHeaders(proxyResponse.headers) : proxyResponse.headers,
+        // The body was read (and possibly re-serialized), so the upstream's
+        // framing headers describe bytes that are not being sent.
+        ...stripBodyHeaders(proxyResponse.headers),
         "content-type": "application/json",
         "cache-control": "no-store, no-transform"
       }
@@ -3118,20 +4184,32 @@ async function handleOpenAIRequest(request, env, failover, ctx) {
     const errorMessage = error instanceof Error ? error.message : "Unknown error";
     failover.recordRequest(account.id, group.id, true);
     defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: errorMessage, latency_ms: Date.now() - startTime }));
-    return handleFailover2(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, model, errorMessage, preferredGroupId, startTime, ctx, fallbackGroupId);
+    return handleFailover2(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, model, errorMessage, preferredGroupId, startTime, ctx, fallbackGroupId, stickyKey, stripState);
   }
 }
-async function handleFailover2(body, request, env, failover, keyRecord, accounts, groups, mappings, provider, upstreamModel, stream, clientModel, errorMessage, preferredGroupId, originStart = Date.now(), ctx, fallbackGroupId = 0) {
+async function handleFailover2(body, request, env, failover, keyRecord, accounts, groups, mappings, provider, upstreamModel, stream, clientModel, errorMessage, preferredGroupId, originStart = Date.now(), ctx, fallbackGroupId = 0, stickyKey, stripState) {
   const db = createDatabase(env.DB);
   const url = new URL(request.url);
   const isResponses = url.pathname.includes("/responses");
   let endpoint = "/v1/chat/completions";
   if (isResponses) endpoint = "/v1/responses";
+  const userAgent = request.headers.get("user-agent")?.slice(0, 255) || null;
+  let retryParseBody;
+  try {
+    retryParseBody = JSON.parse(body);
+  } catch {
+    retryParseBody = void 0;
+  }
+  const reasoningEffort = extractReasoningEffort(retryParseBody);
   const attempted = /* @__PURE__ */ new Set();
   const maxRetries = Math.min(Math.max(Number(env.MAX_SAME_ACCOUNT_RETRIES) || 3, 1), 5);
   for (let i = 0; i < maxRetries; i++) {
+    if (request.signal?.aborted) break;
+    if (retryBudgetExceeded(originStart, env)) break;
+    await sleep(retryDelayMs(i + 1, env), request.signal);
+    if (request.signal?.aborted) break;
     const nextAccounts = accounts.filter((a) => a.enabled && !attempted.has(a.id));
-    const selection = await failover.selectAccount(nextAccounts, groups, preferredGroupId, fallbackGroupId ? [fallbackGroupId] : []);
+    const selection = await failover.selectAccount(nextAccounts, groups, preferredGroupId, fallbackGroupId ? [fallbackGroupId] : [], { stickyKey });
     if (!selection) break;
     const { account, group } = selection;
     attempted.add(account.id);
@@ -3164,27 +4242,33 @@ async function handleFailover2(body, request, env, failover, keyRecord, accounts
         applyOpenCodeHeaders(headers, { clientHeaders: request.headers, body: retryBody, allowGenerate: true });
       }
       const sendBody = retrySendBody;
-      const proxyResponse = await proxyRequest({
+      const refusalDetector = new SilentRefusalDetector(sendBody?.length ?? 0, currentProvider === "openai");
+      const proxyResponse = await sendWithRejectedFieldRetry((bodyText) => proxyRequest({
         url: upstreamUrl,
         method: request.method,
         headers,
+        signal: request.signal,
+        timeoutMs: envInt(env.UPSTREAM_HEADER_TIMEOUT_MS, 6e4),
         body: new ReadableStream({
           start(controller) {
-            controller.enqueue(new TextEncoder().encode(sendBody));
+            if (bodyText !== void 0) controller.enqueue(new TextEncoder().encode(bodyText));
             controller.close();
           }
         })
-      });
+      }), sendBody, stripState);
       const isError = proxyResponse.status >= 400;
-      if (isError && failover.shouldFailover({ status: proxyResponse.status }) && i < maxRetries - 1) {
-        failover.recordRequest(account.id, group.id, true);
-        continue;
+      if (isError && failover.shouldFailover({ status: proxyResponse.status })) {
+        failover.noteRateLimit(account.id, proxyResponse.status, proxyResponse.headers["retry-after"]);
+        if (i < maxRetries - 1) {
+          failover.recordRequest(account.id, group.id, true);
+          continue;
+        }
       }
       let finalStatus = proxyResponse.status;
       let finalBody;
       if (retryBridged && !isError) {
         if (stream && proxyResponse.body) {
-          return streamWithRecording(responsesSseToChatStream(proxyResponse.body, clientModel), proxyResponse.status, stripBodyHeaders(proxyResponse.headers), {
+          return await streamWithRecording(responsesSseToChatStream(guardSilentRefusalStream(proxyResponse.body, refusalDetector), clientModel), proxyResponse.status, stripBodyHeaders(proxyResponse.headers), {
             db,
             failover,
             keyRecordId: keyRecord.id,
@@ -3194,7 +4278,10 @@ async function handleFailover2(body, request, env, failover, keyRecord, accounts
             model: upstreamModel,
             rateMultiplier: accountRateMultiplier(account),
             startedAt: originStart,
-            ctx
+            reasoningEffort,
+            userAgent,
+            ctx,
+            env
           });
         }
         const buffered = await bufferResponsesSseAsChat(proxyResponse.body, clientModel);
@@ -3203,7 +4290,7 @@ async function handleFailover2(body, request, env, failover, keyRecord, accounts
       }
       const finalError = isError || finalStatus >= 400;
       if (stream && !finalError && finalBody === void 0 && proxyResponse.body) {
-        return streamWithRecording(proxyResponse.body, proxyResponse.status, proxyResponse.headers, {
+        return await streamWithRecording(guardSilentRefusalStream(proxyResponse.body, refusalDetector), proxyResponse.status, proxyResponse.headers, {
           db,
           failover,
           keyRecordId: keyRecord.id,
@@ -3213,7 +4300,10 @@ async function handleFailover2(body, request, env, failover, keyRecord, accounts
           model: upstreamModel,
           rateMultiplier: accountRateMultiplier(account),
           startedAt: originStart,
-          ctx
+          reasoningEffort,
+          userAgent,
+          ctx,
+          env
         });
       }
       failover.recordRequest(account.id, group.id, finalError);
@@ -3226,10 +4316,21 @@ async function handleFailover2(body, request, env, failover, keyRecord, accounts
         latency_ms: 0
       }));
       const responseText = finalBody !== void 0 ? JSON.stringify(finalBody) : await proxyResponse.text();
+      let retryResponseBody = {};
+      try {
+        retryResponseBody = JSON.parse(responseText);
+      } catch {
+      }
+      const usage = extractTokenUsage(retryResponseBody, proxyResponse.headers, finalError ? void 0 : retryParseBody);
+      const retryBreakdown = calculateCostBreakdown(currentProvider, upstreamModel, usage.promptTokens, usage.completionTokens, accountRateMultiplier(account));
+      if (retryBreakdown.cost > 0) {
+        defer(ctx, db.incrementApiKeyUsage(keyRecord.id, retryBreakdown.cost));
+      }
+      defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider: currentProvider, prompt_tokens: usage.promptTokens, completion_tokens: usage.completionTokens, total_tokens: usage.totalTokens, cost: retryBreakdown.cost, base_cost: retryBreakdown.baseCost, rate_multiplier: retryBreakdown.multiplier, cost_estimated: retryBreakdown.estimated ? 1 : 0, cache_status: "bypass", status: finalStatus, error_message: finalError ? retryResponseBody?.error?.message || errorMessage : "", latency_ms: Date.now() - originStart, reasoning_effort: reasoningEffort, user_agent: userAgent }));
       return new Response(responseText, {
         status: finalStatus,
         headers: {
-          ...finalBody !== void 0 ? stripBodyHeaders(proxyResponse.headers) : proxyResponse.headers,
+          ...stripBodyHeaders(proxyResponse.headers),
           "content-type": "application/json",
           "cache-control": "no-store, no-transform"
         }
@@ -3265,6 +4366,10 @@ async function handleClaudeRequest(request, env, failover, ctx) {
   }
   const model = requestBody.model || getModelFromHeader(request) || "";
   const stream = requestBody.stream === true;
+  const isCountTokens = url.pathname.replace(/\/+$/, "").endsWith("/v1/messages/count_tokens");
+  const stickyKey = resolveOpenCodeSessionId({ clientHeaders: request.headers, body: requestBody, allowGenerate: false }) || void 0;
+  const userAgent = request.headers.get("user-agent")?.slice(0, 255) || null;
+  const reasoningEffort = extractReasoningEffort(requestBody);
   const routing = await loadRoutingSnapshot(db, failover);
   let accounts = routing.accounts;
   accounts = accounts.filter((a) => (a.provider === "anthropic" || a.provider === "opencode_go") && a.enabled);
@@ -3273,6 +4378,7 @@ async function handleClaudeRequest(request, env, failover, ctx) {
   if (keyGroupId) {
     accounts = accounts.filter((account2) => Number(account2.group_id) === keyGroupId || Number(account2.group_id) === fallbackGroupId);
     if (accounts.length === 0) {
+      if (isCountTokens) return localCountTokensResponse(requestBody);
       return new Response(JSON.stringify({
         error: "No available accounts",
         message: "\u8BE5 API \u5BC6\u94A5\u7ED1\u5B9A\u7684\u4E3B\u5206\u7EC4\u548C\u515C\u5E95\u5206\u7EC4\u4E0B\u6CA1\u6709\u53EF\u7528\u8D26\u53F7"
@@ -3280,15 +4386,20 @@ async function handleClaudeRequest(request, env, failover, ctx) {
     }
   }
   if (accounts.length === 0) {
+    if (isCountTokens) return localCountTokensResponse(requestBody);
     return new Response(JSON.stringify({ error: "No available Anthropic-compatible accounts" }), { status: 503, headers: { "Content-Type": "application/json" } });
   }
   const groups = new Map(routing.groups.map((g) => [g.id, g]));
   const mappings = routing.mappings;
+  if (keyGroupId && !modelAllowed(model, groups.get(keyGroupId))) {
+    return modelAllowlistDenied(model);
+  }
   const mapping = findModelMapping(model, mappings, "anthropic") || findModelMapping(model, mappings, "opencode_go");
   if (mapping && (mapping.provider === "anthropic" || mapping.provider === "opencode_go")) {
     accounts = accounts.filter((account2) => account2.provider === mapping.provider);
   }
   if (accounts.length === 0) {
+    if (isCountTokens) return localCountTokensResponse(requestBody);
     return new Response(JSON.stringify({ error: "No available accounts for requested model" }), { status: 503, headers: { "Content-Type": "application/json" } });
   }
   let upstreamModel = mapping?.requested_model.endsWith("*") ? mapping.upstream_model + model.slice(mapping.requested_model.length - 1) : mapping?.upstream_model || model;
@@ -3296,15 +4407,23 @@ async function handleClaudeRequest(request, env, failover, ctx) {
   if (upstreamModel && upstreamModel !== model && requestBody.model) {
     requestBody.model = upstreamModel;
   }
-  const selection = await failover.selectAccount(accounts, groups, preferredGroupId, fallbackGroupId ? [fallbackGroupId] : []);
+  const selection = await failover.selectAccount(accounts, groups, preferredGroupId, fallbackGroupId ? [fallbackGroupId] : [], { stickyKey });
   if (!selection) {
+    if (isCountTokens) return localCountTokensResponse(requestBody);
     return new Response(JSON.stringify({ error: "No available accounts" }), { status: 503, headers: { "Content-Type": "application/json" } });
   }
   const { account, group } = selection;
   const provider = account.provider;
+  if (isCountTokens && provider === "opencode_go") {
+    return localCountTokensResponse(requestBody);
+  }
+  if (provider === "anthropic" && (env.CACHE_BREAKPOINTS ?? "1") !== "0") {
+    applyAnthropicCacheBreakpoints(requestBody);
+  }
   const credentials = resolveUpstreamCredentials(account);
   const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, provider);
-  const upstreamUrl = provider === "opencode_go" ? `${baseUrl}/v1/messages` : `${baseUrl}/v1/messages?beta=true`;
+  const upstreamPath = isCountTokens ? "/v1/messages/count_tokens" : "/v1/messages";
+  const upstreamUrl = provider === "opencode_go" ? `${baseUrl}${upstreamPath}` : `${baseUrl}${upstreamPath}?beta=true`;
   const headers = buildUpstreamHeaders(request.headers, provider, credentials.apiKey, credentials.baseUrl, account.client_spoofing);
   if (provider === "opencode_go") {
     applyOpenCodeHeaders(headers, { clientHeaders: request.headers, body: requestBody, allowGenerate: true });
@@ -3315,6 +4434,8 @@ async function handleClaudeRequest(request, env, failover, ctx) {
       url: upstreamUrl,
       method: request.method,
       headers,
+      signal: request.signal,
+      timeoutMs: envInt(env.UPSTREAM_HEADER_TIMEOUT_MS, 6e4),
       body: new ReadableStream({
         start(controller) {
           controller.enqueue(new TextEncoder().encode(typeof requestBody === "string" ? requestBody : JSON.stringify(requestBody)));
@@ -3323,14 +4444,34 @@ async function handleClaudeRequest(request, env, failover, ctx) {
       })
     });
     const isError = proxyResponse.status >= 400;
+    if (isCountTokens) {
+      const countText = await proxyResponse.text().catch(() => "");
+      if (proxyResponse.status === 404 || proxyResponse.status === 405) {
+        return localCountTokensResponse(requestBody);
+      }
+      if (failover.shouldFailover({ status: proxyResponse.status })) {
+        return handleClaudeFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, upstreamModel, stream, `count_tokens upstream ${proxyResponse.status}`, preferredGroupId, startTime, ctx, fallbackGroupId, stickyKey, isCountTokens);
+      }
+      return new Response(countText, {
+        status: proxyResponse.status,
+        headers: {
+          ...stripBodyHeaders(proxyResponse.headers),
+          "content-type": proxyResponse.headers["content-type"] || "application/json",
+          "cache-control": "no-store, no-transform"
+        }
+      });
+    }
+    if (isError && failover.shouldFailover({ status: proxyResponse.status })) {
+      failover.noteRateLimit(account.id, proxyResponse.status, proxyResponse.headers["retry-after"]);
+    }
     if (isError && failover.shouldFailover({ status: proxyResponse.status }) && accounts.length > 1) {
       await proxyResponse.text().catch(() => "");
       failover.recordRequest(account.id, group.id, true);
       defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: proxyResponse.status, error_message: `Upstream returned ${proxyResponse.status}`, latency_ms: Date.now() - startTime }));
-      return handleClaudeFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, upstreamModel, stream, `Upstream returned ${proxyResponse.status}`, preferredGroupId, startTime, ctx, fallbackGroupId);
+      return handleClaudeFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, upstreamModel, stream, `Upstream returned ${proxyResponse.status}`, preferredGroupId, startTime, ctx, fallbackGroupId, stickyKey);
     }
     if (stream && proxyResponse.body) {
-      return streamWithRecording(proxyResponse.body, proxyResponse.status, proxyResponse.headers, {
+      return await streamWithRecording(proxyResponse.body, proxyResponse.status, proxyResponse.headers, {
         db,
         failover,
         keyRecordId: keyRecord.id,
@@ -3340,7 +4481,10 @@ async function handleClaudeRequest(request, env, failover, ctx) {
         model: upstreamModel,
         rateMultiplier: accountRateMultiplier(account),
         startedAt: startTime,
-        ctx
+        reasoningEffort,
+        userAgent,
+        ctx,
+        env
       });
     }
     const responseText = await proxyResponse.text();
@@ -3349,13 +4493,13 @@ async function handleClaudeRequest(request, env, failover, ctx) {
       responseBody = JSON.parse(responseText);
     } catch {
     }
-    const { promptTokens, completionTokens, totalTokens } = extractTokenUsage(responseBody, proxyResponse.headers);
+    const { promptTokens, completionTokens, totalTokens } = extractTokenUsage(responseBody, proxyResponse.headers, isError ? void 0 : requestBody);
     const breakdown = calculateCostBreakdown(provider, upstreamModel, promptTokens, completionTokens, accountRateMultiplier(account));
     const cost = breakdown.cost;
     if (cost > 0) {
       defer(ctx, db.incrementApiKeyUsage(keyRecord.id, cost));
     }
-    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cost, base_cost: breakdown.baseCost, rate_multiplier: breakdown.multiplier, cost_estimated: breakdown.estimated ? 1 : 0, cache_status: "bypass", status: proxyResponse.status, error_message: isError ? responseBody?.error?.message || "Error" : "", latency_ms: Date.now() - startTime }));
+    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cost, base_cost: breakdown.baseCost, rate_multiplier: breakdown.multiplier, cost_estimated: breakdown.estimated ? 1 : 0, cache_status: "bypass", status: proxyResponse.status, error_message: isError ? responseBody?.error?.message || "Error" : "", latency_ms: Date.now() - startTime, reasoning_effort: reasoningEffort, user_agent: userAgent }));
     defer(ctx, db.createRequestLog({
       account_id: account.id,
       group_id: group.id,
@@ -3368,25 +4512,41 @@ async function handleClaudeRequest(request, env, failover, ctx) {
     return new Response(responseText, {
       status: proxyResponse.status,
       headers: {
-        ...proxyResponse.headers,
+        // The body was read back as text, so upstream framing headers no
+        // longer describe the bytes being sent.
+        ...stripBodyHeaders(proxyResponse.headers),
         "content-type": "application/json",
         "cache-control": "no-store, no-transform"
       }
     });
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : "Unknown error";
-    failover.recordRequest(account.id, group.id, true);
-    defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: errorMessage, latency_ms: Date.now() - startTime }));
-    return handleClaudeFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, upstreamModel, stream, errorMessage, preferredGroupId, startTime, ctx, fallbackGroupId);
+    if (!isCountTokens) {
+      failover.recordRequest(account.id, group.id, true);
+      defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: errorMessage, latency_ms: Date.now() - startTime }));
+    }
+    return handleClaudeFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, upstreamModel, stream, errorMessage, preferredGroupId, startTime, ctx, fallbackGroupId, stickyKey, isCountTokens);
   }
 }
-async function handleClaudeFailover(body, request, env, failover, keyRecord, accounts, groups, mappings, upstreamModel, stream, errorMessage, preferredGroupId, originStart = Date.now(), ctx, fallbackGroupId = 0) {
+async function handleClaudeFailover(body, request, env, failover, keyRecord, accounts, groups, mappings, upstreamModel, stream, errorMessage, preferredGroupId, originStart = Date.now(), ctx, fallbackGroupId = 0, stickyKey, isCountTokens = false) {
   const db = createDatabase(env.DB);
+  const userAgent = request.headers.get("user-agent")?.slice(0, 255) || null;
+  let requestMetaBody;
+  try {
+    requestMetaBody = JSON.parse(body);
+  } catch {
+    requestMetaBody = void 0;
+  }
+  const reasoningEffort = extractReasoningEffort(requestMetaBody);
   const attempted = /* @__PURE__ */ new Set();
   const maxRetries = Math.min(Math.max(Number(env.MAX_SAME_ACCOUNT_RETRIES) || 3, 1), 5);
   for (let i = 0; i < maxRetries; i++) {
+    if (request.signal?.aborted) break;
+    if (retryBudgetExceeded(originStart, env)) break;
+    await sleep(retryDelayMs(i + 1, env), request.signal);
+    if (request.signal?.aborted) break;
     const nextAccounts = accounts.filter((a) => a.enabled && !attempted.has(a.id));
-    const selection = await failover.selectAccount(nextAccounts, groups, preferredGroupId, fallbackGroupId ? [fallbackGroupId] : []);
+    const selection = await failover.selectAccount(nextAccounts, groups, preferredGroupId, fallbackGroupId ? [fallbackGroupId] : [], { stickyKey });
     if (!selection) break;
     const { account, group } = selection;
     attempted.add(account.id);
@@ -3397,10 +4557,14 @@ async function handleClaudeFailover(body, request, env, failover, keyRecord, acc
     } catch {
       retryBody = void 0;
     }
+    if (isCountTokens && currentProvider === "opencode_go") {
+      return localCountTokensResponse(retryBody);
+    }
     try {
       const credentials = resolveUpstreamCredentials(account);
       const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, currentProvider);
-      const upstreamUrl = currentProvider === "opencode_go" ? `${baseUrl}/v1/messages` : `${baseUrl}/v1/messages?beta=true`;
+      const retryPath = isCountTokens ? "/v1/messages/count_tokens" : "/v1/messages";
+      const upstreamUrl = currentProvider === "opencode_go" ? `${baseUrl}${retryPath}` : `${baseUrl}${retryPath}?beta=true`;
       const headers = buildUpstreamHeaders(request.headers, currentProvider, credentials.apiKey, credentials.baseUrl, account.client_spoofing);
       if (currentProvider === "opencode_go") {
         applyOpenCodeHeaders(headers, { clientHeaders: request.headers, body: retryBody, allowGenerate: true });
@@ -3409,6 +4573,8 @@ async function handleClaudeFailover(body, request, env, failover, keyRecord, acc
         url: upstreamUrl,
         method: request.method,
         headers,
+        signal: request.signal,
+        timeoutMs: envInt(env.UPSTREAM_HEADER_TIMEOUT_MS, 6e4),
         body: new ReadableStream({
           start(controller) {
             controller.enqueue(new TextEncoder().encode(body));
@@ -3417,12 +4583,34 @@ async function handleClaudeFailover(body, request, env, failover, keyRecord, acc
         })
       });
       const isError = proxyResponse.status >= 400;
-      if (isError && failover.shouldFailover({ status: proxyResponse.status }) && i < maxRetries - 1) {
-        failover.recordRequest(account.id, group.id, true);
-        continue;
+      if (isCountTokens) {
+        const countText = await proxyResponse.text().catch(() => "");
+        if (proxyResponse.status === 404 || proxyResponse.status === 405) {
+          return localCountTokensResponse(retryBody);
+        }
+        if (isError && failover.shouldFailover({ status: proxyResponse.status })) {
+          const hasMore = accounts.some((candidate) => candidate.enabled && !attempted.has(candidate.id));
+          if (hasMore && i < maxRetries - 1) continue;
+          return localCountTokensResponse(retryBody);
+        }
+        return new Response(countText, {
+          status: proxyResponse.status,
+          headers: {
+            ...stripBodyHeaders(proxyResponse.headers),
+            "content-type": proxyResponse.headers["content-type"] || "application/json",
+            "cache-control": "no-store, no-transform"
+          }
+        });
+      }
+      if (isError && failover.shouldFailover({ status: proxyResponse.status })) {
+        failover.noteRateLimit(account.id, proxyResponse.status, proxyResponse.headers["retry-after"]);
+        if (i < maxRetries - 1) {
+          failover.recordRequest(account.id, group.id, true);
+          continue;
+        }
       }
       if (stream && !isError && proxyResponse.body) {
-        return streamWithRecording(proxyResponse.body, proxyResponse.status, proxyResponse.headers, {
+        return await streamWithRecording(proxyResponse.body, proxyResponse.status, proxyResponse.headers, {
           db,
           failover,
           keyRecordId: keyRecord.id,
@@ -3432,7 +4620,10 @@ async function handleClaudeFailover(body, request, env, failover, keyRecord, acc
           model: upstreamModel,
           rateMultiplier: accountRateMultiplier(account),
           startedAt: originStart,
-          ctx
+          reasoningEffort,
+          userAgent,
+          ctx,
+          env
         });
       }
       failover.recordRequest(account.id, group.id, isError);
@@ -3445,17 +4636,48 @@ async function handleClaudeFailover(body, request, env, failover, keyRecord, acc
         latency_ms: 0
       }));
       const responseText = await proxyResponse.text();
+      let retryResponseBody = {};
+      try {
+        retryResponseBody = JSON.parse(responseText);
+      } catch {
+      }
+      const usage = extractTokenUsage(retryResponseBody, proxyResponse.headers, isError ? void 0 : requestMetaBody);
+      const retryBreakdown = calculateCostBreakdown(currentProvider, upstreamModel, usage.promptTokens, usage.completionTokens, accountRateMultiplier(account));
+      if (retryBreakdown.cost > 0) {
+        defer(ctx, db.incrementApiKeyUsage(keyRecord.id, retryBreakdown.cost));
+      }
+      defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider: currentProvider, prompt_tokens: usage.promptTokens, completion_tokens: usage.completionTokens, total_tokens: usage.totalTokens, cost: retryBreakdown.cost, base_cost: retryBreakdown.baseCost, rate_multiplier: retryBreakdown.multiplier, cost_estimated: retryBreakdown.estimated ? 1 : 0, cache_status: "bypass", status: proxyResponse.status, error_message: isError ? retryResponseBody?.error?.message || errorMessage : "", latency_ms: Date.now() - originStart, reasoning_effort: reasoningEffort, user_agent: userAgent }));
       return new Response(responseText, {
         status: proxyResponse.status,
-        headers: { ...proxyResponse.headers, "content-type": "application/json", "cache-control": "no-store, no-transform" }
+        headers: { ...stripBodyHeaders(proxyResponse.headers), "content-type": "application/json", "cache-control": "no-store, no-transform" }
       });
     } catch (retryError) {
-      failover.recordRequest(account.id, group.id, true);
-      defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: retryError instanceof Error ? retryError.message : "Upstream request failed", latency_ms: 0 }));
+      if (!isCountTokens) {
+        failover.recordRequest(account.id, group.id, true);
+        defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: retryError instanceof Error ? retryError.message : "Upstream request failed", latency_ms: 0 }));
+      }
       continue;
     }
   }
+  if (isCountTokens) {
+    let parsed;
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      parsed = void 0;
+    }
+    return localCountTokensResponse(parsed);
+  }
   return new Response(JSON.stringify({ error: "All Anthropic accounts failed", message: errorMessage }), { status: 502, headers: { "Content-Type": "application/json" } });
+}
+function countTokensEstimate(body) {
+  return Math.max(1, estimateTokens(JSON.stringify(body ?? {})));
+}
+function localCountTokensResponse(body) {
+  return new Response(JSON.stringify({ input_tokens: countTokensEstimate(body) }), {
+    status: 200,
+    headers: { "Content-Type": "application/json", "cache-control": "no-store" }
+  });
 }
 
 // functions/src/config/groups.ts
@@ -3489,10 +4711,13 @@ async function handleGroupsRequest(request, env, ctx) {
     if (!name) return jsonError("\u8BF7\u586B\u5199\u5206\u7EC4\u540D\u79F0", 400);
     const thresholds = readThresholds(body);
     if (typeof thresholds === "string") return jsonError(thresholds, 400);
+    const allowlist = readAllowlist(body);
+    if (typeof allowlist === "string") return jsonError(allowlist, 400);
     if (await db.getGroupByName(name)) return jsonError(`\u5206\u7EC4\u540D\u79F0\u300C${name}\u300D\u5DF2\u5B58\u5728`, 409);
     const result = await db.createGroup(name, String(body.description || "").trim(), Number(body.priority) || 0, {
       enabled: body.enabled === false || body.enabled === 0 ? 0 : 1,
-      ...thresholds
+      ...thresholds,
+      ...allowlist
     });
     const group = await db.getGroup(result.lastRowId);
     return jsonData(group, 201);
@@ -3521,6 +4746,17 @@ async function handleGroupsRequest(request, env, ctx) {
     const thresholds = readThresholds(body, true);
     if (typeof thresholds === "string") return jsonError(thresholds, 400);
     Object.assign(updates, thresholds);
+    const allowlist = readAllowlist(body, true);
+    if (typeof allowlist === "string") return jsonError(allowlist, 400);
+    Object.assign(updates, allowlist);
+    const existing = await db.getGroup(id);
+    const finalEnabled = updates.model_allowlist_enabled !== void 0 ? Number(updates.model_allowlist_enabled) : Number(existing?.model_allowlist_enabled) || 0;
+    if (finalEnabled) {
+      const finalList = updates.model_allowlist !== void 0 ? JSON.parse(String(updates.model_allowlist)) : JSON.parse(existing?.model_allowlist || "[]");
+      if (!Array.isArray(finalList) || finalList.length === 0) {
+        return jsonError("\u542F\u7528\u6A21\u578B\u767D\u540D\u5355\u540E\u81F3\u5C11\u9700\u8981\u4E00\u4E2A\u6A21\u578B", 400);
+      }
+    }
     await db.updateGroup(id, updates);
     const group = await db.getGroup(id);
     return jsonData(group);
@@ -3570,6 +4806,23 @@ function readThresholds(body, partial = false) {
     result.window_seconds = window;
   } else if (!partial) {
     result.window_seconds = 300;
+  }
+  return result;
+}
+function readAllowlist(body, partial = false) {
+  const result = {};
+  if (body.model_allowlist_enabled !== void 0) {
+    result.model_allowlist_enabled = body.model_allowlist_enabled === true || body.model_allowlist_enabled === 1 ? 1 : 0;
+  }
+  if (body.model_allowlist !== void 0) {
+    const normalized = normalizeModelAllowlist(body.model_allowlist);
+    if (normalized.error) return normalized.error;
+    const list = normalized.list || [];
+    const enabled = result.model_allowlist_enabled !== void 0 ? result.model_allowlist_enabled : 0;
+    if (enabled && list.length === 0) return "\u542F\u7528\u6A21\u578B\u767D\u540D\u5355\u540E\u81F3\u5C11\u9700\u8981\u4E00\u4E2A\u6A21\u578B";
+    result.model_allowlist = serializeModelAllowlist(list);
+  } else if (!partial && body.model_allowlist_enabled) {
+    return "\u542F\u7528\u6A21\u578B\u767D\u540D\u5355\u540E\u81F3\u5C11\u9700\u8981\u4E00\u4E2A\u6A21\u578B";
   }
   return result;
 }
@@ -3886,6 +5139,7 @@ async function handleAccountsRequest(request, env) {
     const refresh = url.searchParams.get("refresh") === "1";
     try {
       const result = await listUpstreamModels(db, id, refresh);
+      if (!result.cached) invalidateAllRoutingSnapshots();
       const account = await db.getAccount(id);
       return new Response(JSON.stringify({
         data: {
@@ -4332,6 +5586,7 @@ async function route(request, env, ctx) {
     return handleStats(request, env);
   }
   if (path.startsWith("/api/v1/keys")) {
+    if (request.method !== "GET") invalidateApiKeyCache();
     return handleApiKeys(request, env);
   }
   if (path === "/api/v1/usage" || path.startsWith("/api/v1/usage/")) {
@@ -4354,7 +5609,10 @@ async function route(request, env, ctx) {
   const failover = sharedFailover ?? (sharedFailover = new FailoverManager(env));
   failover.setDb(createDatabase(env.DB));
   if (path === "/v1/models" && request.method === "GET") {
-    return handleProviderModels(request, env);
+    return handleProviderModels(request, env, failover);
+  }
+  if (path.startsWith("/v1/models/") && request.method === "GET") {
+    return handleProviderModelRetrieve(request, env, failover, path);
   }
   if (path.startsWith("/v1/chat/completions")) {
     return handleOpenAIRequest(request, env, failover, ctx);
@@ -4483,7 +5741,7 @@ async function handleStats(request, env) {
   const bucket = url.searchParams.get("bucket") === "day" ? "day" : "hour";
   const db = createDatabase(env.DB);
   const stats = await db.getDashboardStats(hours, bucket);
-  return json({ data: { hours, bucket, cache: routingCacheMetrics(), ...stats } });
+  return json({ data: { hours, bucket, cache: routingCacheMetrics(), auth_cache: apiKeyCacheMetrics(), error_stats_cache: errorStatsCacheMetrics(), ...stats } });
 }
 async function handleApiKeys(request, env) {
   const session = await checkAuth(request, env);
@@ -4675,15 +5933,24 @@ async function checkAuth(request, env) {
   const session = await verifySessionToken(token, await resolveSessionSecret(db, env.JWT_SECRET));
   return session;
 }
-async function handleProviderModels(request, env) {
+async function handleProviderModels(request, env, failover) {
   const authHeader = request.headers.get("authorization");
   if (!authHeader?.startsWith("Bearer ")) return json({ error: "Missing API key" }, 401);
   const db = createDatabase(env.DB);
-  if (!await authenticateApiKey(db, authHeader.slice(7))) {
+  const keyRecord = await authenticateApiKey(db, authHeader.slice(7));
+  if (!keyRecord) {
     return json({ error: "Invalid or disabled API key" }, 401);
   }
-  const accounts = await db.listEnabledAccounts();
-  const mappings = (await db.listModelMappings()).filter((m) => m.enabled);
+  const routing = await loadRoutingSnapshot(db, failover);
+  const entries = buildProviderModelEntries(routing.accounts, routing.mappings.filter((m) => m.enabled));
+  const group = allowlistGroupFor(keyRecord, routing.groups);
+  return json({ object: "list", data: entries.filter((entry) => modelAllowed(entry.id, group)) });
+}
+function allowlistGroupFor(keyRecord, groups) {
+  const keyGroupId = Number(keyRecord?.group_id) || 0;
+  return keyGroupId ? groups.find((group) => group.id === keyGroupId) : void 0;
+}
+function buildProviderModelEntries(accounts, mappings) {
   const protocolFor = (provider, id) => provider === "opencode_go" ? openCodeGoModelProtocol(id) : provider === "anthropic" ? "anthropic" : "chat_completions";
   const ids = [];
   const protocolById = /* @__PURE__ */ new Map();
@@ -4704,10 +5971,22 @@ async function handleProviderModels(request, env) {
     account.provider === "anthropic" ? "claude-3-5-sonnet-20241022" : account.provider === "xai" ? "grok-2-latest" : account.provider === "opencode_go" ? "glm-5.3" : "gpt-4o",
     account.provider
   ));
-  return json({
-    object: "list",
-    data: ids.map((id) => ({ id, object: "model", owned_by: "sub2api", protocol: protocolById.get(id) }))
-  });
+  return ids.map((id) => ({ id, object: "model", owned_by: "sub2api", protocol: protocolById.get(id) || "chat_completions" }));
+}
+async function handleProviderModelRetrieve(request, env, failover, path) {
+  const authHeader = request.headers.get("authorization");
+  if (!authHeader?.startsWith("Bearer ")) return json({ error: "Missing API key" }, 401);
+  const db = createDatabase(env.DB);
+  const keyRecord = await authenticateApiKey(db, authHeader.slice(7));
+  if (!keyRecord) {
+    return json({ error: "Invalid or disabled API key" }, 401);
+  }
+  const id = decodeURIComponent(path.slice("/v1/models/".length)).trim();
+  const routing = await loadRoutingSnapshot(db, failover);
+  const group = allowlistGroupFor(keyRecord, routing.groups);
+  const entry = id ? buildProviderModelEntries(routing.accounts, routing.mappings.filter((m) => m.enabled)).find((candidate) => candidate.id === id) : void 0;
+  if (!entry || !modelAllowed(id, group)) return modelAllowlistDenied(id);
+  return json(entry);
 }
 export {
   worker_default as default

@@ -51,7 +51,7 @@ for (const file of tsFiles) {
 check('no D1 write is left un-deferred', strayWrites.length === 0, strayWrites.join(' '))
 
 // ---- 2. gateway routes must accept an execution context -------------------
-for (const route of ['openai', 'claude', 'grok', 'gateway']) {
+for (const route of ['openai', 'claude', 'gateway']) {
   const source = readFileSync(`functions/src/routes/${route}.ts`, 'utf8')
   const signature = source.match(/export async function handle\w+Request\(([^)]*)\)/)?.[1] || ''
   check(`${route} route receives ctx`, signature.includes('ctx'), signature)
@@ -59,7 +59,7 @@ for (const route of ['openai', 'claude', 'grok', 'gateway']) {
 
 // ---- 3. the worker must pass ctx into every route it dispatches -----------
 const workerSource = readFileSync('functions/_worker.ts', 'utf8')
-const dispatches = [...workerSource.matchAll(/return handle(OpenAI|Claude|Grok|Gateway)Request\(([^)]*)\)/g)]
+const dispatches = [...workerSource.matchAll(/return handle(OpenAI|Claude|Gateway)Request\(([^)]*)\)/g)]
 check('worker dispatches at least four gateway routes', dispatches.length >= 4, String(dispatches.length))
 const missingCtx = dispatches.filter(match => !match[2].includes('ctx')).map(match => match[1])
 check('worker passes ctx to every gateway route', missingCtx.length === 0, missingCtx.join(','))
@@ -208,7 +208,7 @@ function blockAfter(source, startMarker, endMarker) {
     check(`usage_records declares ${col}`,
       schema.includes(`table: 'usage_records', column: '${col}'`))
   }
-  const routes = ['openai', 'claude', 'grok', 'gateway']
+  const routes = ['openai', 'claude', 'gateway']
   for (const route of routes) {
     const source = readFileSync(`functions/src/routes/${route}.ts`, 'utf8')
     const call = source.slice(source.indexOf('createUsageRecord'))
@@ -253,6 +253,203 @@ function blockAfter(source, startMarker, endMarker) {
   check('schemaReady does not swallow database errors',
     !/catch/.test(probeBody),
     probeBody.slice(0, 120))
+}
+
+// ---- 12. streaming chat must ask the upstream for usage --------------------
+// A Chat Completions stream carries a usage frame only when
+// stream_options.include_usage is set. A route that forgets to force it bills
+// every streamed call at zero tokens — invisible to runtime suites, because
+// the stub emits usage unconditionally.
+{
+  for (const route of ['openai', 'gateway']) {
+    const source = readFileSync(`functions/src/routes/${route}.ts`, 'utf8')
+    check(`${route} route forces upstream stream usage`,
+      source.includes('ensureChatStreamUsage('))
+  }
+  // Anthropic reports usage in message_delta regardless, and an OpenAI-only
+  // field in its body would be an unknown parameter upstream.
+  const claude = readFileSync('functions/src/routes/claude.ts', 'utf8')
+  check('claude route does not inject an OpenAI stream field',
+    !claude.includes('ensureChatStreamUsage('))
+  // The fallback must read the *request*, or it estimates zero prompt tokens.
+  const billing = readFileSync('functions/src/billing.ts', 'utf8')
+  check('usage estimation falls back to the request body',
+    billing.includes('request?.messages'))
+}
+
+// ---- 13. hot-path reads must be cached, and writes must invalidate --------
+// Every proxied request performs two uncached D1 reads: the API-key lookup and
+// the per-account error window. That doubles database traffic on the hot path
+// and makes the billing/dashboard database the bottleneck. A stale key cache is
+// worse than slow: a revoked key would keep working, so key writes must
+// invalidate; a stale *healthy* error window would keep sending traffic to a
+// tripped breaker, so recordRequest must drop the cached window on failure.
+{
+  const auth = readFileSync('functions/src/auth.ts', 'utf8')
+  check('auth caches key lookups', auth.includes('apiKeyCache') && auth.includes('API_KEY_CACHE_TTL_MS'))
+  check('auth can drop cached keys', auth.includes('invalidateApiKeyCache('))
+
+  const worker = readFileSync('functions/_worker.ts', 'utf8')
+  check('key writes invalidate the cache',
+    /invalidateApiKeyCache\(\)/.test(worker))
+  check('stats endpoint reports cache hit rates',
+    worker.includes('auth_cache') && worker.includes('error_stats_cache'))
+
+  const failover = readFileSync('functions/src/failover.ts', 'utf8')
+  check('error windows are cached per account', failover.includes('statsCache'))
+  check('a failed request drops the cached window',
+    /if\s*\(isError\)[^}]*statsCache\.delete/.test(failover.replace(/\n/g, ' ')),
+    'recordRequest must delete on isError')
+
+  // The account-model catalogue is a routing input too: caching it onto the
+  // account row without dropping the warm snapshot hides it from /v1/models
+  // for the rest of the TTL.
+  const accountsCfg = readFileSync('functions/src/config/accounts.ts', 'utf8')
+  check('catalogue fetch drops the routing snapshot',
+    accountsCfg.includes('invalidateAllRoutingSnapshots()'))
+  const routingCache = readFileSync('functions/src/utils/routing-cache.ts', 'utf8')
+  check('routing cache exposes an all-snapshots invalidation',
+    routingCache.includes('export function invalidateAllRoutingSnapshots'))
+}
+
+// ---- 14. token-count preflights must never generate ------------------------
+// /v1/messages/count_tokens and /v1/responses/input_tokens are advisory
+// preflights. A rewrite to the generation path turns a free count into a
+// billable completion; forwarding the count endpoint to a provider without it
+// yields a 404. Anthropic itself must forward count_tokens (exact counts),
+// answer locally only when the endpoint or provider cannot serve it, and never
+// write usage, health or rate-limit state for a count.
+{
+  const claude = readFileSync('functions/src/routes/claude.ts', 'utf8')
+  check('claude route detects the count endpoint', claude.includes('isCountTokens'))
+  check('claude has a local count fallback', claude.includes('localCountTokensResponse('))
+  check('claude forwards count_tokens upstream',
+    /isCountTokens\s*\?\s*'\/v1\/messages\/count_tokens'/.test(claude.replace(/\n/g, ' ')))
+  const countIdx = claude.indexOf('if (isCountTokens)')
+  check('count_tokens answers before health/rate-limit bookkeeping',
+    countIdx > -1 && countIdx < claude.indexOf('noteRateLimit('))
+
+  const openai = readFileSync('functions/src/routes/openai.ts', 'utf8')
+  check('responses input_tokens is answered locally',
+    openai.includes('/responses/input_tokens') && openai.includes("'response.input_tokens'"))
+}
+
+// ---- 15. usage rows must carry request-shape telemetry ---------------------
+// reasoning_effort and user_agent exist to answer "why was this bill this
+// big" and "who sent this". A createUsageRecord call that omits them writes a
+// row that cannot answer either, and the omission is invisible at runtime —
+// the insert succeeds, it just stores NULL.
+{
+  const routes = ['openai', 'claude', 'gateway']
+  for (const route of routes) {
+    const source = readFileSync(`functions/src/routes/${route}.ts`, 'utf8')
+    // Every route-level call is a single defer(...) line; the record.ts
+    // recorder is the only multi-line one and is checked below.
+    const lines = source.split('\n').filter(line => line.includes('createUsageRecord('))
+    check(`${route} passes request-shape telemetry to every usage record`,
+      lines.length > 0 && lines.every(line => line.includes('reasoning_effort:') && line.includes('user_agent:')),
+      `calls=${lines.length}`)
+  }
+  const record = readFileSync('functions/src/utils/record.ts', 'utf8')
+  check('the stream recorder carries both fields',
+    record.includes('reasoning_effort: context.reasoningEffort') && record.includes('user_agent: context.userAgent'))
+  const schema = readFileSync('functions/src/schema.ts', 'utf8')
+  for (const col of ['reasoning_effort', 'user_agent']) {
+    check(`usage_records declares ${col}`,
+      schema.includes(`table: 'usage_records', column: '${col}'`))
+  }
+}
+
+// ---- 16. Responses 400 field-strip retry -----------------------------------
+// Relays reject valid Responses bodies for fields their schema does not model
+// (max_output_tokens, replayed input[i].status, prompt_cache_breakpoint on a
+// non-cache model). Dropping the named field and re-sending once turns a hard
+// client 400 into a served request; without the shared budget the same loop
+// becomes an amplifier against a hostile upstream.
+{
+  const compat = readFileSync('functions/src/utils/responses-compat.ts', 'utf8')
+  check('compat util exposes the strip transform', compat.includes('export function stripRejectedResponseFields'))
+  check('strip retries are bounded', compat.includes('MAX_STRIP_RETRIES = 6'))
+  check('retry driver rebuilds a consumed 400 body', compat.includes('export async function sendWithRejectedFieldRetry'))
+
+  for (const route of ['openai', 'gateway']) {
+    const source = readFileSync(`functions/src/routes/${route}.ts`, 'utf8')
+    const sendCalls = (source.match(/sendWithRejectedFieldRetry\(/g) || []).length
+    check(`${route} strips-and-retries on the main path and in failover`,
+      sendCalls >= 2, `calls=${sendCalls}`)
+    check(`${route} shares one strip budget across the request`,
+      source.includes('createStripRetryState(') && source.includes('stripState?: StripRetryState'))
+  }
+
+  const gateway = readFileSync('functions/src/routes/gateway.ts', 'utf8')
+  check('gateway leaves Anthropic error shapes alone',
+    /provider !== 'anthropic' && upstreamBody !== undefined/.test(gateway.replace(/\n/g, ' ')))
+}
+
+// ---- 17. OpenAI silent-refusal detection ------------------------------------
+// A long request answered with an empty finish_reason=stop stream must fail
+// over instead of being served, and detection is size-gated so short prompts
+// that legitimately answer with nothing keep streaming (Go: openai_silent_refusal.go).
+{
+  const util = readFileSync('functions/src/utils/silent-refusal.ts', 'utf8')
+  check('refusal detection is gated at 64KB', util.includes('SILENT_REFUSAL_MIN_BODY_BYTES = 64 * 1024'))
+  check('the held buffer fails open past 1MB', util.includes('SILENT_REFUSAL_BUFFER_CAP = 1024 * 1024'))
+  check('refusal errors the stream with the failover message',
+    util.includes('OpenAI upstream returned an empty completion stream with finish_reason=stop and no usage'))
+  check('output is withheld until a positive signal', util.includes('shouldReleaseClientOutput(): boolean'))
+
+  const detectors = {
+    openai: [
+      "new SilentRefusalDetector(sentBody.length, provider === 'openai')",
+      "new SilentRefusalDetector(sendBody?.length ?? 0, currentProvider === 'openai')"
+    ],
+    gateway: [
+      "new SilentRefusalDetector(upstreamBody?.length ?? 0, provider === 'openai')",
+      "new SilentRefusalDetector(sendBody?.length ?? 0, provider === 'openai')"
+    ]
+  }
+  for (const route of ['openai', 'gateway']) {
+    const source = readFileSync(`functions/src/routes/${route}.ts`, 'utf8')
+    check(`${route} imports the refusal guard`, source.includes("from '../utils/silent-refusal'"))
+    const guards = (source.match(/guardSilentRefusalStream\(/g) || []).length
+    check(`${route} guards every stream site (main + failover)`, guards >= 4, `guards=${guards}`)
+    for (const detector of detectors[route]) {
+      check(`${route} arms a detector on the right path`, source.includes(detector))
+    }
+  }
+}
+
+// ---- 18. Group model allowlist ----------------------------------------------
+// A key's group may pin which models it can list, retrieve and generate; the
+// gate must exist in the schema, the config API, every generation route and
+// both model endpoints (Go: group_model_allowlist.go).
+{
+  const schema = readFileSync('functions/src/schema.ts', 'utf8')
+  check('schema version is bumped for the allowlist columns', schema.includes("SCHEMA_VERSION = '12'"))
+  const groupsDdl = schema.slice(schema.indexOf('CREATE TABLE IF NOT EXISTS groups'), schema.indexOf('CREATE TABLE IF NOT EXISTS channels'))
+  check('fresh groups table carries the allowlist columns',
+    groupsDdl.includes('model_allowlist_enabled INTEGER DEFAULT 0') && groupsDdl.includes('model_allowlist TEXT'))
+  check('existing groups tables gain the allowlist columns',
+    schema.includes("{ table: 'groups', column: 'model_allowlist_enabled'")
+      && schema.includes("{ table: 'groups', column: 'model_allowlist'"))
+
+  const groupsApi = readFileSync('functions/src/config/groups.ts', 'utf8')
+  check('groups API normalizes the allowlist', groupsApi.includes('normalizeModelAllowlist('))
+  check('groups API rejects an enabled empty allowlist',
+    groupsApi.includes('启用模型白名单后至少需要一个模型'))
+
+  for (const route of ['openai', 'gateway', 'claude']) {
+    const source = readFileSync(`functions/src/routes/${route}.ts`, 'utf8')
+    check(`${route} imports the allowlist gate`, source.includes("from '../utils/model-allowlist'"))
+    check(`${route} denies listed-out models with a 404`,
+      source.includes('modelAllowed(model, groups.get(keyGroupId))') && source.includes('modelAllowlistDenied(model)'))
+  }
+
+  const worker = readFileSync('functions/_worker.ts', 'utf8')
+  check('model list filters by the key\'s group', worker.includes('modelAllowed(entry.id, group)'))
+  check('single-model retrieve shares the gate',
+    worker.includes('modelAllowlistDenied(id)')
+      && /if \(path\.startsWith\('\/v1\/models\/'\) && request\.method === 'GET'\)/.test(worker))
 }
 
 console.log()

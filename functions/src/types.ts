@@ -16,6 +16,10 @@ export interface Group {
   error_threshold: number;
   error_count_threshold: number;
   window_seconds: number;
+  /** Model allowlist gate (Go: group_model_allowlist): 1 = only listed models. */
+  model_allowlist_enabled?: number;
+  /** JSON array of allowed model patterns; trailing `*` wildcards only. */
+  model_allowlist?: string;
   created_at: string;
 }
 
@@ -36,6 +40,10 @@ export interface Account {
   last_error_msg?: string;
   priority: number;
   client_spoofing?: string;
+  /** Result of the most recent health probe: 1 ok, 0 failed, null never probed. */
+  last_check_ok?: number | null;
+  /** ISO timestamp of the most recent health probe. */
+  last_check_at?: string | null;
   created_at: string;
 }
 
@@ -84,6 +92,10 @@ export interface UsageRecord {
   latency_ms?: number;
   /** Time to first byte. Null for non-streaming replies, which have no TTFT. */
   ttft_ms?: number | null;
+  /** Reasoning budget the client asked for, when the request declared one. */
+  reasoning_effort?: string | null;
+  /** Client User-Agent, so an unexpected caller is identifiable from usage. */
+  user_agent?: string | null;
   created_at: string;
 }
 
@@ -122,6 +134,10 @@ export interface ProxyRequest {
   method: string;
   headers: Record<string, string>;
   body?: ReadableStream | null;
+  /** Aborts the upstream fetch when the client disconnects. */
+  signal?: AbortSignal;
+  /** Header wait budget in ms; defaults to 60000 when absent or invalid. */
+  timeoutMs?: number;
 }
 
 export interface ProxyResponse {

@@ -20,7 +20,20 @@ STATE = {}
 
 
 def _blank():
-    return {'status': 200, 'requests': [], 'stream': False}
+    return {'status': 200, 'requests': [], 'stream': False, 'retry_after': None, 'reject_once': None,
+            'silent_refusal': False}
+
+
+def _count_cache_control(node, depth=0):
+    """Count cache_control markers in a parsed request body."""
+    if depth > 6:
+        return 0
+    if isinstance(node, dict):
+        total = 1 if node.get('cache_control') else 0
+        return total + sum(_count_cache_control(value, depth + 1) for value in node.values())
+    if isinstance(node, list):
+        return sum(_count_cache_control(item, depth + 1) for item in node)
+    return 0
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -55,11 +68,13 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get('content-length') or 0)
         return self.rfile.read(length) if length else b''
 
-    def _send(self, status, payload):
+    def _send(self, status, payload, retry_after=None):
         raw = json.dumps(payload).encode()
         self.send_response(status)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(raw)))
+        if retry_after is not None:
+            self.send_header('Retry-After', str(retry_after))
         self.end_headers()
         self.wfile.write(raw)
 
@@ -98,6 +113,16 @@ class Handler(BaseHTTPRequestHandler):
                     state['status'] = int(config['status'])
                 if 'stream' in config:
                     state['stream'] = bool(config['stream'])
+                if 'retry_after' in config:
+                    state['retry_after'] = config['retry_after']
+                if 'reject_once' in config:
+                    # One-shot 400 naming a field the request carries: exercises
+                    # the gateway's Responses field-strip-and-retry.
+                    state['reject_once'] = config['reject_once']
+                if 'silent_refusal' in config:
+                    # Stream that ends on finish_reason=stop with nothing in it:
+                    # exercises the OpenAI silent-refusal failover.
+                    state['silent_refusal'] = bool(config['silent_refusal'])
             return self._send(200, {'ok': True})
 
         try:
@@ -111,6 +136,10 @@ class Handler(BaseHTTPRequestHandler):
                 'path': self.path,
                 'model': body.get('model'),
                 'stream': bool(body.get('stream')),
+                # When the gateway forces usage reporting it must set this even
+                # though the client did not: real providers omit usage frames
+                # otherwise and streamed calls would bill at zero tokens.
+                'stream_options': body.get('stream_options'),
                 'authorization': self.headers.get('authorization'),
                 'x_api_key': self.headers.get('x-api-key'),
                 'user_agent': self.headers.get('user-agent'),
@@ -122,12 +151,43 @@ class Handler(BaseHTTPRequestHandler):
                 'has_input': 'input' in body,
                 'has_tools': 'tools' in body,
                 'tool_choice': body.get('tool_choice'),
+                # Anthropic prompt-cache breakpoints, when the gateway injects them.
+                'cache_control_count': _count_cache_control(body),
+                # Field-strip-and-retry visibility: the rejected request carries
+                # the field, the rewritten re-send must not.
+                'max_output_tokens': body.get('max_output_tokens'),
             })
             status = state['status']
             want_stream = state['stream']
+            retry_after = state['retry_after']
+            reject_once = state.get('reject_once')
+            if reject_once and reject_once.get('param') in body:
+                state['reject_once'] = None
+            else:
+                reject_once = None
+            silent_refusal = state.get('silent_refusal')
+
+        if reject_once:
+            return self._send(400, {
+                'error': {
+                    'message': reject_once.get('message') or f"Unknown parameter: '{reject_once['param']}'.",
+                    'code': reject_once.get('code', 'unknown_parameter'),
+                    'param': reject_once['param'],
+                }
+            })
 
         if status >= 400:
-            return self._send(status, {'error': {'message': f'stub failure {status}', 'type': 'stub'}})
+            return self._send(status, {'error': {'message': f'stub failure {status}', 'type': 'stub'}},
+                              retry_after=retry_after)
+
+        # Token-count preflight: reply in the count shape (not the message
+        # shape below), and keep the recorded path so a test can prove the
+        # gateway forwarded /count_tokens instead of rewriting it to
+        # /v1/messages — a rewrite turns a free count into a generation.
+        # The relay may append its own query (?beta=true), so route on the
+        # path alone, the way the assertions read the recorded hit.
+        if self.path.split('?')[0].endswith('/count_tokens'):
+            return self._send(200, {'input_tokens': 42})
 
         # Responses-native models (muse-spark/grok/gpt) arrive on /v1/responses
         # via the chat bridge; reply in the Responses shape so the test can
@@ -145,6 +205,24 @@ class Handler(BaseHTTPRequestHandler):
                 'content': [{'type': 'output_text', 'text': 'from-responses'}],
             }]
             if want_stream or body.get('stream'):
+                if silent_refusal:
+                    # Empty completed stream: no output, no usage — the Responses
+                    # shape of a silent upstream refusal.
+                    frames = [
+                        'data: ' + json.dumps({'type': 'response.created',
+                                               'response': {'id': f'resp-{port}', 'model': body.get('model'),
+                                                            'status': 'in_progress'}}),
+                        'data: ' + json.dumps({'type': 'response.completed',
+                                               'response': {'id': f'resp-{port}', 'model': body.get('model'),
+                                                            'status': 'completed', 'output': []}}),
+                    ]
+                    payload = ('\n\n'.join(frames) + '\n\n').encode()
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/event-stream')
+                    self.send_header('Content-Length', str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
                 frames = [
                     'data: ' + json.dumps({'type': 'response.created',
                                            'response': {'id': f'resp-{port}', 'model': body.get('model'),
@@ -186,6 +264,24 @@ class Handler(BaseHTTPRequestHandler):
             })
 
         if want_stream or body.get('stream'):
+            if silent_refusal:
+                # finish_reason=stop with no content, no usage: the chat shape
+                # of a silent upstream refusal.
+                frames = [
+                    'data: ' + json.dumps({'id': f'chatcmpl-{port}', 'object': 'chat.completion.chunk',
+                                           'choices': [{'index': 0, 'delta': {'role': 'assistant'},
+                                                        'finish_reason': None}]}),
+                    'data: ' + json.dumps({'id': f'chatcmpl-{port}', 'object': 'chat.completion.chunk',
+                                           'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]}),
+                    'data: [DONE]',
+                ]
+                payload = ('\n\n'.join(frames) + '\n\n').encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/event-stream')
+                self.send_header('Content-Length', str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
             # Real providers report usage in a late frame: OpenAI sends a final
             # chunk carrying `usage`, Anthropic a `message_delta`. The gateway
             # parses that frame to record streamed usage, so the stub must send

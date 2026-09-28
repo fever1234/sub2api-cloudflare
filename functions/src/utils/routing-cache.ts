@@ -20,6 +20,7 @@ interface SnapshotEntry {
 
 const TTL_MS = 5000;
 const snapshots = new WeakMap<object, SnapshotEntry>();
+let lastIdentity: object | null = null;
 let hits = 0;
 let misses = 0;
 
@@ -39,11 +40,24 @@ export async function loadRoutingSnapshot(db: Database, identity: object): Promi
   ]);
   const value = { accounts, groups, mappings } as RoutingSnapshot;
   snapshots.set(identity, { loadedAt: now, value });
+  lastIdentity = identity;
   return value;
 }
 
 export function invalidateRoutingSnapshot(identity: object): void {
   snapshots.delete(identity);
+  if (lastIdentity === identity) lastIdentity = null;
+}
+
+/**
+ * Drop the isolate's snapshot when a write happens outside the CRUD routes
+ * (e.g. the account-model fetch caching a catalogue onto the account row):
+ * a warm snapshot would otherwise keep serving the pre-write accounts for the
+ * rest of its TTL and hide the new models from /v1/models.
+ */
+export function invalidateAllRoutingSnapshots(): void {
+  if (lastIdentity) snapshots.delete(lastIdentity);
+  lastIdentity = null;
 }
 
 export function routingCacheMetrics() {

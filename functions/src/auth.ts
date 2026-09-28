@@ -134,9 +134,63 @@ export async function hashApiKey(apiKey: string): Promise<string> {
   return toHex(digest);
 }
 
+/**
+ * Isolate-local cache for API-key authentication.
+ *
+ * Every gateway request pays a D1 SELECT just to prove its key exists, and a
+ * Workers request has a hard subrequest budget — on top of which the routing
+ * snapshot and per-account health already spend queries. A key row changes
+ * only when an admin edits it (every such write clears this cache from the
+ * keys handler) or when its balance crosses the quota gate, so a short TTL
+ * bounds the staleness to a few seconds of possible quota overshoot, while a
+ * warm isolate authenticates for free.
+ *
+ * Negative results are cached too: without them, replaying one bad key is a
+ * D1 query per request.
+ */
+const API_KEY_CACHE_TTL_MS = 5_000;
+const apiKeyCache = new Map<string, { expires: number; key: any | null }>();
+let apiKeyHits = 0;
+let apiKeyMisses = 0;
+
+/** Drop every cached key decision (admin edits a key: create/update/delete). */
+export function invalidateApiKeyCache(): void {
+  apiKeyCache.clear();
+}
+
+export function apiKeyCacheMetrics() {
+  const samples = apiKeyHits + apiKeyMisses;
+  return {
+    hits: apiKeyHits,
+    misses: apiKeyMisses,
+    samples,
+    hit_rate: samples ? Math.round(apiKeyHits / samples * 10000) / 100 : 0,
+    ttl_ms: API_KEY_CACHE_TTL_MS
+  };
+}
+
 export async function authenticateApiKey(db: Database, apiKey: string): Promise<any | null> {
-  const key = await db.getApiKeyByHash(await hashApiKey(apiKey));
-  if (!key || !key.enabled) return null;
-  if (key.quota_limit > 0 && key.balance >= key.quota_limit) return null;
-  return key;
+  const keyHash = await hashApiKey(apiKey);
+  const now = Date.now();
+  const cached = apiKeyCache.get(keyHash);
+  if (cached && now < cached.expires) {
+    apiKeyHits += 1;
+    return cached.key;
+  }
+  apiKeyMisses += 1;
+
+  const key = await db.getApiKeyByHash(keyHash);
+  const valid = key && key.enabled && !(key.quota_limit > 0 && key.balance >= key.quota_limit)
+    ? key
+    : null;
+
+  // Bound the map so a key-spray cannot grow isolate memory without limit.
+  if (apiKeyCache.size >= 1024) {
+    for (const [hash, entry] of apiKeyCache) {
+      if (entry.expires <= now) apiKeyCache.delete(hash);
+    }
+    if (apiKeyCache.size >= 1024) apiKeyCache.clear();
+  }
+  apiKeyCache.set(keyHash, { expires: now + API_KEY_CACHE_TTL_MS, key: valid });
+  return valid;
 }

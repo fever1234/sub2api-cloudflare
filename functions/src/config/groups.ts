@@ -2,6 +2,7 @@
 import type { Env } from '../index';
 import { createDatabase } from '../db';
 import { verifySessionToken, resolveSessionSecret } from '../auth';
+import { normalizeModelAllowlist, serializeModelAllowlist } from '../utils/model-allowlist';
 
 export async function handleGroupsRequest(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const db = createDatabase(env.DB);
@@ -42,13 +43,17 @@ export async function handleGroupsRequest(request: Request, env: Env, ctx: Execu
     const thresholds = readThresholds(body);
     if (typeof thresholds === 'string') return jsonError(thresholds, 400);
 
+    const allowlist = readAllowlist(body);
+    if (typeof allowlist === 'string') return jsonError(allowlist, 400);
+
     // groups.name is UNIQUE; check first so the client gets a readable message
     // instead of a raw D1 constraint error.
     if (await db.getGroupByName(name)) return jsonError(`分组名称「${name}」已存在`, 409);
 
     const result = await db.createGroup(name, String(body.description || '').trim(), Number(body.priority) || 0, {
       enabled: body.enabled === false || body.enabled === 0 ? 0 : 1,
-      ...thresholds
+      ...thresholds,
+      ...allowlist
     });
 
     const group = await db.getGroup(result.lastRowId);
@@ -80,6 +85,25 @@ export async function handleGroupsRequest(request: Request, env: Env, ctx: Execu
     const thresholds = readThresholds(body, true);
     if (typeof thresholds === 'string') return jsonError(thresholds, 400);
     Object.assign(updates, thresholds);
+
+    const allowlist = readAllowlist(body, true);
+    if (typeof allowlist === 'string') return jsonError(allowlist, 400);
+    Object.assign(updates, allowlist);
+
+    // Enabling the gate with nothing in it would deny every model; catch it
+    // here whether the list arrives in this request or was empty already.
+    const existing = await db.getGroup(id);
+    const finalEnabled = updates.model_allowlist_enabled !== undefined
+      ? Number(updates.model_allowlist_enabled)
+      : Number(existing?.model_allowlist_enabled) || 0;
+    if (finalEnabled) {
+      const finalList = updates.model_allowlist !== undefined
+        ? JSON.parse(String(updates.model_allowlist))
+        : JSON.parse(existing?.model_allowlist || '[]');
+      if (!Array.isArray(finalList) || finalList.length === 0) {
+        return jsonError('启用模型白名单后至少需要一个模型', 400);
+      }
+    }
 
     await db.updateGroup(id, updates);
     const group = await db.getGroup(id);
@@ -152,6 +176,36 @@ function readThresholds(
     result.window_seconds = window;
   } else if (!partial) {
     result.window_seconds = 300;
+  }
+
+  return result;
+}
+
+/**
+ * Validate the model allowlist. Wildcards only at the end of an entry, entries
+ * deduped case-insensitively — and an enabled gate with an empty list would
+ * deny every model, which is never what an operator means.
+ * Returns an error string, or the fields to persist.
+ */
+function readAllowlist(
+  body: Record<string, any>,
+  partial = false
+): string | { model_allowlist_enabled?: number; model_allowlist?: string } {
+  const result: { model_allowlist_enabled?: number; model_allowlist?: string } = {};
+
+  if (body.model_allowlist_enabled !== undefined) {
+    result.model_allowlist_enabled = body.model_allowlist_enabled === true || body.model_allowlist_enabled === 1 ? 1 : 0;
+  }
+
+  if (body.model_allowlist !== undefined) {
+    const normalized = normalizeModelAllowlist(body.model_allowlist);
+    if (normalized.error) return normalized.error;
+    const list = normalized.list || [];
+    const enabled = result.model_allowlist_enabled !== undefined ? result.model_allowlist_enabled : 0;
+    if (enabled && list.length === 0) return '启用模型白名单后至少需要一个模型';
+    result.model_allowlist = serializeModelAllowlist(list);
+  } else if (!partial && body.model_allowlist_enabled) {
+    return '启用模型白名单后至少需要一个模型';
   }
 
   return result;
