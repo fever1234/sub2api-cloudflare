@@ -125,6 +125,34 @@ const openaiUsage = extractTokenUsage({ usage: { prompt_tokens: 11, completion_t
 check('openai token fields are read',
   openaiUsage.promptTokens === 11 && openaiUsage.totalTokens === 16, openaiUsage)
 
+// ---- input vs cache reads are recorded separately --------------------------
+// OpenAI folds cached tokens into prompt_tokens; Anthropic excludes its cache
+// reads from input_tokens. Net input must mean the same thing on both, and the
+// cache half is recorded — but never billed (pricing has no cache rate).
+const openaiCached = extractTokenUsage({
+  usage: { prompt_tokens: 1200, completion_tokens: 50, total_tokens: 1250, prompt_tokens_details: { cached_tokens: 200 } }
+}, {})
+check('openai cached tokens are split out of input',
+  openaiCached.promptTokens === 1000 && openaiCached.cacheReadTokens === 200, openaiCached)
+check('openai total keeps the cache', openaiCached.totalTokens === 1250, openaiCached.totalTokens)
+
+const responsesCached = extractTokenUsage({
+  usage: { input_tokens: 500, output_tokens: 10, input_tokens_details: { cached_tokens: 100 } }
+}, {})
+check('responses-shaped cached tokens are split out',
+  responsesCached.promptTokens === 400 && responsesCached.cacheReadTokens === 100, responsesCached)
+
+const anthropicCached = extractTokenUsage({
+  usage: { input_tokens: 300, output_tokens: 40, cache_read_input_tokens: 700 }
+}, {})
+check('anthropic cache reads are read as-is (already excluded from input)',
+  anthropicCached.promptTokens === 300 && anthropicCached.cacheReadTokens === 700, anthropicCached)
+check('anthropic total includes cache reads', anthropicCached.totalTokens === 1040, anthropicCached.totalTokens)
+
+const uncached = extractTokenUsage({ usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } }, {})
+check('rows without cache report zero cache reads',
+  uncached.cacheReadTokens === 0 && uncached.promptTokens === 10 && uncached.totalTokens === 15, uncached)
+
 // ---- estimation fallback ---------------------------------------------------
 // An upstream that strips `usage` must still bill something — but the prompt
 // lives on the *request*: a response body has no `messages` field, so the old

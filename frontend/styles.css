@@ -716,6 +716,9 @@ th:last-child, td:last-child { text-align: right; }
 
 .cell-main { display: block; font-weight: 600; }
 .cell-sub { display: block; margin-top: 2px; color: var(--text-3); font-size: 11.5px; }
+/* Long secondary lines (client UA under the key) cap at a readable width and
+   hand the full string to the title tooltip instead of stretching the column. */
+.cell-sub.truncate { max-width: 18ch; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .cell-dim { color: var(--text-3); }
 
 .meter { display: block; width: 88px; height: 6px; margin-top: 5px; border-radius: 99px; background: var(--line); overflow: hidden; }

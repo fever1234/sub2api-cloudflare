@@ -33,4 +33,6 @@ export interface Env {
   SESSION_STICKY?: string;
   /** '0' disables Anthropic cache_control breakpoint injection. */
   CACHE_BREAKPOINTS?: string;
+  /** Retention for usage_records/request_logs in days. '0' disables cleanup. */
+  USAGE_RETENTION_DAYS?: string;
 }

@@ -361,8 +361,8 @@ export class Database {
   async createUsageRecord(record: Partial<UsageRecord>) {
     return this.insert(
       `INSERT INTO usage_records
-       (api_key_id, model, provider, prompt_tokens, completion_tokens, total_tokens, cost, base_cost, rate_multiplier, cost_estimated, cache_status, status, error_message, latency_ms, ttft_ms, group_id, account_id, reasoning_effort, user_agent)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (api_key_id, model, provider, prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, cost, base_cost, rate_multiplier, cost_estimated, cache_status, status, error_message, latency_ms, ttft_ms, group_id, account_id, reasoning_effort, user_agent)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         record.api_key_id ?? 0,
         record.model,
@@ -370,6 +370,7 @@ export class Database {
         record.prompt_tokens ?? 0,
         record.completion_tokens ?? 0,
         record.total_tokens ?? 0,
+        record.cache_read_tokens ?? 0,
         record.cost ?? 0,
         record.base_cost ?? record.cost ?? 0,
         record.rate_multiplier ?? 1,
@@ -483,6 +484,7 @@ export class Database {
           SUM(CASE WHEN status < 400 THEN 1 ELSE 0 END) AS success_requests,
           COALESCE(SUM(total_tokens), 0) AS total_tokens,
           COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+          COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
           COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
           COALESCE(SUM(cost), 0) AS total_cost,
           COALESCE(SUM(base_cost), 0) AS base_cost,
@@ -521,6 +523,7 @@ export class Database {
           COUNT(*) AS requests,
           SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END) AS errors,
           COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+          COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
           COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
           COALESCE(SUM(cost), 0) AS cost
         FROM usage_records WHERE created_at >= ?
@@ -812,13 +815,6 @@ export class Database {
       "SELECT COUNT(*) AS total FROM sqlite_master WHERE type = 'table' AND name IN ('users','groups','accounts','model_mappings','api_keys','usage_records','request_logs')"
     );
     return Number(row?.total || 0) >= 7;
-  }
-
-  // Cleanup old logs
-  async cleanupOldLogs(days = 7) {
-    const cutoff = sqliteTimestamp(Date.now() - days * 24 * 60 * 60 * 1000);
-    await this.exec(`DELETE FROM request_logs WHERE created_at < '${cutoff}'`);
-    await this.exec(`DELETE FROM usage_records WHERE created_at < '${cutoff}'`);
   }
 }
 

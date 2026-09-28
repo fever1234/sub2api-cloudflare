@@ -6,7 +6,7 @@ import { FailoverManager } from '../failover';
 import { proxyRequest, buildUpstreamHeaders, getUpstreamBaseUrl, findModelMapping, resolveUpstreamCredentials , accountRateMultiplier, stripBodyHeaders, ensureChatStreamUsage } from '../utils/proxy';
 import { applyOpenCodeHeaders, resolveOpenCodeSessionId } from '../utils/opencode-session';
 import { openCodeGoModelProtocol, chatCompletionsToResponses, responsesSseToChatStream, bufferResponsesSseAsChat } from '../utils/responses-bridge';
-import { createStripRetryState, sendWithRejectedFieldRetry, type StripRetryState } from '../utils/responses-compat';
+import { createStripRetryState, sendWithRejectedFieldRetry, sanitizeToolSchemas, type StripRetryState } from '../utils/responses-compat';
 import { SilentRefusalDetector, guardSilentRefusalStream } from '../utils/silent-refusal';
 import { modelAllowed, modelAllowlistDenied } from '../utils/model-allowlist';
 import { streamWithRecording } from '../utils/record';
@@ -139,6 +139,13 @@ export async function handleGatewayRequest(request: Request, env: Env, failover:
     }
   }
 
+  // Proactive tool-schema sanitation before the first attempt (Go:
+  // sanitizeToolSchema on the forward paths). In-place; `toolSchemaFixed`
+  // forces re-serialization below so the raw client bytes never win the
+  // "unchanged body" shortcut after a repair. Lookaround removal is
+  // OpenAI-only, mirroring Go's platform gate.
+  const toolSchemaFixed = sanitizeToolSchemas(requestBody, { removeLookaround: provider === 'openai' });
+
   // opencode_go responses-native models (muse-spark-*, grok-*, gpt-*) exist
   // only on /v1/responses: bridge a chat-completions request onto it so an
   // OpenAI-compatible client can still use them.
@@ -160,7 +167,7 @@ export async function handleGatewayRequest(request: Request, env: Env, failover:
   
   // Chat Completions only emits a usage frame when stream_options.include_usage
   // is on, so a streaming client that omitted it would be billed at zero tokens.
-  // The gateway asks on the client's behalf — but only for the OpenAI-protocol
+  // The gateway asks on the client's behalf —but only for the OpenAI-protocol
   // chat endpoint: an Anthropic body would gain an unknown field, and a bridged
   // Responses body must stay a pure Responses body (its terminal event already
   // carries usage). A changed body is re-serialized below.
@@ -194,7 +201,7 @@ export async function handleGatewayRequest(request: Request, env: Env, failover:
   }
   const chatBody = request.method === 'GET' || request.method === 'HEAD'
     ? undefined
-    : (upstreamModel !== model || cacheInjected || usageInjected ? JSON.stringify(requestBody) : body);
+    : (upstreamModel !== model || cacheInjected || usageInjected || toolSchemaFixed ? JSON.stringify(requestBody) : body);
   // Failover must see the original chat body so each retry re-decides bridging.
   const upstreamBody = bridgedBody !== undefined ? bridgedBody : chatBody;
   
@@ -298,7 +305,7 @@ export async function handleGatewayRequest(request: Request, env: Env, failover:
     }
     
     // The estimation fallback needs the request body; a failed attempt bills nothing.
-    const { promptTokens, completionTokens, totalTokens } = extractTokenUsage(responseBody, proxyResponse.headers, isError ? undefined : requestBody);
+    const { promptTokens, completionTokens, totalTokens, cacheReadTokens } = extractTokenUsage(responseBody, proxyResponse.headers, isError ? undefined : requestBody);
     const breakdown = calculateCostBreakdown(provider, upstreamModel, promptTokens, completionTokens, accountRateMultiplier(account));
     const cost = breakdown.cost;
     
@@ -306,7 +313,7 @@ export async function handleGatewayRequest(request: Request, env: Env, failover:
     if (cost > 0) {
       defer(ctx, db.incrementApiKeyUsage(keyRecord.id, cost));
     }
-    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cost, base_cost: breakdown.baseCost, rate_multiplier: breakdown.multiplier, cost_estimated: breakdown.estimated ? 1 : 0, cache_status: 'bypass', status: responseStatus, error_message: isError ? responseBody?.error?.message || 'Error' : '', latency_ms: Date.now() - startTime, reasoning_effort: reasoningEffort, user_agent: userAgent }));
+    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cache_read_tokens: cacheReadTokens, cost, base_cost: breakdown.baseCost, rate_multiplier: breakdown.multiplier, cost_estimated: breakdown.estimated ? 1 : 0, cache_status: 'bypass', status: responseStatus, error_message: isError ? responseBody?.error?.message || 'Error' : '', latency_ms: Date.now() - startTime, reasoning_effort: reasoningEffort, user_agent: userAgent }));
     
     defer(ctx, db.createRequestLog({
       account_id: account.id,
@@ -519,7 +526,7 @@ async function handleFailover(
       if (retryBreakdown.cost > 0) {
         defer(ctx, db.incrementApiKeyUsage(keyRecord.id, retryBreakdown.cost));
       }
-      defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: usage.promptTokens, completion_tokens: usage.completionTokens, total_tokens: usage.totalTokens, cost: retryBreakdown.cost, base_cost: retryBreakdown.baseCost, rate_multiplier: retryBreakdown.multiplier, cost_estimated: retryBreakdown.estimated ? 1 : 0, cache_status: 'bypass', status: finalStatus, error_message: finalError ? retryResponseBody?.error?.message || errorMessage : '', latency_ms: Date.now() - originStart, reasoning_effort: reasoningEffort, user_agent: userAgent }));
+      defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: usage.promptTokens, completion_tokens: usage.completionTokens, total_tokens: usage.totalTokens, cache_read_tokens: usage.cacheReadTokens, cost: retryBreakdown.cost, base_cost: retryBreakdown.baseCost, rate_multiplier: retryBreakdown.multiplier, cost_estimated: retryBreakdown.estimated ? 1 : 0, cache_status: 'bypass', status: finalStatus, error_message: finalError ? retryResponseBody?.error?.message || errorMessage : '', latency_ms: Date.now() - originStart, reasoning_effort: reasoningEffort, user_agent: userAgent }));
       
       return new Response(responseText, {
         status: finalStatus,

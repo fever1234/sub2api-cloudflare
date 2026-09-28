@@ -6,7 +6,7 @@ import { FailoverManager } from '../failover';
 import { proxyRequest, buildUpstreamHeaders, getUpstreamBaseUrl, findModelMapping, resolveUpstreamCredentials , accountRateMultiplier, stripBodyHeaders, ensureChatStreamUsage } from '../utils/proxy';
 import { applyOpenCodeHeaders, resolveOpenCodeSessionId } from '../utils/opencode-session';
 import { openCodeGoModelProtocol, chatCompletionsToResponses, responsesSseToChatStream, bufferResponsesSseAsChat } from '../utils/responses-bridge';
-import { createStripRetryState, sendWithRejectedFieldRetry, type StripRetryState } from '../utils/responses-compat';
+import { createStripRetryState, sendWithRejectedFieldRetry, sanitizeToolSchemas, type StripRetryState } from '../utils/responses-compat';
 import { SilentRefusalDetector, guardSilentRefusalStream } from '../utils/silent-refusal';
 import { modelAllowed, modelAllowlistDenied } from '../utils/model-allowlist';
 import { streamWithRecording } from '../utils/record';
@@ -52,7 +52,7 @@ export async function handleOpenAIRequest(request: Request, env: Env, failover: 
 
   // Codex-style token-count preflight. Answered locally and never billed:
   // relays rarely implement /responses/input_tokens, and a forwarded miss
-  // would either 400 the client or — worse — POST the preflight body to
+  // would either 400 the client or —worse —POST the preflight body to
   // /v1/responses and create a billable generation instead of a count.
   if (url.pathname.replace(/\/+$/, '').endsWith('/responses/input_tokens')) {
     return new Response(JSON.stringify({
@@ -131,6 +131,11 @@ export async function handleOpenAIRequest(request: Request, env: Env, failover: 
   const { account, group } = selection;
   const provider = account.provider;
 
+  // Proactive tool-schema sanitation before the first attempt (Go:
+  // sanitizeToolSchema on the forward paths): repairs are in-place, and
+  // lookaround removal is OpenAI-only, mirroring Go's platform gate.
+  sanitizeToolSchemas(requestBody, { removeLookaround: provider === 'openai' });
+
   // opencode_go serves responses-native models (muse-spark-*, grok-*, gpt-*)
   // only on /v1/responses. Bridge the chat request so an OpenAI-compatible
   // client can still use them; every other model keeps the direct chat path.
@@ -168,7 +173,7 @@ export async function handleOpenAIRequest(request: Request, env: Env, failover: 
   
   const sentBody = JSON.stringify(outboundBody);
   // Bounded same-account retry when a 400 names a field this gateway can drop
-  // (max_output_tokens, replayed input[i].status, …). The budget is shared with
+  // (max_output_tokens, replayed input[i].status, —. The budget is shared with
   // the failover chain, mirroring the Go gateway's per-request loop guard.
   const stripState = createStripRetryState(sentBody);
   // OpenAI's silent refusals are gated on request size, exactly like Go's.
@@ -257,7 +262,7 @@ export async function handleOpenAIRequest(request: Request, env: Env, failover: 
     
     // Calculate cost. The estimation fallback needs the request body, and a
     // failed attempt must not bill anything.
-    const { promptTokens, completionTokens, totalTokens } = extractTokenUsage(responseBody, proxyResponse.headers, finalError ? undefined : requestBody);
+    const { promptTokens, completionTokens, totalTokens, cacheReadTokens } = extractTokenUsage(responseBody, proxyResponse.headers, finalError ? undefined : requestBody);
     const breakdown = calculateCostBreakdown(provider, upstreamModel, promptTokens, completionTokens, accountRateMultiplier(account));
     const cost = breakdown.cost;
     
@@ -265,7 +270,7 @@ export async function handleOpenAIRequest(request: Request, env: Env, failover: 
     if (cost > 0) {
       defer(ctx, db.incrementApiKeyUsage(keyRecord.id, cost));
     }
-    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cost, base_cost: breakdown.baseCost, rate_multiplier: breakdown.multiplier, cost_estimated: breakdown.estimated ? 1 : 0, cache_status: 'bypass', status: finalStatus, error_message: finalError ? responseBody?.error?.message || 'Error' : '', latency_ms: Date.now() - startTime, reasoning_effort: reasoningEffort, user_agent: userAgent }));
+    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cache_read_tokens: cacheReadTokens, cost, base_cost: breakdown.baseCost, rate_multiplier: breakdown.multiplier, cost_estimated: breakdown.estimated ? 1 : 0, cache_status: 'bypass', status: finalStatus, error_message: finalError ? responseBody?.error?.message || 'Error' : '', latency_ms: Date.now() - startTime, reasoning_effort: reasoningEffort, user_agent: userAgent }));
     
     // Record request log
     defer(ctx, db.createRequestLog({
@@ -452,7 +457,7 @@ async function handleFailover(
       const responseText = finalBody !== undefined ? JSON.stringify(finalBody) : await proxyResponse.text();
 
       // A successful retry served real tokens to the client. Billing it here —
-      // the main path does the same — or every failed-over call would be
+      // the main path does the same —or every failed-over call would be
       // invisible to the usage page, quota accounting and the operator's bill.
       let retryResponseBody: any = {};
       try { retryResponseBody = JSON.parse(responseText); } catch { /* non-JSON */ }
@@ -461,7 +466,7 @@ async function handleFailover(
       if (retryBreakdown.cost > 0) {
         defer(ctx, db.incrementApiKeyUsage(keyRecord.id, retryBreakdown.cost));
       }
-      defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider: currentProvider, prompt_tokens: usage.promptTokens, completion_tokens: usage.completionTokens, total_tokens: usage.totalTokens, cost: retryBreakdown.cost, base_cost: retryBreakdown.baseCost, rate_multiplier: retryBreakdown.multiplier, cost_estimated: retryBreakdown.estimated ? 1 : 0, cache_status: 'bypass', status: finalStatus, error_message: finalError ? retryResponseBody?.error?.message || errorMessage : '', latency_ms: Date.now() - originStart, reasoning_effort: reasoningEffort, user_agent: userAgent }));
+      defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider: currentProvider, prompt_tokens: usage.promptTokens, completion_tokens: usage.completionTokens, total_tokens: usage.totalTokens, cache_read_tokens: usage.cacheReadTokens, cost: retryBreakdown.cost, base_cost: retryBreakdown.baseCost, rate_multiplier: retryBreakdown.multiplier, cost_estimated: retryBreakdown.estimated ? 1 : 0, cache_status: 'bypass', status: finalStatus, error_message: finalError ? retryResponseBody?.error?.message || errorMessage : '', latency_ms: Date.now() - originStart, reasoning_effort: reasoningEffort, user_agent: userAgent }));
       
       return new Response(responseText, {
         status: finalStatus,

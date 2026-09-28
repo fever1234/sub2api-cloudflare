@@ -29,30 +29,47 @@ export function extractTokenUsage(
   body: any,
   headers: Headers | Record<string, string>,
   request?: any
-): { promptTokens: number; completionTokens: number; totalTokens: number } {
+): { promptTokens: number; completionTokens: number; totalTokens: number; cacheReadTokens: number } {
   let promptTokens = 0;
   let completionTokens = 0;
-  let totalTokens = 0;
+  let cacheReadTokens = 0;
 
-  // Try to get from body first
+  // Try to get from body first.
+  //
+  // The two spellings disagree about cache reads: Anthropic excludes them from
+  // `input_tokens` and reports them as `cache_read_input_tokens`, while OpenAI
+  // nests them under `*_details.cached_tokens` and *includes* them in
+  // `prompt_tokens`. Net input therefore subtracts only the OpenAI-sourced
+  // figure — subtracting the Anthropic one as well would double-count the
+  // cache, and never subtracting would leave the two protocols inconsistent.
   if (body?.usage) {
-    promptTokens = body.usage.prompt_tokens || body.usage.input_tokens || 0;
-    completionTokens = body.usage.completion_tokens || body.usage.output_tokens || 0;
-    totalTokens = body.usage.total_tokens || (promptTokens + completionTokens);
+    const usage = body.usage;
+    const anthropicCache = Number(usage.cache_read_input_tokens) || 0;
+    const openaiCache = Number(usage.prompt_tokens_details?.cached_tokens)
+      || Number(usage.input_tokens_details?.cached_tokens)
+      || 0;
+    cacheReadTokens = anthropicCache || openaiCache;
+    const rawPrompt = Number(usage.prompt_tokens ?? usage.input_tokens) || 0;
+    promptTokens = Math.max(0, rawPrompt - openaiCache);
+    completionTokens = Number(usage.completion_tokens ?? usage.output_tokens) || 0;
   }
 
   // Fallback to estimation
-  if (totalTokens === 0 && request !== undefined) {
+  if (promptTokens + completionTokens + cacheReadTokens === 0 && request !== undefined) {
     const inputSource = request?.messages ?? request?.input ?? request?.content ?? '';
     const inputText = typeof inputSource === 'string' ? inputSource : JSON.stringify(inputSource);
     const outputSource = body?.choices?.[0]?.message?.content ?? body?.output ?? body?.content ?? '';
     const outputText = typeof outputSource === 'string' ? outputSource : JSON.stringify(outputSource);
     promptTokens = estimateTokens(inputText);
     completionTokens = estimateTokens(outputText);
-    totalTokens = promptTokens + completionTokens;
   }
 
-  return { promptTokens, completionTokens, totalTokens };
+  // Totals are recomputed from the parts rather than trusting the upstream's
+  // `total_tokens`: the split rows must add up in the UI, and OpenAI's figure
+  // is arithmetically identical anyway (its prompt already included the cache).
+  const totalTokens = promptTokens + cacheReadTokens + completionTokens;
+
+  return { promptTokens, completionTokens, totalTokens, cacheReadTokens };
 }
 
 /**

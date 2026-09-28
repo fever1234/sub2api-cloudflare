@@ -188,7 +188,11 @@ check('empty database reports schema not ready', freshBody?.data?.schema_ready =
     `settings written: ${writes.join(', ') || 'none'}`)
 }
 
-// ---- the JSON error carries the real reason -------------------------------
+// ---- the JSON error is opaque to the client --------------------------------
+//
+// The reason belongs in Workers Logs: a body or header naming the table,
+// binding or upstream host would hand reconnaissance to whoever triggered the
+// failure, and a browser navigation must not carry it either.
 const apiResponse = await callWorker('/api/v1/usage', { headers: { authorization: 'Bearer x' } })
 const apiBody = await apiResponse.text()
 check('api error body is JSON', apiBody.trim().startsWith('{'), apiBody.slice(0, 80))
@@ -196,16 +200,22 @@ let parsed = null
 try { parsed = JSON.parse(apiBody) } catch {}
 check('api error body is parseable', parsed !== null)
 check('api error body is not the Cloudflare 1101 page', !apiBody.includes('Worker threw exception'))
+check('api error keeps the generic error', parsed?.error === 'Internal error', apiBody.slice(0, 120))
+check('api error body leaks no message field', !('message' in (parsed ?? {})), apiBody.slice(0, 120))
+check('api error leaks no x-sub2api-error header',
+  !apiResponse.headers.get('x-sub2api-error'), String(apiResponse.headers.get('x-sub2api-error')))
 
 // ---- a browser navigation still gets the SPA shell ------------------------
 //
 // Returning raw JSON to a navigation would replace the app with a blob of text.
-// The shell loads instead, and the reason rides along in a header.
+// The shell loads instead; the reason must not ride along in a header.
 const navResponse = await callWorker('/dashboard', { headers: { accept: 'text/html' } })
 check('navigation during failure returns 200 shell', navResponse.status === 200, `status ${navResponse.status}`)
 const navBody = await navResponse.text()
 check('navigation returns html, not JSON', navBody.includes('<!doctype html'), navBody.slice(0, 80))
 check('navigation never shows the 1101 page', !navBody.includes('Worker threw exception'))
+check('navigation leaks no x-sub2api-error header',
+  !navResponse.headers.get('x-sub2api-error'), String(navResponse.headers.get('x-sub2api-error')))
 
 // ---- missing bindings degrade instead of crashing -------------------------
 let noDbThrew = null

@@ -82,6 +82,8 @@ export interface UsageRecord {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
+  /** Cache-read tokens: the slice of the upstream's input served from prompt cache, recorded separately from `prompt_tokens` (never overlapping). */
+  cache_read_tokens?: number;
   cost: number;
   base_cost?: number;
   rate_multiplier?: number;

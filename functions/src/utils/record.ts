@@ -88,7 +88,7 @@ export async function streamWithRecording(
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<StreamOutcome>(resolve => {
     timer = setTimeout(
-      () => resolve({ promptTokens: 0, completionTokens: 0, totalTokens: 0, ttftMs: null, totalMs: Date.now() - context.startedAt }),
+      () => resolve({ promptTokens: 0, completionTokens: 0, totalTokens: 0, cacheReadTokens: 0, ttftMs: null, totalMs: Date.now() - context.startedAt }),
       STREAM_RECORD_TIMEOUT_MS
     );
   });
@@ -120,6 +120,7 @@ export async function streamWithRecording(
       prompt_tokens: outcome.promptTokens,
       completion_tokens: outcome.completionTokens,
       total_tokens: outcome.totalTokens,
+      cache_read_tokens: outcome.cacheReadTokens ?? 0,
       cost,
       base_cost: breakdown.baseCost,
       rate_multiplier: breakdown.multiplier,

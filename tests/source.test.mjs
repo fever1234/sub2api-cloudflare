@@ -425,7 +425,7 @@ function blockAfter(source, startMarker, endMarker) {
 // both model endpoints (Go: group_model_allowlist.go).
 {
   const schema = readFileSync('functions/src/schema.ts', 'utf8')
-  check('schema version is bumped for the allowlist columns', schema.includes("SCHEMA_VERSION = '12'"))
+  check('schema version is bumped for the allowlist columns', schema.includes("SCHEMA_VERSION = '13'"))
   const groupsDdl = schema.slice(schema.indexOf('CREATE TABLE IF NOT EXISTS groups'), schema.indexOf('CREATE TABLE IF NOT EXISTS channels'))
   check('fresh groups table carries the allowlist columns',
     groupsDdl.includes('model_allowlist_enabled INTEGER DEFAULT 0') && groupsDdl.includes('model_allowlist TEXT'))
@@ -450,6 +450,78 @@ function blockAfter(source, startMarker, endMarker) {
   check('single-model retrieve shares the gate',
     worker.includes('modelAllowlistDenied(id)')
       && /if \(path\.startsWith\('\/v1\/models\/'\) && request\.method === 'GET'\)/.test(worker))
+}
+
+// ---- 19. Proactive tool-schema sanitation ---------------------------------
+// Go sanitizes tool schemas on the forward paths *before* the first attempt
+// (openai_responses_tool_schema.go); a 400 round trip is what the reactive
+// strip already covers, so the routes must call the sanitizer pre-send, with
+// lookaround removal gated to OpenAI the way Go gates it by platform.
+{
+  const compat = readFileSync('functions/src/utils/responses-compat.ts', 'utf8')
+  check('compat util exports the proactive sanitizer', compat.includes('export function sanitizeToolSchemas('))
+  check('lookaround matcher covers lookahead and lookbehind',
+    compat.includes(String.raw`/\(\?(?:=|!|<=|<!)/`))
+  check('sanitation fails open on a throw', compat.includes('return false;') && compat.includes('catch {'))
+  check('instance values are excluded from the schema walk',
+    compat.includes('hold instance values, not schemas'))
+
+  for (const route of ['openai', 'gateway', 'claude']) {
+    const source = readFileSync(`functions/src/routes/${route}.ts`, 'utf8')
+    check(`${route} imports the proactive sanitizer`, source.includes('sanitizeToolSchemas'))
+    const callSite = source.indexOf('sanitizeToolSchemas(')
+    const firstSend = source.indexOf('proxyRequest(')
+    check(`${route} sanitizes before the first send`,
+      callSite > 0 && firstSend > 0 && callSite < firstSend, `sanitize@${callSite} send@${firstSend}`)
+  }
+
+  const openai = readFileSync('functions/src/routes/openai.ts', 'utf8')
+  const gateway = readFileSync('functions/src/routes/gateway.ts', 'utf8')
+  const claude = readFileSync('functions/src/routes/claude.ts', 'utf8')
+  check('openai gates lookaround removal on its own provider',
+    openai.includes("sanitizeToolSchemas(requestBody, { removeLookaround: provider === 'openai' })"))
+  check('gateway gates lookaround removal on its own provider',
+    gateway.includes("sanitizeToolSchemas(requestBody, { removeLookaround: provider === 'openai' })"))
+  check('gateway re-serializes after a repair', gateway.includes('|| toolSchemaFixed'))
+  check('claude repairs without touching patterns',
+    claude.includes('sanitizeToolSchemas(requestBody);') && !claude.includes('removeLookaround'))
+}
+
+// ---- 20. Input vs cache-read split -----------------------------------------
+// `prompt_tokens` records net input on every protocol — OpenAI's cached slice
+// is subtracted, Anthropic's is already excluded — and the cache half lands in
+// its own column so the two never overlap. The split is recorded everywhere a
+// usage row is written, aggregated for the dashboard and never billed.
+{
+  const schema = readFileSync('functions/src/schema.ts', 'utf8')
+  check('schema version is bumped for the cache-read column', schema.includes("SCHEMA_VERSION = '13'"))
+  const usageDdl = schema.slice(
+    schema.indexOf('CREATE TABLE IF NOT EXISTS usage_records'),
+    schema.indexOf('CREATE TABLE IF NOT EXISTS request_logs'))
+  check('fresh usage table carries cache_read_tokens', usageDdl.includes('cache_read_tokens INTEGER DEFAULT 0'))
+  check('existing usage tables gain the cache column',
+    schema.includes("{ table: 'usage_records', column: 'cache_read_tokens'"))
+
+  const billing = readFileSync('functions/src/billing.ts', 'utf8')
+  check('extract reads both cache spellings',
+    billing.includes('cache_read_input_tokens') && billing.includes('prompt_tokens_details?.cached_tokens'))
+  check('extract subtracts only the openai-sourced cache', billing.includes('Math.max(0, rawPrompt - openaiCache)'))
+
+  const db = readFileSync('functions/src/db.ts', 'utf8')
+  check('usage insert carries the cache column', db.includes('total_tokens, cache_read_tokens, cost'))
+  check('dashboard totals aggregate cache reads', db.includes('SUM(cache_read_tokens), 0) AS cache_read_tokens'))
+
+  const proxy = readFileSync('functions/src/utils/proxy.ts', 'utf8')
+  check('stream sniffer reads both cache spellings',
+    proxy.includes('"cache_read_input_tokens"') && proxy.includes('"cached_tokens"'))
+
+  for (const route of ['openai', 'gateway', 'claude']) {
+    const source = readFileSync(`functions/src/routes/${route}.ts`, 'utf8')
+    const sites = (source.match(/cache_read_tokens:/g) || []).length
+    check(`${route} records cache reads on main and failover paths`, sites >= 2, `sites=${sites}`)
+  }
+  const record = readFileSync('functions/src/utils/record.ts', 'utf8')
+  check('streaming records cache reads', record.includes('cache_read_tokens: outcome.cacheReadTokens'))
 }
 
 console.log()

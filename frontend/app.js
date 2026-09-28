@@ -583,7 +583,7 @@ function renderDashboard() {
     statCard({
       label: '总 Token', iconName: 'i-token', tint: 'tint-indigo',
       value: fmtTokens(totals.total_tokens),
-      caption: `输入 ${fmtTokens(totals.prompt_tokens)} · 输出 ${fmtTokens(totals.completion_tokens)}`
+      caption: `输入 ${fmtTokens(totals.prompt_tokens)} · 缓存读取 ${fmtTokens(totals.cache_read_tokens || 0)} · 输出 ${fmtTokens(totals.completion_tokens)}`
     }),
     statCard({
       label: '路由缓存命中率', iconName: 'i-layers', tint: 'tint-sky',
@@ -635,10 +635,12 @@ function renderDashboard() {
   const trend = (stats.trend || []).map(row => ({
     bucket: row.bucket,
     prompt_tokens: num(row.prompt_tokens),
+    cache_read_tokens: num(row.cache_read_tokens),
     completion_tokens: num(row.completion_tokens)
   }))
   $('chart-tokens').innerHTML = lineChart(trend, [
     { key: 'prompt_tokens', label: '输入 Token', color: '#14b8a6' },
+    { key: 'cache_read_tokens', label: '缓存读取', color: '#a855f7' },
     { key: 'completion_tokens', label: '输出 Token', color: '#3b82f6' }
   ])
 
@@ -664,6 +666,21 @@ function table(headers, rows, options = {}) {
   const head = headers.map(h => `<th${h.numeric ? ' class="num"' : ''}>${esc(h.label ?? h)}</th>`).join('')
   const body = rows.map(cells => `<tr>${cells.map(cell => `<td>${cell}</td>`).join('')}</tr>`).join('')
   return `<table class="data-table${options.compact ? ' compact' : ''}"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`
+}
+
+/**
+ * One cell of the usage table's token columns (input / output / cache reads).
+ * The row shows three bare numbers, so hovering any of them reveals the full
+ * breakdown — including the total, which no column carries any more.
+ */
+function tokenBreakdown(item, column) {
+  const title = `输入 ${fmtTokens(item.prompt_tokens)} · 缓存读取 ${fmtTokens(item.cache_read_tokens)}`
+    + ` · 输出 ${fmtTokens(item.completion_tokens)} · 总计 ${fmtTokens(item.total_tokens)}`
+  const value = column === 'input' ? item.prompt_tokens
+    : column === 'output' ? item.completion_tokens
+    : item.cache_read_tokens
+  const dim = column === 'cache' && !num(value)
+  return `<span class="${dim ? 'cell-dim' : 'cell-main'}" title="${esc(title)}">${fmtTokens(value)}</span>`
 }
 
 /**
@@ -760,32 +777,46 @@ function renderKeys() {
     : emptyState('i-key', all.length ? '没有匹配的密钥' : '暂无 API 密钥', all.length ? '换个关键词再试。' : '点击右上角创建一个供客户端使用的密钥。')
 }
 
+/** effort → 中文；未收录的值原样显示，空值不显示。 */
+const EFFORT_LABELS = { none: '关闭', minimal: '最低', low: '低', medium: '中', high: '高', xhigh: '超高' }
+function effortLabel(value) {
+  const raw = String(value || '').trim()
+  if (!raw) return ''
+  return EFFORT_LABELS[raw.toLowerCase()] || raw
+}
+
 function renderUsage() {
   const all = state.data.usage
   const items = applyFilters(all, state.filters.usage, {
-    text: item => `${item.model || ''} ${item.provider || ''} ${item.status || ''} ${item.group_name || ''} ${item.account_name || ''} ${item.key_name || ''}`,
+    text: item => `${item.model || ''} ${item.provider || ''} ${item.status || ''} ${item.group_name || ''} ${item.account_name || ''} ${item.key_name || ''} ${item.reasoning_effort || ''} ${item.user_agent || ''}`,
     provider: item => item.provider || '',
     group: item => item.group_id || ''
   })
   $('usage-count').textContent = filterSummary(items.length, all.length, '条记录')
 
-  // Twelve columns overflowed on a laptop, so the three token counts collapse
-  // into one cell (total on top, the split beneath) and cost carries its own
-  // multiplier detail instead of needing a separate column.
+  // Thirteen columns still fit because each token count is one bare number:
+  // net input, output and cache reads stand side by side (the row total is
+  // their sum, so the dashboard card keeps it and the row doesn't repeat it).
+  // The reasoning column earns its place by being the only one showing how the
+  // call was asked for; the client UA rides under the key instead of widening
+  // the table.
   $('usage-list').innerHTML = items.length
     ? table(
-        ['模型', '服务商', '分组 / 账号', '密钥', 'Token', '费用', '状态', '首字 / 耗时', '时间', ''],
+        ['模型', '服务商', '分组 / 账号', '密钥', '推理强度', '输入', '输出', '缓存读取', '费用', '状态', '首字 / 耗时', '时间', ''],
         items.map(item => [
           `<span class="cell-main">${esc(item.model || '-')}</span>${item.error_message ? `<span class="cell-sub err" title="${esc(item.error_message)}">${esc(item.error_message)}</span>` : ''}`,
           providerBadge(item.provider),
           item.group_name || item.account_name
             ? `<span class="badge badge-group">${esc(item.group_name || '未知分组')}</span><span class="cell-sub">${esc(item.account_name || '账号已删除')}</span>`
             : '<span class="cell-dim">-</span>',
-          item.key_name
-            ? `<span class="cell-dim">${esc(item.key_name)}</span>`
+          `${item.key_name ? `<span class="cell-dim">${esc(item.key_name)}</span>` : '<span class="cell-dim">-</span>'}`
+            + (item.user_agent ? `<span class="cell-sub truncate" title="${esc(item.user_agent)}">${esc(item.user_agent)}</span>` : ''),
+          item.reasoning_effort
+            ? `<span class="badge badge-neutral" title="${esc(item.reasoning_effort)}">${esc(effortLabel(item.reasoning_effort))}</span>`
             : '<span class="cell-dim">-</span>',
-          `<span class="cell-main">${fmtTokens(item.total_tokens)}</span>`
-            + `<span class="cell-sub">↑${fmtTokens(item.prompt_tokens)} ↓${fmtTokens(item.completion_tokens)}</span>`,
+          tokenBreakdown(item, 'input'),
+          tokenBreakdown(item, 'output'),
+          tokenBreakdown(item, 'cache'),
           costCell(item),
           httpBadge(item.status),
           `${ttftCell(item.ttft_ms)}<span class="cell-sub">${fmtLatency(item.latency_ms)}</span>`,

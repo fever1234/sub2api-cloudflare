@@ -8,6 +8,7 @@ import { applyOpenCodeHeaders, resolveOpenCodeSessionId } from '../utils/opencod
 import { streamWithRecording } from '../utils/record';
 import { envInt, retryDelayMs, retryBudgetExceeded, sleep } from '../utils/retry';
 import { applyAnthropicCacheBreakpoints } from '../utils/cache-breakpoints';
+import { sanitizeToolSchemas } from '../utils/responses-compat';
 import { defer, Deferrable } from '../utils/background';
 import { getModelFromHeader } from '../utils/headers';
 import { extractTokenUsage, calculateCostBreakdown, estimateTokens, extractReasoningEffort } from '../billing';
@@ -44,7 +45,7 @@ export async function handleClaudeRequest(request: Request, env: Env, failover: 
   const stream = requestBody.stream === true;
   // Claude Code probes the token-count preflight constantly. Rewriting it to
   // /v1/messages (the hardcoded upstream path below) made every call fail —
-  // or worse, generate — so it gets its own endpoint and bookkeeping rules.
+  // or worse, generate —so it gets its own endpoint and bookkeeping rules.
   const isCountTokens = url.pathname.replace(/\/+$/, '').endsWith('/v1/messages/count_tokens');
   // Session→account pin for sticky routing; see gateway.ts.
   const stickyKey = resolveOpenCodeSessionId({ clientHeaders: request.headers, body: requestBody, allowGenerate: false }) || undefined;
@@ -120,7 +121,7 @@ export async function handleClaudeRequest(request: Request, env: Env, failover: 
   const provider = account.provider;
 
   // OpenCode's Anthropic-compatible layer exposes no count_tokens endpoint:
-  // forwarding it only 404s and — worse — feeds the failure into account
+  // forwarding it only 404s and —worse —feeds the failure into account
   // health. The count is answered locally instead, before any upstream work.
   if (isCountTokens && provider === 'opencode_go') {
     return localCountTokensResponse(requestBody);
@@ -132,7 +133,13 @@ export async function handleClaudeRequest(request: Request, env: Env, failover: 
   if (provider === 'anthropic' && (env.CACHE_BREAKPOINTS ?? '1') !== '0') {
     applyAnthropicCacheBreakpoints(requestBody);
   }
-  
+
+  // Proactive tool-schema sanitation before the first attempt: this route
+  // speaks the Anthropic protocol (tools[].input_schema) where Go repairs
+  // root types but never touches `pattern` —lookaround removal stays
+  // OpenAI-only, so the option is omitted here.
+  sanitizeToolSchemas(requestBody);
+
   // Build upstream request
   const credentials = resolveUpstreamCredentials(account);
   const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, provider);
@@ -168,7 +175,7 @@ export async function handleClaudeRequest(request: Request, env: Env, failover: 
 
     // count_tokens is a free advisory preflight, not a generation. Its answer
     // (or a local estimate when the relay lacks the endpoint) passes straight
-    // through: never billed, never written to account health — a relay without
+    // through: never billed, never written to account health —a relay without
     // /count_tokens would otherwise trip the circuit breaker for everyone
     // while Claude Code kept probing it. A real failure surfaces on the very
     // next /v1/messages call, which fails over normally.
@@ -227,7 +234,7 @@ export async function handleClaudeRequest(request: Request, env: Env, failover: 
     }
     
     // The estimation fallback needs the request body; a failed attempt bills nothing.
-    const { promptTokens, completionTokens, totalTokens } = extractTokenUsage(responseBody, proxyResponse.headers, isError ? undefined : requestBody);
+    const { promptTokens, completionTokens, totalTokens, cacheReadTokens } = extractTokenUsage(responseBody, proxyResponse.headers, isError ? undefined : requestBody);
     const breakdown = calculateCostBreakdown(provider, upstreamModel, promptTokens, completionTokens, accountRateMultiplier(account));
     const cost = breakdown.cost;
     
@@ -235,7 +242,7 @@ export async function handleClaudeRequest(request: Request, env: Env, failover: 
     if (cost > 0) {
       defer(ctx, db.incrementApiKeyUsage(keyRecord.id, cost));
     }
-    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cost, base_cost: breakdown.baseCost, rate_multiplier: breakdown.multiplier, cost_estimated: breakdown.estimated ? 1 : 0, cache_status: 'bypass', status: proxyResponse.status, error_message: isError ? responseBody?.error?.message || 'Error' : '', latency_ms: Date.now() - startTime, reasoning_effort: reasoningEffort, user_agent: userAgent }));
+    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cache_read_tokens: cacheReadTokens, cost, base_cost: breakdown.baseCost, rate_multiplier: breakdown.multiplier, cost_estimated: breakdown.estimated ? 1 : 0, cache_status: 'bypass', status: proxyResponse.status, error_message: isError ? responseBody?.error?.message || 'Error' : '', latency_ms: Date.now() - startTime, reasoning_effort: reasoningEffort, user_agent: userAgent }));
     
     // Record request log
     defer(ctx, db.createRequestLog({
@@ -426,7 +433,7 @@ async function handleClaudeFailover(
       if (retryBreakdown.cost > 0) {
         defer(ctx, db.incrementApiKeyUsage(keyRecord.id, retryBreakdown.cost));
       }
-      defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider: currentProvider, prompt_tokens: usage.promptTokens, completion_tokens: usage.completionTokens, total_tokens: usage.totalTokens, cost: retryBreakdown.cost, base_cost: retryBreakdown.baseCost, rate_multiplier: retryBreakdown.multiplier, cost_estimated: retryBreakdown.estimated ? 1 : 0, cache_status: 'bypass', status: proxyResponse.status, error_message: isError ? retryResponseBody?.error?.message || errorMessage : '', latency_ms: Date.now() - originStart, reasoning_effort: reasoningEffort, user_agent: userAgent }));
+      defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider: currentProvider, prompt_tokens: usage.promptTokens, completion_tokens: usage.completionTokens, total_tokens: usage.totalTokens, cache_read_tokens: usage.cacheReadTokens, cost: retryBreakdown.cost, base_cost: retryBreakdown.baseCost, rate_multiplier: retryBreakdown.multiplier, cost_estimated: retryBreakdown.estimated ? 1 : 0, cache_status: 'bypass', status: proxyResponse.status, error_message: isError ? retryResponseBody?.error?.message || errorMessage : '', latency_ms: Date.now() - originStart, reasoning_effort: reasoningEffort, user_agent: userAgent }));
 
       return new Response(responseText, {
         status: proxyResponse.status,
@@ -444,8 +451,8 @@ async function handleClaudeFailover(
     }
   }
   
-  // All retries failed. A preflight still owes the client a number — Claude
-  // Code sizes context against it — so it degrades to a local estimate
+  // All retries failed. A preflight still owes the client a number —Claude
+  // Code sizes context against it —so it degrades to a local estimate
   // instead of an error the client would have to work around.
   if (isCountTokens) {
     let parsed: unknown;

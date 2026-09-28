@@ -95,6 +95,7 @@ CREATE TABLE IF NOT EXISTS usage_records (
   prompt_tokens INTEGER DEFAULT 0,
   completion_tokens INTEGER DEFAULT 0,
   total_tokens INTEGER DEFAULT 0,
+  cache_read_tokens INTEGER DEFAULT 0,
   cost REAL DEFAULT 0,
   base_cost REAL DEFAULT 0,
   rate_multiplier REAL DEFAULT 1,

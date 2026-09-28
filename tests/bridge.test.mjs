@@ -381,7 +381,7 @@ check('response.failed never fabricates finish_reason stop',
 // Relays reject valid Responses bodies for fields their schema does not model;
 // the gateway drops exactly the named field and re-sends, bounded by a shared
 // per-request budget (Go: openai_responses_rejected_field_retry.go).
-const { stripRejectedResponseFields, createStripRetryState, sendWithRejectedFieldRetry } = compat
+const { stripRejectedResponseFields, createStripRetryState, sendWithRejectedFieldRetry, sanitizeToolSchemas } = compat
 const stripJson = (obj) => JSON.stringify(obj)
 const stripErr = (error) => JSON.stringify({ error })
 
@@ -756,6 +756,112 @@ check('denied model is a 404 with Go wording',
     && deniedBody.error.code === 'model_not_found'
     && deniedBody.error.message === 'Model "gpt-4o-turbo" does not exist or is not available for this group',
   denied)
+
+// ---- proactive tool-schema sanitation (pre-send) --------------------------
+// Go runs the pass on the forward paths before the first attempt
+// (openai_responses_tool_schema.go): repairs are in-place, the union walk is
+// strict (only an explicit type:object or a nested object-only union proves
+// objectness), and lookaround regexes never reach an OpenAI upstream.
+
+let san = { tools: [{ type: 'function', name: 'f', parameters: { type: null, properties: {} } }] }
+check('proactive: null root type repaired',
+  sanitizeToolSchemas(san) && san.tools[0].parameters.type === 'object')
+
+san = { tools: [{ type: 'function', name: 'f', parameters: { anyOf: [{ type: 'object', properties: { a: {} } }, { type: 'object' }] } }] }
+check('proactive: object-only union gets a root type',
+  sanitizeToolSchemas(san) && san.tools[0].parameters.type === 'object')
+
+san = { tools: [{ parameters: { oneOf: [{ oneOf: [{ type: 'object' }] }, { type: 'object' }] } }] }
+check('proactive: nested object-only union counts',
+  sanitizeToolSchemas(san) && san.tools[0].parameters.type === 'object')
+
+san = { tools: [{ parameters: { anyOf: [{ type: 'object' }, { type: 'string' }] } }] }
+check('proactive: mixed union is left alone',
+  !sanitizeToolSchemas(san) && san.tools[0].parameters.type === undefined)
+
+san = { tools: [{ parameters: { anyOf: [{ properties: { a: {} } }, { type: 'object' }] } }] }
+check('proactive: typeless member does not prove objectness',
+  !sanitizeToolSchemas(san) && san.tools[0].parameters.type === undefined)
+
+san = { tools: [{ parameters: { type: 'object', required: null } }] }
+check('proactive: required:null is dropped',
+  sanitizeToolSchemas(san) && !('required' in san.tools[0].parameters))
+
+san = { tools: [{ name: 'f', input_schema: { type: null, properties: {} } }] }
+check('proactive: anthropic input_schema root repaired',
+  sanitizeToolSchemas(san) && san.tools[0].input_schema.type === 'object')
+
+san = { tools: [{ type: 'function', function: { name: 'f', parameters: { type: null } } }] }
+check('proactive: chat function.parameters repaired',
+  sanitizeToolSchemas(san) && san.tools[0].function.parameters.type === 'object')
+
+san = { input: [{ type: 'function_call', tools: [{ parameters: { type: null } }] }] }
+check('proactive: tools embedded in input items repaired',
+  sanitizeToolSchemas(san) && san.input[0].tools[0].parameters.type === 'object')
+
+san = { tools: [{ parameters: { type: 'object', properties: { x: { type: 'string', pattern: '(?=.*a)' } } } }] }
+check('proactive: lookaround pattern removed',
+  sanitizeToolSchemas(san, { removeLookaround: true })
+    && san.tools[0].parameters.properties.x.pattern === undefined)
+
+san = { tools: [{ parameters: { type: 'object', properties: { x: { pattern: '(?!x)' }, y: { pattern: '(?<=a)b' }, z: { pattern: '(?<!a)b' } } } }] }
+sanitizeToolSchemas(san, { removeLookaround: true })
+check('proactive: lookahead/behind variants removed',
+  san.tools[0].parameters.properties.x.pattern === undefined
+    && san.tools[0].parameters.properties.y.pattern === undefined
+    && san.tools[0].parameters.properties.z.pattern === undefined)
+
+san = { tools: [{ parameters: { type: 'object', properties: { x: { pattern: '^foo(?:bar)?$' }, n: { pattern: '(?<name>\\d+)' } } } }] }
+sanitizeToolSchemas(san, { removeLookaround: true })
+check('proactive: ordinary patterns kept',
+  san.tools[0].parameters.properties.x.pattern === '^foo(?:bar)?$'
+    && san.tools[0].parameters.properties.n.pattern === '(?<name>\\d+)')
+
+san = { tools: [{ parameters: { type: 'object', examples: ['(?=x)'], properties: { x: { pattern: '(?=y)' } } } }] }
+sanitizeToolSchemas(san, { removeLookaround: true })
+check('proactive: instance values are not descended',
+  san.tools[0].parameters.examples[0] === '(?=x)'
+    && san.tools[0].parameters.properties.x.pattern === undefined)
+
+san = { tools: [{ parameters: { type: 'object', properties: { x: { pattern: '(?=a)' } } } }] }
+check('proactive: lookaround removal is opt-in',
+  !sanitizeToolSchemas(san) && san.tools[0].parameters.properties.x.pattern === '(?=a)')
+
+san = { model: 'gpt-5', tools: [{ parameters: { type: 'object', properties: { a: { type: 'string' } } } }] }
+check('proactive: valid schema reports no change', !sanitizeToolSchemas(san))
+
+san = { tools: [{ parameters: { type: null } }] }
+sanitizeToolSchemas(san)
+check('proactive: repair is idempotent', !sanitizeToolSchemas(san))
+
+check('proactive: null body is a no-op', sanitizeToolSchemas(null) === false)
+check('proactive: string body is a no-op', sanitizeToolSchemas('{}') === false)
+
+let deepProps = {}
+let deepCursor = deepProps
+for (let i = 0; i < 400; i++) {
+  deepCursor.n = { type: 'object', properties: {} }
+  deepCursor = deepCursor.n.properties
+}
+deepCursor.x = { pattern: '(?=deep)' }
+san = { tools: [{ parameters: { type: 'object', properties: deepProps } }] }
+let deepThrew = null
+try { sanitizeToolSchemas(san, { removeLookaround: true }) } catch (error) { deepThrew = error }
+check('proactive: deep schema does not throw', deepThrew === null, deepThrew ? deepThrew.message : '')
+
+// The reactive 400 repair shares the same walk, so its union verdicts match.
+strip = stripRejectedResponseFields(
+  stripErr({ message: 'invalid function parameters for tools[0].parameters: got type: none', code: 'invalid_function_parameters', param: 'tools[0].parameters' }),
+  stripJson({ model: 'gpt-5', tools: [{ type: 'function', name: 'f', parameters: { anyOf: [{ type: 'object' }, { type: 'object' }] } }] })
+)
+check('reactive: object-only union is repaired',
+  !!strip && JSON.parse(strip.body).tools[0].parameters.type === 'object')
+
+strip = stripRejectedResponseFields(
+  stripErr({ message: 'invalid function parameters for tools[0].parameters: got type: none', code: 'invalid_function_parameters', param: 'tools[0].parameters' }),
+  stripJson({ model: 'gpt-5', tools: [{ type: 'function', name: 'f', parameters: { anyOf: [{ type: 'string' }, { type: 'object' }] } }] })
+)
+check('reactive: mixed union refuses to repair', strip === null)
 
 console.log(`\n${pass} passed, ${failures.length} failed`)
 if (failures.length > 0) {

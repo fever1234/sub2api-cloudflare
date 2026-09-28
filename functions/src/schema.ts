@@ -17,7 +17,7 @@
  * exception". The version is recorded in `settings` once the work succeeds, and
  * later requests spend a single cheap read confirming there is nothing to do.
  */
-export const SCHEMA_VERSION = '12';
+export const SCHEMA_VERSION = '13';
 
 /**
  * The accounts table DDL.
@@ -114,6 +114,7 @@ export const SCHEMA_STATEMENTS: string[] = [
     prompt_tokens INTEGER DEFAULT 0,
     completion_tokens INTEGER DEFAULT 0,
     total_tokens INTEGER DEFAULT 0,
+    cache_read_tokens INTEGER DEFAULT 0,
     cost REAL DEFAULT 0,
     base_cost REAL DEFAULT 0,
     rate_multiplier REAL DEFAULT 1,
@@ -224,6 +225,12 @@ export const ADDITIVE_COLUMNS: Array<{ table: string; column: string; definition
   // answer when investigating an unexpected bill or a misbehaving integration.
   { table: 'usage_records', column: 'reasoning_effort', definition: 'TEXT' },
   { table: 'usage_records', column: 'user_agent', definition: 'TEXT' },
+
+  // Token composition. `prompt_tokens` now records *net* input — the part that
+  // did not come from cache — and this column carries the cache-read half, so
+  // the two never overlap regardless of how the upstream spells its usage
+  // (OpenAI folds cached tokens into prompt_tokens; Anthropic excludes them).
+  { table: 'usage_records', column: 'cache_read_tokens', definition: 'INTEGER DEFAULT 0' },
 
   // Per-group model allowlist (Go: group_model_allowlist). The list is JSON
   // text so entries can carry trailing `*` wildcards; the enabled flag keeps

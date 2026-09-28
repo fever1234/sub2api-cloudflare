@@ -198,6 +198,32 @@ check("login with new password", st == 200 and js.get("token"), (st, js))
 st, js = call("POST", "/v1/chat/completions", {"model": "gpt-4o", "messages": []})
 check("gateway rejects missing key", st == 401, (st, js))
 
+# --- login throttle (failure-only counter in CONFIG_KV) ---
+# Five wrong passwords buy a 60-second 429; the short-circuit happens before
+# credential verification, so even the correct password is refused while the
+# window is hot. Appended last because the lockout is deliberately untestable
+# in reverse: nothing after it may depend on logging in.
+for attempt in range(5):
+    st, js = call("POST", "/api/v1/auth/login",
+                  {"username": "admin", "password": "definitely-wrong-%d" % attempt})
+check("wrong passwords are counted with a 401", st == 401, (st, js))
+
+req = urllib.request.Request(
+    BASE + "/api/v1/auth/login",
+    data=json.dumps({"username": "admin", "password": "definitely-wrong"}).encode("utf-8"),
+    headers={"Content-Type": "application/json"}, method="POST")
+try:
+    with urllib.request.urlopen(req, timeout=25) as resp:
+        st, retry_after = resp.status, resp.headers.get("Retry-After")
+except urllib.error.HTTPError as err:
+    st, retry_after = err.code, err.headers.get("Retry-After")
+check("sixth attempt is throttled with 429", st == 429, st)
+check("throttle advertises Retry-After", retry_after is not None, retry_after)
+
+st, js = call("POST", "/api/v1/auth/login",
+              {"username": "admin", "password": "AnotherPass456"})
+check("lockout short-circuits even the correct password", st == 429, (st, js))
+
 passed = sum(1 for _, ok, _ in results if ok)
 print("\nPASSED %d / %d" % (passed, len(results)))
 if passed != len(results):

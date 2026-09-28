@@ -332,6 +332,8 @@ export interface StreamOutcome {
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
+  /** Cache-read tokens observed in the usage frame, kept out of `promptTokens`. */
+  cacheReadTokens: number;
 }
 
 /**
@@ -367,7 +369,7 @@ export function measureStreamTiming(
   let ttftMs: number | null = null;
   let settled = false;
   let tail = '';
-  const usage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+  const usage = { promptTokens: 0, completionTokens: 0, anthropicCache: 0, openaiCache: 0 };
   const decoder = new TextDecoder();
 
   // Enough to hold a usage frame that straddles a chunk boundary, small enough
@@ -377,10 +379,15 @@ export function measureStreamTiming(
   const scan = (text: string) => {
     tail = (tail + text).slice(-TAIL_LIMIT);
     // Match both OpenAI (prompt_tokens/completion_tokens) and Anthropic
-    // (input_tokens/output_tokens) spellings wherever they appear.
+    // (input_tokens/output_tokens) spellings wherever they appear, plus the two
+    // cache-read spellings. Anthropic excludes its cache reads from
+    // input_tokens; OpenAI includes its cached_tokens in prompt_tokens — the
+    // finish handler subtracts only the OpenAI figure so net input means the
+    // same thing on either protocol.
     const prompt = /"(?:prompt_tokens|input_tokens)"\s*:\s*(\d+)/g;
     const completion = /"(?:completion_tokens|output_tokens)"\s*:\s*(\d+)/g;
-    const total = /"total_tokens"\s*:\s*(\d+)/g;
+    const anthropicCache = /"cache_read_input_tokens"\s*:\s*(\d+)/g;
+    const openaiCache = /"cached_tokens"\s*:\s*(\d+)/g;
     for (let m = prompt.exec(tail); m; m = prompt.exec(tail)) {
       usage.promptTokens = Math.max(usage.promptTokens, Number(m[1]) || 0);
     }
@@ -388,8 +395,11 @@ export function measureStreamTiming(
       // Anthropic emits a running output count, so the largest seen wins.
       usage.completionTokens = Math.max(usage.completionTokens, Number(m[1]) || 0);
     }
-    for (let m = total.exec(tail); m; m = total.exec(tail)) {
-      usage.totalTokens = Math.max(usage.totalTokens, Number(m[1]) || 0);
+    for (let m = anthropicCache.exec(tail); m; m = anthropicCache.exec(tail)) {
+      usage.anthropicCache = Math.max(usage.anthropicCache, Number(m[1]) || 0);
+    }
+    for (let m = openaiCache.exec(tail); m; m = openaiCache.exec(tail)) {
+      usage.openaiCache = Math.max(usage.openaiCache, Number(m[1]) || 0);
     }
   };
 
@@ -397,12 +407,15 @@ export function measureStreamTiming(
     if (settled) return;
     settled = true;
     try {
+      const cacheReadTokens = usage.anthropicCache || usage.openaiCache;
+      const promptTokens = Math.max(0, usage.promptTokens - usage.openaiCache);
       onDone({
         ttftMs,
         totalMs: Date.now() - startedAt,
-        promptTokens: usage.promptTokens,
+        promptTokens,
         completionTokens: usage.completionTokens,
-        totalTokens: usage.totalTokens || usage.promptTokens + usage.completionTokens
+        cacheReadTokens,
+        totalTokens: promptTokens + cacheReadTokens + usage.completionTokens
       });
     } catch {
       // Never let logging break the response the client is reading.

@@ -1,5 +1,5 @@
 // functions/src/schema.ts
-var SCHEMA_VERSION = "12";
+var SCHEMA_VERSION = "13";
 var ACCOUNTS_TABLE_DDL = `CREATE TABLE IF NOT EXISTS accounts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
@@ -86,6 +86,7 @@ var SCHEMA_STATEMENTS = [
     prompt_tokens INTEGER DEFAULT 0,
     completion_tokens INTEGER DEFAULT 0,
     total_tokens INTEGER DEFAULT 0,
+    cache_read_tokens INTEGER DEFAULT 0,
     cost REAL DEFAULT 0,
     base_cost REAL DEFAULT 0,
     rate_multiplier REAL DEFAULT 1,
@@ -178,6 +179,11 @@ var ADDITIVE_COLUMNS = [
   // answer when investigating an unexpected bill or a misbehaving integration.
   { table: "usage_records", column: "reasoning_effort", definition: "TEXT" },
   { table: "usage_records", column: "user_agent", definition: "TEXT" },
+  // Token composition. `prompt_tokens` now records *net* input — the part that
+  // did not come from cache — and this column carries the cache-read half, so
+  // the two never overlap regardless of how the upstream spells its usage
+  // (OpenAI folds cached tokens into prompt_tokens; Anthropic excludes them).
+  { table: "usage_records", column: "cache_read_tokens", definition: "INTEGER DEFAULT 0" },
   // Per-group model allowlist (Go: group_model_allowlist). The list is JSON
   // text so entries can carry trailing `*` wildcards; the enabled flag keeps
   // an emptied list visible instead of silently repurposing it.
@@ -578,8 +584,8 @@ var Database = class {
   async createUsageRecord(record) {
     return this.insert(
       `INSERT INTO usage_records
-       (api_key_id, model, provider, prompt_tokens, completion_tokens, total_tokens, cost, base_cost, rate_multiplier, cost_estimated, cache_status, status, error_message, latency_ms, ttft_ms, group_id, account_id, reasoning_effort, user_agent)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (api_key_id, model, provider, prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, cost, base_cost, rate_multiplier, cost_estimated, cache_status, status, error_message, latency_ms, ttft_ms, group_id, account_id, reasoning_effort, user_agent)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         record.api_key_id ?? 0,
         record.model,
@@ -587,6 +593,7 @@ var Database = class {
         record.prompt_tokens ?? 0,
         record.completion_tokens ?? 0,
         record.total_tokens ?? 0,
+        record.cache_read_tokens ?? 0,
         record.cost ?? 0,
         record.base_cost ?? record.cost ?? 0,
         record.rate_multiplier ?? 1,
@@ -691,6 +698,7 @@ var Database = class {
           SUM(CASE WHEN status < 400 THEN 1 ELSE 0 END) AS success_requests,
           COALESCE(SUM(total_tokens), 0) AS total_tokens,
           COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+          COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
           COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
           COALESCE(SUM(cost), 0) AS total_cost,
           COALESCE(SUM(base_cost), 0) AS base_cost,
@@ -727,6 +735,7 @@ var Database = class {
           COUNT(*) AS requests,
           SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END) AS errors,
           COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+          COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
           COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
           COALESCE(SUM(cost), 0) AS cost
         FROM usage_records WHERE created_at >= ?
@@ -964,12 +973,6 @@ var Database = class {
       "SELECT COUNT(*) AS total FROM sqlite_master WHERE type = 'table' AND name IN ('users','groups','accounts','model_mappings','api_keys','usage_records','request_logs')"
     );
     return Number(row?.total || 0) >= 7;
-  }
-  // Cleanup old logs
-  async cleanupOldLogs(days = 7) {
-    const cutoff = sqliteTimestamp(Date.now() - days * 24 * 60 * 60 * 1e3);
-    await this.exec(`DELETE FROM request_logs WHERE created_at < '${cutoff}'`);
-    await this.exec(`DELETE FROM usage_records WHERE created_at < '${cutoff}'`);
   }
 };
 function sqliteTimestamp(timestamp) {
@@ -1377,34 +1380,41 @@ function measureStreamTiming(body, startedAt, onDone, guard, keepalive = false) 
   let ttftMs = null;
   let settled = false;
   let tail = "";
-  const usage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+  const usage = { promptTokens: 0, completionTokens: 0, anthropicCache: 0, openaiCache: 0 };
   const decoder = new TextDecoder();
   const TAIL_LIMIT = 4096;
   const scan = (text) => {
     tail = (tail + text).slice(-TAIL_LIMIT);
     const prompt = /"(?:prompt_tokens|input_tokens)"\s*:\s*(\d+)/g;
     const completion = /"(?:completion_tokens|output_tokens)"\s*:\s*(\d+)/g;
-    const total = /"total_tokens"\s*:\s*(\d+)/g;
+    const anthropicCache = /"cache_read_input_tokens"\s*:\s*(\d+)/g;
+    const openaiCache = /"cached_tokens"\s*:\s*(\d+)/g;
     for (let m = prompt.exec(tail); m; m = prompt.exec(tail)) {
       usage.promptTokens = Math.max(usage.promptTokens, Number(m[1]) || 0);
     }
     for (let m = completion.exec(tail); m; m = completion.exec(tail)) {
       usage.completionTokens = Math.max(usage.completionTokens, Number(m[1]) || 0);
     }
-    for (let m = total.exec(tail); m; m = total.exec(tail)) {
-      usage.totalTokens = Math.max(usage.totalTokens, Number(m[1]) || 0);
+    for (let m = anthropicCache.exec(tail); m; m = anthropicCache.exec(tail)) {
+      usage.anthropicCache = Math.max(usage.anthropicCache, Number(m[1]) || 0);
+    }
+    for (let m = openaiCache.exec(tail); m; m = openaiCache.exec(tail)) {
+      usage.openaiCache = Math.max(usage.openaiCache, Number(m[1]) || 0);
     }
   };
   const finish = () => {
     if (settled) return;
     settled = true;
     try {
+      const cacheReadTokens = usage.anthropicCache || usage.openaiCache;
+      const promptTokens = Math.max(0, usage.promptTokens - usage.openaiCache);
       onDone({
         ttftMs,
         totalMs: Date.now() - startedAt,
-        promptTokens: usage.promptTokens,
+        promptTokens,
         completionTokens: usage.completionTokens,
-        totalTokens: usage.totalTokens || usage.promptTokens + usage.completionTokens
+        cacheReadTokens,
+        totalTokens: promptTokens + cacheReadTokens + usage.completionTokens
       });
     } catch {
     }
@@ -2780,17 +2790,20 @@ function extractErrorFields(errorBodyText) {
   }
   return { code, message, param };
 }
-function repairToolParameterRootTypes(body) {
+function collectRootSchemas(body) {
   const candidates = [];
+  const push = (value) => {
+    const record = asRecord(value);
+    if (record) candidates.push(record);
+  };
   const collectTools = (tools) => {
     if (!Array.isArray(tools)) return;
     for (const tool of tools) {
       const record = asRecord(tool);
       if (!record) continue;
-      const direct = asRecord(record.parameters);
-      if (direct) candidates.push(direct);
-      const nested = asRecord(asRecord(record.function)?.parameters);
-      if (nested) candidates.push(nested);
+      push(record.parameters);
+      push(record.input_schema);
+      push(asRecord(record.function)?.parameters);
     }
   };
   collectTools(body?.tools);
@@ -2798,36 +2811,94 @@ function repairToolParameterRootTypes(body) {
     for (const item of body.input) {
       const record = asRecord(item);
       if (!record) continue;
-      const direct = asRecord(record.parameters);
-      if (direct) candidates.push(direct);
+      push(record.parameters);
       collectTools(record.tools);
     }
   }
-  let changed = false;
-  for (const params of candidates) {
-    const hasType = Object.prototype.hasOwnProperty.call(params, "type");
-    if (!hasType || params.type === null) {
-      if (hasType) {
-        params.type = "object";
-        changed = true;
-      } else {
-        const union = Array.isArray(params.anyOf) ? params.anyOf : Array.isArray(params.oneOf) ? params.oneOf : void 0;
-        const objectOnly = !!union && union.length > 0 && union.every((member) => {
-          const record = asRecord(member);
-          return !!record && (record.type === void 0 || record.type === null || record.type === "object");
-        });
-        if (objectOnly) {
-          params.type = "object";
-          changed = true;
-        }
-      }
-    }
-    if ("required" in params && params.required === null) {
-      delete params.required;
-      changed = true;
+  return candidates;
+}
+var MAX_UNION_DEPTH = 32;
+function isObjectOnlySchema(value, depth) {
+  const record = asRecord(value);
+  if (!record) return false;
+  if (record.type === "object") return true;
+  if (record.type !== void 0 && record.type !== null) return false;
+  if (depth >= MAX_UNION_DEPTH) return false;
+  for (const key of ["anyOf", "oneOf"]) {
+    const union = record[key];
+    if (Array.isArray(union) && union.length > 0 && union.every((member) => isObjectOnlySchema(member, depth + 1))) {
+      return true;
     }
   }
+  return false;
+}
+function repairRootSchema(params) {
+  let changed = false;
+  const hasType = Object.prototype.hasOwnProperty.call(params, "type");
+  if (hasType && params.type === null) {
+    params.type = "object";
+    changed = true;
+  } else if (!hasType && isObjectOnlySchema(params, 0)) {
+    params.type = "object";
+    changed = true;
+  }
+  if ("required" in params && params.required === null) {
+    delete params.required;
+    changed = true;
+  }
   return changed;
+}
+function repairToolParameterRootTypes(body) {
+  let changed = false;
+  for (const root of collectRootSchemas(body)) changed = repairRootSchema(root) || changed;
+  return changed;
+}
+var RE_LOOKAROUND = /\(\?(?:=|!|<=|<!)/;
+var SCHEMA_MAP_KEYS = ["properties", "patternProperties", "$defs", "definitions", "dependentSchemas"];
+var SCHEMA_VALUE_KEYS = ["items", "additionalProperties", "additionalItems", "unevaluatedProperties", "unevaluatedItems", "not", "if", "then", "else", "contains", "contentSchema"];
+var SCHEMA_ARRAY_KEYS = ["anyOf", "oneOf", "allOf", "prefixItems"];
+var MAX_SCHEMA_DEPTH = 128;
+function removeLookaroundPatterns(node, depth) {
+  if (depth > MAX_SCHEMA_DEPTH) return false;
+  if (Array.isArray(node)) {
+    let changed2 = false;
+    for (const item of node) changed2 = removeLookaroundPatterns(item, depth + 1) || changed2;
+    return changed2;
+  }
+  const record = asRecord(node);
+  if (!record) return false;
+  let changed = false;
+  if (typeof record.pattern === "string" && RE_LOOKAROUND.test(record.pattern)) {
+    delete record.pattern;
+    changed = true;
+  }
+  for (const key of SCHEMA_MAP_KEYS) {
+    const map = asRecord(record[key]);
+    if (!map) continue;
+    for (const value of Object.values(map)) changed = removeLookaroundPatterns(value, depth + 1) || changed;
+  }
+  for (const key of SCHEMA_VALUE_KEYS) {
+    if (key in record) changed = removeLookaroundPatterns(record[key], depth + 1) || changed;
+  }
+  for (const key of SCHEMA_ARRAY_KEYS) {
+    const list = record[key];
+    if (!Array.isArray(list)) continue;
+    for (const item of list) changed = removeLookaroundPatterns(item, depth + 1) || changed;
+  }
+  return changed;
+}
+function sanitizeToolSchemas(body, options = {}) {
+  try {
+    if (!asRecord(body)) return false;
+    let changed = false;
+    for (const root of collectRootSchemas(body)) {
+      changed = repairRootSchema(root) || changed;
+      if (options.removeLookaround) changed = removeLookaroundPatterns(root, 0) || changed;
+    }
+    return changed;
+  } catch {
+    return false;
+  }
 }
 function stripRejectedResponseFields(errorBodyText, sentBody) {
   if (!errorBodyText || !sentBody) return null;
@@ -3302,22 +3373,26 @@ function estimateTokens(text) {
 function extractTokenUsage(body, headers, request) {
   let promptTokens = 0;
   let completionTokens = 0;
-  let totalTokens = 0;
+  let cacheReadTokens = 0;
   if (body?.usage) {
-    promptTokens = body.usage.prompt_tokens || body.usage.input_tokens || 0;
-    completionTokens = body.usage.completion_tokens || body.usage.output_tokens || 0;
-    totalTokens = body.usage.total_tokens || promptTokens + completionTokens;
+    const usage = body.usage;
+    const anthropicCache = Number(usage.cache_read_input_tokens) || 0;
+    const openaiCache = Number(usage.prompt_tokens_details?.cached_tokens) || Number(usage.input_tokens_details?.cached_tokens) || 0;
+    cacheReadTokens = anthropicCache || openaiCache;
+    const rawPrompt = Number(usage.prompt_tokens ?? usage.input_tokens) || 0;
+    promptTokens = Math.max(0, rawPrompt - openaiCache);
+    completionTokens = Number(usage.completion_tokens ?? usage.output_tokens) || 0;
   }
-  if (totalTokens === 0 && request !== void 0) {
+  if (promptTokens + completionTokens + cacheReadTokens === 0 && request !== void 0) {
     const inputSource = request?.messages ?? request?.input ?? request?.content ?? "";
     const inputText = typeof inputSource === "string" ? inputSource : JSON.stringify(inputSource);
     const outputSource = body?.choices?.[0]?.message?.content ?? body?.output ?? body?.content ?? "";
     const outputText = typeof outputSource === "string" ? outputSource : JSON.stringify(outputSource);
     promptTokens = estimateTokens(inputText);
     completionTokens = estimateTokens(outputText);
-    totalTokens = promptTokens + completionTokens;
   }
-  return { promptTokens, completionTokens, totalTokens };
+  const totalTokens = promptTokens + cacheReadTokens + completionTokens;
+  return { promptTokens, completionTokens, totalTokens, cacheReadTokens };
 }
 function extractReasoningEffort(body) {
   if (!body || typeof body !== "object") return null;
@@ -3375,7 +3450,7 @@ async function streamWithRecording(body, status, headers, context) {
   let timer;
   const timeout = new Promise((resolve) => {
     timer = setTimeout(
-      () => resolve({ promptTokens: 0, completionTokens: 0, totalTokens: 0, ttftMs: null, totalMs: Date.now() - context.startedAt }),
+      () => resolve({ promptTokens: 0, completionTokens: 0, totalTokens: 0, cacheReadTokens: 0, ttftMs: null, totalMs: Date.now() - context.startedAt }),
       STREAM_RECORD_TIMEOUT_MS
     );
   });
@@ -3405,6 +3480,7 @@ async function streamWithRecording(body, status, headers, context) {
       prompt_tokens: outcome.promptTokens,
       completion_tokens: outcome.completionTokens,
       total_tokens: outcome.totalTokens,
+      cache_read_tokens: outcome.cacheReadTokens ?? 0,
       cost,
       base_cost: breakdown.baseCost,
       rate_multiplier: breakdown.multiplier,
@@ -3637,6 +3713,7 @@ async function handleGatewayRequest(request, env, failover, ctx) {
       upstreamPath = "/v1/chat/completions";
     }
   }
+  const toolSchemaFixed = sanitizeToolSchemas(requestBody, { removeLookaround: provider === "openai" });
   let bridgedBody;
   if (provider === "opencode_go" && request.method !== "GET" && request.method !== "HEAD" && !upstreamPath.includes("/responses") && !upstreamPath.includes("/v1/messages") && openCodeGoModelProtocol(upstreamModel) === "responses") {
     if (upstreamModel && upstreamModel !== model && requestBody.model) {
@@ -3667,7 +3744,7 @@ async function handleGatewayRequest(request, env, failover, ctx) {
   if (upstreamModel && upstreamModel !== model && requestBody.model) {
     requestBody.model = upstreamModel;
   }
-  const chatBody = request.method === "GET" || request.method === "HEAD" ? void 0 : upstreamModel !== model || cacheInjected || usageInjected ? JSON.stringify(requestBody) : body;
+  const chatBody = request.method === "GET" || request.method === "HEAD" ? void 0 : upstreamModel !== model || cacheInjected || usageInjected || toolSchemaFixed ? JSON.stringify(requestBody) : body;
   const upstreamBody = bridgedBody !== void 0 ? bridgedBody : chatBody;
   const startTime = Date.now();
   let isError = false;
@@ -3753,13 +3830,13 @@ async function handleGatewayRequest(request, env, failover, ctx) {
       } catch {
       }
     }
-    const { promptTokens, completionTokens, totalTokens } = extractTokenUsage(responseBody, proxyResponse.headers, isError ? void 0 : requestBody);
+    const { promptTokens, completionTokens, totalTokens, cacheReadTokens } = extractTokenUsage(responseBody, proxyResponse.headers, isError ? void 0 : requestBody);
     const breakdown = calculateCostBreakdown(provider, upstreamModel, promptTokens, completionTokens, accountRateMultiplier(account));
     const cost = breakdown.cost;
     if (cost > 0) {
       defer(ctx, db.incrementApiKeyUsage(keyRecord.id, cost));
     }
-    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cost, base_cost: breakdown.baseCost, rate_multiplier: breakdown.multiplier, cost_estimated: breakdown.estimated ? 1 : 0, cache_status: "bypass", status: responseStatus, error_message: isError ? responseBody?.error?.message || "Error" : "", latency_ms: Date.now() - startTime, reasoning_effort: reasoningEffort, user_agent: userAgent }));
+    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cache_read_tokens: cacheReadTokens, cost, base_cost: breakdown.baseCost, rate_multiplier: breakdown.multiplier, cost_estimated: breakdown.estimated ? 1 : 0, cache_status: "bypass", status: responseStatus, error_message: isError ? responseBody?.error?.message || "Error" : "", latency_ms: Date.now() - startTime, reasoning_effort: reasoningEffort, user_agent: userAgent }));
     defer(ctx, db.createRequestLog({
       account_id: account.id,
       group_id: group.id,
@@ -3932,7 +4009,7 @@ async function handleFailover(body, request, env, failover, keyRecord, accounts,
       if (retryBreakdown.cost > 0) {
         defer(ctx, db.incrementApiKeyUsage(keyRecord.id, retryBreakdown.cost));
       }
-      defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: usage.promptTokens, completion_tokens: usage.completionTokens, total_tokens: usage.totalTokens, cost: retryBreakdown.cost, base_cost: retryBreakdown.baseCost, rate_multiplier: retryBreakdown.multiplier, cost_estimated: retryBreakdown.estimated ? 1 : 0, cache_status: "bypass", status: finalStatus, error_message: finalError ? retryResponseBody?.error?.message || errorMessage : "", latency_ms: Date.now() - originStart, reasoning_effort: reasoningEffort, user_agent: userAgent }));
+      defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: usage.promptTokens, completion_tokens: usage.completionTokens, total_tokens: usage.totalTokens, cache_read_tokens: usage.cacheReadTokens, cost: retryBreakdown.cost, base_cost: retryBreakdown.baseCost, rate_multiplier: retryBreakdown.multiplier, cost_estimated: retryBreakdown.estimated ? 1 : 0, cache_status: "bypass", status: finalStatus, error_message: finalError ? retryResponseBody?.error?.message || errorMessage : "", latency_ms: Date.now() - originStart, reasoning_effort: reasoningEffort, user_agent: userAgent }));
       return new Response(responseText, {
         status: finalStatus,
         headers: {
@@ -4049,6 +4126,7 @@ async function handleOpenAIRequest(request, env, failover, ctx) {
   }
   const { account, group } = selection;
   const provider = account.provider;
+  sanitizeToolSchemas(requestBody, { removeLookaround: provider === "openai" });
   let bridged = false;
   let outboundBody = requestBody;
   if (!isResponses && provider === "opencode_go" && openCodeGoModelProtocol(upstreamModel) === "responses") {
@@ -4154,13 +4232,13 @@ async function handleOpenAIRequest(request, env, failover, ctx) {
       }
     }
     const finalError = finalStatus >= 400;
-    const { promptTokens, completionTokens, totalTokens } = extractTokenUsage(responseBody, proxyResponse.headers, finalError ? void 0 : requestBody);
+    const { promptTokens, completionTokens, totalTokens, cacheReadTokens } = extractTokenUsage(responseBody, proxyResponse.headers, finalError ? void 0 : requestBody);
     const breakdown = calculateCostBreakdown(provider, upstreamModel, promptTokens, completionTokens, accountRateMultiplier(account));
     const cost = breakdown.cost;
     if (cost > 0) {
       defer(ctx, db.incrementApiKeyUsage(keyRecord.id, cost));
     }
-    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cost, base_cost: breakdown.baseCost, rate_multiplier: breakdown.multiplier, cost_estimated: breakdown.estimated ? 1 : 0, cache_status: "bypass", status: finalStatus, error_message: finalError ? responseBody?.error?.message || "Error" : "", latency_ms: Date.now() - startTime, reasoning_effort: reasoningEffort, user_agent: userAgent }));
+    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cache_read_tokens: cacheReadTokens, cost, base_cost: breakdown.baseCost, rate_multiplier: breakdown.multiplier, cost_estimated: breakdown.estimated ? 1 : 0, cache_status: "bypass", status: finalStatus, error_message: finalError ? responseBody?.error?.message || "Error" : "", latency_ms: Date.now() - startTime, reasoning_effort: reasoningEffort, user_agent: userAgent }));
     defer(ctx, db.createRequestLog({
       account_id: account.id,
       group_id: group.id,
@@ -4326,7 +4404,7 @@ async function handleFailover2(body, request, env, failover, keyRecord, accounts
       if (retryBreakdown.cost > 0) {
         defer(ctx, db.incrementApiKeyUsage(keyRecord.id, retryBreakdown.cost));
       }
-      defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider: currentProvider, prompt_tokens: usage.promptTokens, completion_tokens: usage.completionTokens, total_tokens: usage.totalTokens, cost: retryBreakdown.cost, base_cost: retryBreakdown.baseCost, rate_multiplier: retryBreakdown.multiplier, cost_estimated: retryBreakdown.estimated ? 1 : 0, cache_status: "bypass", status: finalStatus, error_message: finalError ? retryResponseBody?.error?.message || errorMessage : "", latency_ms: Date.now() - originStart, reasoning_effort: reasoningEffort, user_agent: userAgent }));
+      defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider: currentProvider, prompt_tokens: usage.promptTokens, completion_tokens: usage.completionTokens, total_tokens: usage.totalTokens, cache_read_tokens: usage.cacheReadTokens, cost: retryBreakdown.cost, base_cost: retryBreakdown.baseCost, rate_multiplier: retryBreakdown.multiplier, cost_estimated: retryBreakdown.estimated ? 1 : 0, cache_status: "bypass", status: finalStatus, error_message: finalError ? retryResponseBody?.error?.message || errorMessage : "", latency_ms: Date.now() - originStart, reasoning_effort: reasoningEffort, user_agent: userAgent }));
       return new Response(responseText, {
         status: finalStatus,
         headers: {
@@ -4420,6 +4498,7 @@ async function handleClaudeRequest(request, env, failover, ctx) {
   if (provider === "anthropic" && (env.CACHE_BREAKPOINTS ?? "1") !== "0") {
     applyAnthropicCacheBreakpoints(requestBody);
   }
+  sanitizeToolSchemas(requestBody);
   const credentials = resolveUpstreamCredentials(account);
   const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, provider);
   const upstreamPath = isCountTokens ? "/v1/messages/count_tokens" : "/v1/messages";
@@ -4493,13 +4572,13 @@ async function handleClaudeRequest(request, env, failover, ctx) {
       responseBody = JSON.parse(responseText);
     } catch {
     }
-    const { promptTokens, completionTokens, totalTokens } = extractTokenUsage(responseBody, proxyResponse.headers, isError ? void 0 : requestBody);
+    const { promptTokens, completionTokens, totalTokens, cacheReadTokens } = extractTokenUsage(responseBody, proxyResponse.headers, isError ? void 0 : requestBody);
     const breakdown = calculateCostBreakdown(provider, upstreamModel, promptTokens, completionTokens, accountRateMultiplier(account));
     const cost = breakdown.cost;
     if (cost > 0) {
       defer(ctx, db.incrementApiKeyUsage(keyRecord.id, cost));
     }
-    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cost, base_cost: breakdown.baseCost, rate_multiplier: breakdown.multiplier, cost_estimated: breakdown.estimated ? 1 : 0, cache_status: "bypass", status: proxyResponse.status, error_message: isError ? responseBody?.error?.message || "Error" : "", latency_ms: Date.now() - startTime, reasoning_effort: reasoningEffort, user_agent: userAgent }));
+    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cache_read_tokens: cacheReadTokens, cost, base_cost: breakdown.baseCost, rate_multiplier: breakdown.multiplier, cost_estimated: breakdown.estimated ? 1 : 0, cache_status: "bypass", status: proxyResponse.status, error_message: isError ? responseBody?.error?.message || "Error" : "", latency_ms: Date.now() - startTime, reasoning_effort: reasoningEffort, user_agent: userAgent }));
     defer(ctx, db.createRequestLog({
       account_id: account.id,
       group_id: group.id,
@@ -4646,7 +4725,7 @@ async function handleClaudeFailover(body, request, env, failover, keyRecord, acc
       if (retryBreakdown.cost > 0) {
         defer(ctx, db.incrementApiKeyUsage(keyRecord.id, retryBreakdown.cost));
       }
-      defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider: currentProvider, prompt_tokens: usage.promptTokens, completion_tokens: usage.completionTokens, total_tokens: usage.totalTokens, cost: retryBreakdown.cost, base_cost: retryBreakdown.baseCost, rate_multiplier: retryBreakdown.multiplier, cost_estimated: retryBreakdown.estimated ? 1 : 0, cache_status: "bypass", status: proxyResponse.status, error_message: isError ? retryResponseBody?.error?.message || errorMessage : "", latency_ms: Date.now() - originStart, reasoning_effort: reasoningEffort, user_agent: userAgent }));
+      defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider: currentProvider, prompt_tokens: usage.promptTokens, completion_tokens: usage.completionTokens, total_tokens: usage.totalTokens, cache_read_tokens: usage.cacheReadTokens, cost: retryBreakdown.cost, base_cost: retryBreakdown.baseCost, rate_multiplier: retryBreakdown.multiplier, cost_estimated: retryBreakdown.estimated ? 1 : 0, cache_status: "bypass", status: proxyResponse.status, error_message: isError ? retryResponseBody?.error?.message || errorMessage : "", latency_ms: Date.now() - originStart, reasoning_effort: reasoningEffort, user_agent: userAgent }));
       return new Response(responseText, {
         status: proxyResponse.status,
         headers: { ...stripBodyHeaders(proxyResponse.headers), "content-type": "application/json", "cache-control": "no-store, no-transform" }
@@ -5525,6 +5604,75 @@ async function decryptApiKey(payload, secret) {
   return new TextDecoder().decode(plaintext);
 }
 
+// functions/src/utils/login-throttle.ts
+var WINDOW_SECONDS = 60;
+var MAX_FAILURES = 5;
+var KEY_PREFIX = "rl:authfail:";
+function clientIp(request) {
+  return request.headers.get("cf-connecting-ip")?.trim() || "local";
+}
+function throttleKey(ip) {
+  return `${KEY_PREFIX}${ip}`;
+}
+async function checkLoginThrottle(kv, ip) {
+  try {
+    const value = await kv.get(throttleKey(ip));
+    const count = value ? Number.parseInt(value, 10) : 0;
+    if (Number.isFinite(count) && count >= MAX_FAILURES) {
+      return { allowed: false, retryAfterSeconds: WINDOW_SECONDS };
+    }
+  } catch {
+  }
+  return { allowed: true, retryAfterSeconds: WINDOW_SECONDS };
+}
+async function recordLoginFailure(kv, ip) {
+  try {
+    const key = throttleKey(ip);
+    const value = await kv.get(key);
+    const count = ((value ? Number.parseInt(value, 10) : 0) || 0) + 1;
+    await kv.put(key, String(count), { expirationTtl: WINDOW_SECONDS });
+  } catch {
+  }
+}
+async function clearLoginThrottle(kv, ip) {
+  try {
+    await kv.delete(throttleKey(ip));
+  } catch {
+  }
+}
+
+// functions/src/utils/maintenance.ts
+var LAST_RUN_KEY = "maintenance:last_usage_cleanup";
+var MIN_INTERVAL_SECONDS = 24 * 60 * 60;
+var DEFAULT_RETENTION_DAYS = 30;
+function resolveRetentionDays(env) {
+  const raw = env.USAGE_RETENTION_DAYS;
+  if (raw === void 0 || raw === null || raw === "") return DEFAULT_RETENTION_DAYS;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_RETENTION_DAYS;
+  return parsed;
+}
+function maybeRunScheduledCleanup(env, ctx) {
+  const kv = env.CONFIG_KV;
+  if (!kv || !env.DB) return;
+  const days = resolveRetentionDays(env);
+  if (days <= 0) return;
+  void (async () => {
+    try {
+      const last = await kv.get(LAST_RUN_KEY);
+      const lastMs = last ? Number.parseInt(last, 10) : NaN;
+      const now = Date.now();
+      if (Number.isFinite(lastMs) && now - lastMs < MIN_INTERVAL_SECONDS * 1e3) return;
+      await kv.put(LAST_RUN_KEY, String(now), { expirationTtl: MIN_INTERVAL_SECONDS });
+      ctx.waitUntil(
+        createDatabase(env.DB).deleteUsageRecordsOlderThan(days).then(() => console.log(`usage cleanup: applied ${days}d retention`)).catch((error) => console.error("usage cleanup failed:", error instanceof Error ? error.message : String(error)))
+      );
+    } catch (error) {
+      console.error("usage cleanup gate failed:", error instanceof Error ? error.message : String(error));
+    }
+  })();
+}
+
 // functions/_worker.ts
 var sharedFailover = null;
 function invalidateRouting() {
@@ -5536,6 +5684,7 @@ var worker_default = {
       return await route(request, env, ctx);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      console.error("unhandled route error:", message);
       const wantsHtml = (request.headers.get("accept") || "").includes("text/html");
       if (wantsHtml) {
         const assets = env.ASSETS;
@@ -5546,12 +5695,12 @@ var worker_default = {
           if (shell && shell.status < 400) {
             return new Response(shell.body, {
               status: shell.status,
-              headers: { ...Object.fromEntries(shell.headers), "x-sub2api-error": encodeURIComponent(message).slice(0, 200) }
+              headers: Object.fromEntries(shell.headers)
             });
           }
         }
       }
-      return json({ error: "Internal error", message }, 500);
+      return json({ error: "Internal error" }, 500);
     }
   }
 };
@@ -5559,6 +5708,7 @@ async function route(request, env, ctx) {
   const url = new URL(request.url);
   const path = url.pathname.replace(/\/+$/, "") || "/";
   if (!env.DB) return json({ error: "D1 binding DB is not configured" }, 500);
+  maybeRunScheduledCleanup(env, ctx);
   if (request.method === "OPTIONS") {
     return new Response(null, {
       headers: {
@@ -5635,18 +5785,27 @@ async function route(request, env, ctx) {
   }
   return json({ error: "Not found" }, 404);
 }
-function json(data, status = 200) {
+function json(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data), {
     status,
     headers: {
       "Content-Type": "application/json",
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization, X-API-Key, Anthropic-Version, Anthropic-Beta"
+      "Access-Control-Allow-Headers": "Content-Type, Authorization, X-API-Key, Anthropic-Version, Anthropic-Beta",
+      ...extraHeaders
     }
   });
 }
 async function handleLogin(request, env) {
+  const kv = env.CONFIG_KV;
+  const ip = kv ? clientIp(request) : "";
+  if (kv) {
+    const throttle = await checkLoginThrottle(kv, ip);
+    if (!throttle.allowed) {
+      return json({ error: "Too many failed attempts, please retry later" }, 429, { "Retry-After": String(throttle.retryAfterSeconds) });
+    }
+  }
   let body;
   try {
     body = await request.json();
@@ -5658,7 +5817,11 @@ async function handleLogin(request, env) {
   }
   const db = createDatabase(env.DB);
   const session = await authenticateUser(db, body.username, body.password);
-  if (!session) return json({ error: "Invalid credentials" }, 401);
+  if (!session) {
+    if (kv) await recordLoginFailure(kv, ip);
+    return json({ error: "Invalid credentials" }, 401);
+  }
+  if (kv) await clearLoginThrottle(kv, ip);
   await db.ensureSchema().catch(() => {
   });
   const token = await createSessionToken(session, await resolveSessionSecret(db, env.JWT_SECRET));
@@ -5668,14 +5831,27 @@ async function handleLogin(request, env) {
   });
 }
 async function handleSetup(request, env) {
+  const kv = env.CONFIG_KV;
+  const ip = kv ? clientIp(request) : "";
+  if (kv) {
+    const throttle = await checkLoginThrottle(kv, ip);
+    if (!throttle.allowed) {
+      return json({ error: "Too many failed attempts, please retry later" }, 429, { "Retry-After": String(throttle.retryAfterSeconds) });
+    }
+  }
+  const recordFailure = async () => {
+    if (kv) await recordLoginFailure(kv, ip);
+  };
   const db = createDatabase(env.DB);
   let body;
   try {
     body = await request.json();
   } catch {
+    await recordFailure();
     return json({ error: "Invalid JSON body" }, 400);
   }
   if (!body.username || !body.password || body.username.length > 128 || body.password.length < 8) {
+    await recordFailure();
     return json({ error: "\u8BF7\u586B\u5199\u7528\u6237\u540D\uFF0C\u5BC6\u7801\u81F3\u5C11 8 \u4F4D" }, 400);
   }
   let created = false;
@@ -5689,10 +5865,12 @@ async function handleSetup(request, env) {
   if (existing && existing.password_hash.startsWith("$2a$")) {
     await db.update("UPDATE users SET username = ?, password_hash = ? WHERE id = ?", [body.username, passwordHash, existing.id]);
   } else if (existing) {
+    await recordFailure();
     return json({ error: "Setup already completed" }, 400);
   } else {
     await db.createUser(body.username, passwordHash);
   }
+  if (kv) await clearLoginThrottle(kv, ip);
   return json({ success: true, message: created ? "\u6570\u636E\u5E93\u5DF2\u521D\u59CB\u5316\uFF0C\u7BA1\u7406\u5458\u521B\u5EFA\u6210\u529F" : "\u7BA1\u7406\u5458\u521B\u5EFA\u6210\u529F", schema_created: created });
 }
 async function handleSetupStatus(env) {

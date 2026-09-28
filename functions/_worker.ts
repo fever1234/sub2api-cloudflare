@@ -16,6 +16,8 @@ import { routingCacheMetrics, invalidateRoutingSnapshot, loadRoutingSnapshot } f
 import { openCodeGoModelProtocol } from './src/utils/responses-bridge'
 import { readCachedModels } from './src/utils/healthcheck'
 import { modelAllowed, modelAllowlistDenied } from './src/utils/model-allowlist'
+import { clientIp, checkLoginThrottle, recordLoginFailure, clearLoginThrottle } from './src/utils/login-throttle'
+import { maybeRunScheduledCleanup } from './src/utils/maintenance'
 
 // Keep an isolate-local scheduler between requests. Persistent request logs in
 // D1 are also consulted by FailoverManager, so this cache is only a fast path.
@@ -37,11 +39,14 @@ export default {
     // the opaque "Error 1101 Worker threw exception" HTML page: the whole site
     // white-screens and the real message is only visible in Workers Logs. A
     // transient D1 failure on any single route must not do that, so every throw
-    // is converted into a normal response that also carries the reason.
+    // is converted into a normal response. The reason itself stays out of the
+    // response body and headers — it can name tables, bindings or upstream
+    // hosts — and goes to Workers Logs instead.
     try {
       return await route(request, env, ctx)
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
+      console.error('unhandled route error:', message)
       const wantsHtml = (request.headers.get('accept') || '').includes('text/html')
       if (wantsHtml) {
         // A browser navigation gets the shell back so the SPA still loads and can
@@ -55,12 +60,12 @@ export default {
           if (shell && shell.status < 400) {
             return new Response(shell.body, {
               status: shell.status,
-              headers: { ...Object.fromEntries(shell.headers), 'x-sub2api-error': encodeURIComponent(message).slice(0, 200) }
+              headers: Object.fromEntries(shell.headers)
             })
           }
         }
       }
-      return json({ error: 'Internal error', message }, 500)
+      return json({ error: 'Internal error' }, 500)
     }
   }
 }
@@ -70,6 +75,11 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
   const path = url.pathname.replace(/\/+$/, '') || '/'
 
   if (!env.DB) return json({ error: 'D1 binding DB is not configured' }, 500)
+
+  // Retention cleanup rides the request path (Pages has no Cron Triggers).
+  // Placed before any early return — health probes are the most frequent
+  // traffic, so they are what drives the 24h gate.
+  maybeRunScheduledCleanup(env, ctx)
 
   // CORS preflight
   if (request.method === 'OPTIONS') {
@@ -183,7 +193,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
   return json({ error: 'Not found' }, 404)
 }
 
-function json(data: any, status = 200) {
+function json(data: any, status = 200, extraHeaders: Record<string, string> = {}) {
   return new Response(JSON.stringify(data), {
     status,
     headers: {
@@ -191,11 +201,24 @@ function json(data: any, status = 200) {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-API-Key, Anthropic-Version, Anthropic-Beta',
+      ...extraHeaders,
     }
   })
 }
 
 async function handleLogin(request: Request, env: Env): Promise<Response> {
+  // Failure-only fixed window per IP: five wrong passwords in a row buy a
+  // 60-second 429, but one correct password anywhere in the window clears the
+  // counter, so a misconfigured client can never lock the operator out.
+  const kv = env.CONFIG_KV
+  const ip = kv ? clientIp(request) : ''
+  if (kv) {
+    const throttle = await checkLoginThrottle(kv, ip)
+    if (!throttle.allowed) {
+      return json({ error: 'Too many failed attempts, please retry later' }, 429, { 'Retry-After': String(throttle.retryAfterSeconds) })
+    }
+  }
+
   let body: { username?: string; password?: string }
   try { body = await request.json() } catch { return json({ error: 'Invalid JSON body' }, 400) }
 
@@ -205,7 +228,11 @@ async function handleLogin(request: Request, env: Env): Promise<Response> {
 
   const db = createDatabase(env.DB)
   const session = await authenticateUser(db, body.username, body.password)
-  if (!session) return json({ error: 'Invalid credentials' }, 401)
+  if (!session) {
+    if (kv) await recordLoginFailure(kv, ip)
+    return json({ error: 'Invalid credentials' }, 401)
+  }
+  if (kv) await clearLoginThrottle(kv, ip)
 
   // Bring an already-initialised database up to the current schema. Setup only
   // runs before the first admin exists, so an upgraded deployment would never
@@ -223,12 +250,27 @@ async function handleLogin(request: Request, env: Env): Promise<Response> {
 }
 
 async function handleSetup(request: Request, env: Env): Promise<Response> {
+  // Setup POST is the only unauthenticated path that can replace the admin
+  // password on a claimable deployment, so it shares the login counter. A
+  // database-initialisation failure is deliberately not counted: that is
+  // infrastructure, not a credential guess.
+  const kv = env.CONFIG_KV
+  const ip = kv ? clientIp(request) : ''
+  if (kv) {
+    const throttle = await checkLoginThrottle(kv, ip)
+    if (!throttle.allowed) {
+      return json({ error: 'Too many failed attempts, please retry later' }, 429, { 'Retry-After': String(throttle.retryAfterSeconds) })
+    }
+  }
+  const recordFailure = async () => { if (kv) await recordLoginFailure(kv, ip) }
+
   const db = createDatabase(env.DB)
 
   let body: { username?: string; password?: string }
-  try { body = await request.json() } catch { return json({ error: 'Invalid JSON body' }, 400) }
+  try { body = await request.json() } catch { await recordFailure(); return json({ error: 'Invalid JSON body' }, 400) }
 
   if (!body.username || !body.password || body.username.length > 128 || body.password.length < 8) {
+    await recordFailure()
     return json({ error: '请填写用户名，密码至少 8 位' }, 400)
   }
 
@@ -247,11 +289,13 @@ async function handleSetup(request: Request, env: Env): Promise<Response> {
   if (existing && existing.password_hash.startsWith('$2a$')) {
     await db.update('UPDATE users SET username = ?, password_hash = ? WHERE id = ?', [body.username, passwordHash, existing.id])
   } else if (existing) {
+    await recordFailure()
     return json({ error: 'Setup already completed' }, 400)
   } else {
     await db.createUser(body.username, passwordHash)
   }
 
+  if (kv) await clearLoginThrottle(kv, ip)
   return json({ success: true, message: created ? '数据库已初始化，管理员创建成功' : '管理员创建成功', schema_created: created })
 }
 

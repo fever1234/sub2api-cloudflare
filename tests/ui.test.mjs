@@ -32,8 +32,8 @@ const db = {
     { id: 2, name: 'staging', enabled: 1, balance: 0, quota_limit: 5, group_id: 2, group_name: 'claude-pool', created_at: '2026-01-02 00:00:00' }
   ],
   usage: [
-    { id: 1, model: 'gpt-4o', provider: 'openai', total_tokens: 120, prompt_tokens: 100, completion_tokens: 20, cost: 0.002, base_cost: 0.002, rate_multiplier: 1, cost_estimated: 0, status: 200, latency_ms: 850, ttft_ms: 320, group_id: 1, group_name: 'default', account_id: 1, account_name: 'acct-openai', key_name: 'prod', created_at: '2026-01-01 00:00:00' },
-    { id: 2, model: 'claude-3-5-sonnet', provider: 'anthropic', total_tokens: 80, prompt_tokens: 60, completion_tokens: 20, cost: 0.002, base_cost: 0.004, rate_multiplier: 0.5, cost_estimated: 1, status: 200, latency_ms: 1200, ttft_ms: 2900, group_id: 2, group_name: 'claude-pool', account_id: 2, account_name: 'acct-claude', key_name: 'staging', created_at: '2026-01-02 00:00:00' }
+    { id: 1, model: 'gpt-4o', provider: 'openai', total_tokens: 150, prompt_tokens: 100, cache_read_tokens: 30, completion_tokens: 20, cost: 0.002, base_cost: 0.002, rate_multiplier: 1, cost_estimated: 0, status: 200, latency_ms: 850, ttft_ms: 320, group_id: 1, group_name: 'default', account_id: 1, account_name: 'acct-openai', key_name: 'prod', reasoning_effort: 'high', user_agent: 'python-requests/2.31.0', created_at: '2026-01-01 00:00:00' },
+    { id: 2, model: 'claude-3-5-sonnet', provider: 'anthropic', total_tokens: 80, prompt_tokens: 60, cache_read_tokens: 0, completion_tokens: 20, cost: 0.002, base_cost: 0.004, rate_multiplier: 0.5, cost_estimated: 1, status: 200, latency_ms: 1200, ttft_ms: 2900, group_id: 2, group_name: 'claude-pool', account_id: 2, account_name: 'acct-claude', key_name: 'staging', reasoning_effort: null, user_agent: null, created_at: '2026-01-02 00:00:00' }
   ]
 }
 const posted = []
@@ -46,8 +46,8 @@ function statsPayload() {
     data: {
       hours: 24, bucket: 'hour',
       totals: {
-        total_requests: 1, success_requests: 1, total_tokens: 120, prompt_tokens: 100,
-        completion_tokens: 20, total_cost: 0.002, base_cost: 0.004, avg_latency: 850,
+        total_requests: 1, success_requests: 1, total_tokens: 150, prompt_tokens: 100,
+        cache_read_tokens: 30, completion_tokens: 20, total_cost: 0.002, base_cost: 0.004, avg_latency: 850,
         avg_ttft: 320, cache_hits: 3, cache_samples: 4
       },
       today: { today_requests: 1, today_tokens: 120, today_cost: 0.002 },
@@ -57,7 +57,7 @@ function statsPayload() {
         total_groups: db.groups.length, active_groups: db.groups.length,
         total_models: db.models.length, active_models: db.models.length
       },
-      trend: [{ bucket: '2026-01-01 00:00', requests: 1, errors: 0, prompt_tokens: 100, completion_tokens: 20, cost: 0.002 }],
+      trend: [{ bucket: '2026-01-01 00:00', requests: 1, errors: 0, prompt_tokens: 100, cache_read_tokens: 30, completion_tokens: 20, cost: 0.002 }],
       byModel: [{ model: 'gpt-4o', requests: 1, tokens: 120, cost: 0.002 }],
       byProvider: [{ provider: 'openai', requests: 1, cost: 0.002 }]
     }
@@ -399,6 +399,7 @@ check('theme toggles', doc.documentElement.classList.contains('dark') !== rootBe
 press(doc.querySelector('.nav-item[data-page="dashboard"]'))
 await tick(12)
 check('trend chart drew svg', Boolean(doc.querySelector('#chart-tokens svg')))
+check('trend chart plots cache reads', /缓存读取/.test(doc.getElementById('chart-tokens').textContent))
 check('model chart drew svg', Boolean(doc.querySelector('#chart-models svg')))
 check('stat cards populated', /1/.test(doc.getElementById('stats-grid').textContent))
 
@@ -409,6 +410,7 @@ const statsText = doc.getElementById('stats-grid').textContent
 check('dashboard shows average first-token', /平均首字/.test(statsText), statsText.slice(0, 120))
 check('dashboard shows the routing cache hit rate', /缓存命中率/.test(statsText))
 check('dashboard cost card names the multiplier', /倍率后/.test(statsText))
+check('dashboard token card splits cache reads', /缓存读取/.test(statsText), statsText.slice(0, 200))
 check('stat grid no longer repeats resource counts', !/API 密钥/.test(statsText))
 const resourceText = doc.getElementById('resource-health').textContent
 check('resource panel covers keys', /API 密钥/.test(resourceText), resourceText.slice(0, 120))
@@ -417,19 +419,58 @@ check('resource panel covers keys', /API 密钥/.test(resourceText), resourceTex
 press(doc.querySelector('.nav-item[data-page="usage"]'))
 await tick(10)
 const usageHead = [...doc.querySelectorAll('#usage-list thead th')].map(th => th.textContent)
-// One combined Token column instead of three per-direction ones; the split still
-// appears inside the cell. The action column carries no label.
-check('usage table fits without a token column per direction',
-  usageHead.includes('Token')
-  && !usageHead.includes('输入')
-  && !usageHead.includes('输出')
-  && usageHead.filter(Boolean).length === 9, usageHead.join('|'))
-check('usage row keeps both token directions', /↑|↓/.test(doc.getElementById('usage-list').textContent))
+// Net input, output and cache reads get a column each — the split is the
+// table's job now, not a sub-line inside one cell. The action column carries
+// no label.
+check('usage table splits tokens into three columns',
+  usageHead.includes('输入')
+  && usageHead.includes('输出')
+  && usageHead.includes('缓存读取')
+  && !usageHead.includes('Token')
+  && usageHead.filter(Boolean).length === 12, usageHead.join('|'))
+check('usage table has a reasoning column', usageHead.includes('推理强度'), usageHead.join('|'))
+// Row 1 fixture: input 100, output 20, cache 30 — adjacent columns, in order.
+check('usage row shows input, output and cache side by side',
+  /1002030/.test(doc.getElementById('usage-list').textContent),
+  doc.getElementById('usage-list').textContent.slice(0, 200))
+// The row no longer carries a total, so hovering any token number must reveal
+// the whole breakdown including it.
+check('hovering a token cell reveals the full breakdown',
+  /title="输入 100 · 缓存读取 30 · 输出 20 · 总计 150"/.test(doc.getElementById('usage-list').innerHTML),
+  doc.getElementById('usage-list').innerHTML.slice(0, 300))
 // The discounted row must show what produced the charged figure, otherwise a
 // multiplier is invisible and the number looks wrong against the model's price.
 check('usage cost cell shows the multiplier', /0\.5x/.test(doc.getElementById('usage-list').textContent),
   doc.getElementById('usage-list').textContent.slice(0, 200))
 check('usage marks an estimated price', /估算价/.test(doc.getElementById('usage-list').textContent))
+
+// ---- request-shape telemetry on the row -------------------------------------
+// reasoning_effort and user_agent are stored on every usage row; the page owes
+// the operator both: which reasoning budget the call asked for, and which
+// client sent it. Known effort values read in Chinese, unknown ones verbatim.
+const usageText = doc.getElementById('usage-list').textContent
+check('usage row shows the reasoning effort', /高/.test(usageText), usageText.slice(0, 200))
+check('usage row shows the client user agent', /python-requests\/2\.31\.0/.test(usageText))
+const noEffortRow = [...doc.querySelectorAll('#usage-list tbody tr')]
+  .find(tr => /claude-3-5-sonnet/.test(tr.textContent))
+check('a row without request-shape telemetry shows a dash',
+  Boolean(noEffortRow) && !/badge-neutral/.test(noEffortRow.innerHTML),
+  noEffortRow?.textContent?.slice(0, 120) || 'row not found')
+// Row 2 fixture has no cache reads: input 60, output 20, cache column reads 0
+// (dimmed) instead of showing a value that was never there.
+check('a row without cache reads reports zero in the cache column',
+  Boolean(noEffortRow) && /60200/.test(noEffortRow.textContent),
+  noEffortRow?.textContent?.slice(0, 120) || 'row not found')
+// Both fields join the fuzzy search, so filtering by how a call was made works
+// the same as filtering by model or account.
+setSearch('usage-search', 'high')
+await tick(2)
+check('usage search matches the reasoning effort', rowsIn('usage-list') === 1, String(rowsIn('usage-list')))
+setSearch('usage-search', 'python-requests')
+await tick(2)
+check('usage search matches the user agent', rowsIn('usage-list') === 1, String(rowsIn('usage-list')))
+setSearch('usage-search', '')
+await tick(2)
 
 // ---- usage records must be removable ---------------------------------------
 // D1 caps database size and usage_records is the only table that grows with
