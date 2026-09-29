@@ -14,7 +14,7 @@ import urllib.error
 import urllib.request
 
 sys.path.insert(0, 'tests')
-from upstream_stub import serve  # noqa: E402
+from upstream_stub import serve, usage_hits  # noqa: E402
 
 BASE = (sys.argv[1] if len(sys.argv) > 1 else 'http://127.0.0.1:8788').rstrip('/')
 API = f'{BASE}/api/v1'
@@ -29,6 +29,9 @@ PORT_D, PORT_E = 9104, 9105
 PORT_F = 9106
 # Dedicated upstream for the OpenAI silent-refusal fixture.
 PORT_G = 9107
+# Official-usage stub: the worker's OPENCODE_USAGE_URL binding points here, so
+# the OpenCode Go quota fetch never leaves the machine in e2e.
+PORT_H = 9108
 
 passed = 0
 failures = []
@@ -44,7 +47,13 @@ def check(name, ok, detail=''):
         print('FAIL', name, detail)
 
 
+# Headers of the most recent call(), for asserting response metadata
+# (x-request-id) that the (status, payload) tuple does not carry.
+last_headers = {}
+
+
 def call(path, method='GET', body=None, token=None, headers=None, base=API):
+    global last_headers
     url = path if path.startswith('http') else base + path
     data = json.dumps(body).encode() if body is not None else None
     request = urllib.request.Request(url, data=data, method=method)
@@ -55,12 +64,14 @@ def call(path, method='GET', body=None, token=None, headers=None, base=API):
         request.add_header(key, value)
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
+            last_headers = dict(response.headers)
             raw = response.read().decode()
             try:
                 return response.status, json.loads(raw)
             except Exception:
                 return response.status, {'raw': raw}
     except urllib.error.HTTPError as error:
+        last_headers = dict(error.headers)
         raw = error.read().decode()
         try:
             return error.code, json.loads(raw)
@@ -96,10 +107,10 @@ def reset_upstreams():
 
 
 # ---------------------------------------------------------------- fixtures
-for port in (PORT_A, PORT_B, PORT_C, PORT_D, PORT_E, PORT_F, PORT_G):
+for port in (PORT_A, PORT_B, PORT_C, PORT_D, PORT_E, PORT_F, PORT_G, PORT_H):
     serve(port)
 time.sleep(0.4)
-print(f'stub upstreams ready on {PORT_A}, {PORT_B}, {PORT_C}, {PORT_D}, {PORT_E}, {PORT_F}, {PORT_G}')
+print(f'stub upstreams ready on {PORT_A}-{PORT_G}, usage stub on {PORT_H}')
 
 call('/auth/setup', 'POST', {'username': ADMIN[0], 'password': ADMIN[1]})
 status, payload = call('/auth/login', 'POST', {'username': ADMIN[0], 'password': ADMIN[1]})
@@ -151,10 +162,22 @@ status, payload = call('/v1/chat/completions', 'POST',
                        token=client_key, base=BASE)
 check('chat completion succeeds', status == 200, (status, payload))
 check('response came from priority-0 account', payload.get('id') == f'chatcmpl-{PORT_A}', payload.get('id'))
+# Captured before requests_seen(), which talks to the stubs and overwrites
+# the recorded response headers.
+generated_id = last_headers.get('x-request-id')
+check('chat response carries a generated x-request-id', bool(generated_id), generated_id)
 check('only the selected upstream was called', len(requests_seen(PORT_A)) == 1 and not requests_seen(PORT_B))
 
 seen = requests_seen(PORT_A)[0]
 check('account key forwarded to upstream', seen['authorization'] == 'Bearer sk-account-gw-a', seen['authorization'])
+
+# A well-formed caller-supplied id is honoured so client logs line up.
+status, _ = call('/v1/chat/completions', 'POST',
+                 {'model': 'gpt-4o', 'messages': [{'role': 'user', 'content': 'hi'}]},
+                 token=client_key, base=BASE, headers={'x-request-id': 'e2e-client-req-0001'})
+check('caller-supplied x-request-id is echoed back',
+      status == 200 and last_headers.get('x-request-id') == 'e2e-client-req-0001',
+      (status, last_headers.get('x-request-id')))
 
 # Failover must forward the next account's own credential.
 reset_upstreams()
@@ -837,6 +860,73 @@ status, payload = call('/v1/models', token=pinned_key, base=BASE)
 restored_ids = [m.get('id') for m in payload.get('data', [])]
 check('disabling the allowlist restores the full list',
       status == 200 and len(restored_ids) > len(wildcard_ids), (status, restored_ids))
+
+# ------------------------------------------- OpenCode usage + stream outcome --
+# The first opencode traffic schedules the quota fetch: the account starts
+# without a snapshot, so the request-path trigger hits the official endpoint
+# (bound to the local stub, never the real one) inside waitUntil and stores the
+# windows without slowing the response down.
+def find_account_row(acc_id):
+    _, payload = call('/accounts', token=token)
+    for row in payload.get('data', []):
+        if row.get('id') == acc_id:
+            return row
+    return None
+
+snapshot_raw = None
+deadline = time.time() + 10
+while time.time() < deadline:
+    row = find_account_row(opencode_acct_id)
+    snapshot_raw = (row or {}).get('usage_snapshot')
+    if snapshot_raw:
+        break
+    time.sleep(0.3)
+check('auto refresh stored the usage snapshot', bool(snapshot_raw), snapshot_raw)
+snapshot = json.loads(snapshot_raw) if snapshot_raw else {}
+check('auto refresh reports ok status', snapshot.get('status') == 'ok', snapshot)
+check('rolling percent landed from the official payload',
+      (snapshot.get('data') or {}).get('rolling', {}).get('percent') == 12.5, snapshot.get('data'))
+check('the fetch carried the account credential',
+      any(hit.get('authorization') == 'Bearer sk-opencode-acct' for hit in usage_hits(PORT_H)),
+      usage_hits(PORT_H))
+
+# Manual refresh: a disabled account on the official base_url qualifies for
+# the endpoint without ever being routed to; a second call inside the 30s gap
+# is rejected, and a non-eligible account is refused outright.
+_, quota_created = call('/accounts', 'POST', {
+    'name': 'gw-quota-acct', 'provider': 'openai', 'api_key': 'sk-quota-acct',
+    'base_url': 'https://opencode.ai/zen/go/v1',
+    'group_id': primary_id, 'enabled': 0,
+}, token=token)
+quota_id = quota_created.get('data', {}).get('id')
+check('quota account created', bool(quota_id), quota_created)
+status, payload = call(f'/accounts/{quota_id}/usage', 'POST', token=token)
+manual_state = payload.get('data') or {}
+check('manual refresh returns the snapshot',
+      status == 200 and (manual_state.get('snapshot') or {}).get('status') == 'ok', (status, payload))
+check('manual refresh reports eligibility', manual_state.get('eligible') is True, payload)
+status, payload = call(f'/accounts/{quota_id}/usage', 'POST', token=token)
+check('manual refresh inside the 30s gap is limited', status == 429, (status, payload))
+status, payload = call(f'/accounts/{account_ids["gw-a"]}/usage', 'POST', token=token)
+check('manual refresh rejects a foreign account', status == 400, (status, payload))
+
+# Streamed rows record how they settled; buffered JSON replies never enter the
+# stream guard and stay NULL — the split is what makes "the stream died"
+# reports answerable from the usage page.
+status, payload = call('/usage?limit=200', token=token)
+usage_rows = payload.get('data', []) if status == 200 else []
+outcomes = [row.get('stream_outcome') for row in usage_rows if row.get('stream_outcome')]
+check('streamed usage rows record an outcome', bool(outcomes), outcomes)
+check('a clean stream records completed', 'completed' in outcomes, outcomes)
+check('buffered rows carry no outcome',
+      any(row.get('stream_outcome') is None for row in usage_rows), len(usage_rows))
+
+# The x-request-id that went out on the response also lands on the usage row,
+# so a client-side error report names the exact billing record.
+matched = [row for row in usage_rows if row.get('request_id') == 'e2e-client-req-0001']
+check('usage rows carry the caller x-request-id', len(matched) >= 1, len(usage_rows))
+check('usage rows carry a generated request_id',
+      any(row.get('request_id') for row in usage_rows), len(usage_rows))
 
 print()
 print(f'PASSED {passed} / {passed + len(failures)}')

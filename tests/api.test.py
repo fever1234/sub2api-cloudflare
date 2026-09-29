@@ -290,6 +290,20 @@ st, js = call("POST", "/api/v1/auth/login",
               {"username": "admin", "password": "AnotherPass456"})
 check("lockout short-circuits even the correct password", st == 429, (st, js))
 
+# --- audit log (v16) ---
+# Uses the still-valid session token: the login path itself is locked out.
+st, js = call("GET", "/api/v1/audit", token=token)
+rows = js.get("data", []) if isinstance(js.get("data"), list) else []
+check("audit endpoint returns rows", st == 200 and len(rows) > 0, (st, js))
+failed = [r for r in rows if r.get("action") == "login" and int(r.get("ok") or 0) == 0]
+check("failed logins are audited", len(failed) >= 1, rows[:3])
+throttled = [r for r in rows if (r.get("detail") or "") == "throttled"]
+check("throttled attempts are audited", len(throttled) >= 1, rows[:3])
+changes = [r for r in rows if r.get("action") == "password_change"]
+check("password changes are audited", len(changes) >= 2, changes)
+st2, js2 = call("GET", "/api/v1/audit")
+check("audit endpoint requires auth", st2 == 401, (st2, js2))
+
 passed = sum(1 for _, ok, _ in results if ok)
 print("\nPASSED %d / %d" % (passed, len(results)))
 if passed != len(results):

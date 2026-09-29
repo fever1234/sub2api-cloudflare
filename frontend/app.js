@@ -106,6 +106,33 @@ function httpBadge(status) {
   const tone = code === 0 ? 'badge-off' : code < 400 ? 'badge-on' : code < 500 ? 'badge-warn' : 'badge-err'
   return `<span class="badge ${tone}">${code || '-'}</span>`
 }
+// How a streamed request settled (usage_records.stream_outcome). Rows written
+// before the column existed and buffered responses carry no value; a completed
+// stream needs no marker — only the abnormal endings are called out under the
+// status badge, which is what separates "client hung up" from "upstream died".
+const STREAM_OUTCOME_LABELS = {
+  client_abort: '中断 · 客户端断开',
+  upstream_error: '中断 · 上游断流',
+  stalled: '停滞 · 上游无数据',
+  timeout: '超时 · 流超上限',
+  record_timeout: '中断 · 记账超时'
+}
+function usageStatusCell(item) {
+  const label = item.stream_outcome ? STREAM_OUTCOME_LABELS[item.stream_outcome] : ''
+  if (!label) return httpBadge(item.status)
+  return `${httpBadge(item.status)}<span class="cell-sub err" title="stream_outcome: ${esc(item.stream_outcome)}">${esc(label)}</span>`
+}
+// OpenCode Go quota chip for the account row: the rolling-window percent from
+// the stored usage snapshot (refreshed in the background once per interval).
+function usageChip(item) {
+  let snapshot = null
+  try { snapshot = item.usage_snapshot ? JSON.parse(item.usage_snapshot) : null } catch {}
+  if (!snapshot) return ''
+  if (snapshot.status !== 'ok' || !snapshot.data) return ' · 用量获取失败'
+  const percent = Number(snapshot.data.rolling && snapshot.data.rolling.percent)
+  if (!Number.isFinite(percent)) return ' · 用量 --'
+  return ` · 用量 ${percent.toFixed(1)}%`
+}
 function providerBadge(provider) {
   return `<span class="badge badge-provider prov-${esc(provider || 'unknown')}">${esc(providerLabel(provider))}</span>`
 }
@@ -482,19 +509,29 @@ function lineChart(points, series) {
 
   const width = 640
   const height = 200
-  const pad = { top: 16, right: 12, bottom: 26, left: 48 }
+  // Percent series ride a fixed 0–100% scale on the right axis so a hit rate
+  // never competes with token counts for the same magnitude.
+  const hasPercent = series.some(s => s.percent)
+  const pad = { top: 16, right: hasPercent ? 44 : 12, bottom: 26, left: 48 }
   const plotW = width - pad.left - pad.right
   const plotH = height - pad.top - pad.bottom
 
-  const maxValue = Math.max(1, ...series.flatMap(s => points.map(p => num(p[s.key]))))
+  const tokenSeries = series.filter(s => !s.percent)
+  const maxValue = Math.max(1, ...tokenSeries.flatMap(s => points.map(p => num(p[s.key]))))
   const stepX = points.length > 1 ? plotW / (points.length - 1) : 0
   const xAt = i => pad.left + (points.length > 1 ? i * stepX : plotW / 2)
   const yAt = v => pad.top + plotH - (num(v) / maxValue) * plotH
+  const yPctAt = v => pad.top + plotH - (Math.min(Math.max(num(v), 0), 100) / 100) * plotH
+  const yFor = s => (s.percent ? yPctAt : yAt)
+  const fmtValue = (s, v) => (s.percent ? `${num(v).toFixed(1)}%` : fmtInt(v))
 
   const gridLines = [0, 0.25, 0.5, 0.75, 1].map(ratio => {
     const y = pad.top + plotH - ratio * plotH
+    const rightAxis = hasPercent
+      ? `<text x="${width - pad.right + 6}" y="${(y + 4).toFixed(1)}" class="axis-label" text-anchor="start">${(ratio * 100).toFixed(0)}%</text>`
+      : ''
     return `<line x1="${pad.left}" y1="${y.toFixed(1)}" x2="${width - pad.right}" y2="${y.toFixed(1)}" class="grid"/>
-      <text x="${pad.left - 8}" y="${(y + 4).toFixed(1)}" class="axis-label" text-anchor="end">${fmtTokens(maxValue * ratio)}</text>`
+      <text x="${pad.left - 8}" y="${(y + 4).toFixed(1)}" class="axis-label" text-anchor="end">${fmtTokens(maxValue * ratio)}</text>${rightAxis}`
   }).join('')
 
   // Label at most 6 ticks so dense hourly ranges stay readable.
@@ -506,10 +543,11 @@ function lineChart(points, series) {
   }).join('')
 
   const paths = series.map(s => {
-    const line = points.map((point, index) => `${index ? 'L' : 'M'}${xAt(index).toFixed(1)},${yAt(point[s.key]).toFixed(1)}`).join(' ')
+    const y = yFor(s)
+    const line = points.map((point, index) => `${index ? 'L' : 'M'}${xAt(index).toFixed(1)},${y(point[s.key]).toFixed(1)}`).join(' ')
     const area = `${line} L${xAt(points.length - 1).toFixed(1)},${(pad.top + plotH).toFixed(1)} L${xAt(0).toFixed(1)},${(pad.top + plotH).toFixed(1)} Z`
     const dots = points.length <= 30
-      ? points.map((point, index) => `<circle cx="${xAt(index).toFixed(1)}" cy="${yAt(point[s.key]).toFixed(1)}" r="2.5" fill="${s.color}"><title>${esc(point.bucket)} · ${s.label}: ${fmtInt(point[s.key])}</title></circle>`).join('')
+      ? points.map((point, index) => `<circle cx="${xAt(index).toFixed(1)}" cy="${y(point[s.key]).toFixed(1)}" r="2.5" fill="${s.color}"><title>${esc(point.bucket)} · ${esc(s.label)}: ${fmtValue(s, point[s.key])}</title></circle>`).join('')
       : ''
     return `<path d="${area}" fill="${s.color}" opacity=".10"/><path d="${line}" fill="none" stroke="${s.color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>${dots}`
   }).join('')
@@ -518,7 +556,7 @@ function lineChart(points, series) {
 
   return `<div class="chart-line">
     <div class="chart-legend-row">${legend}</div>
-    <svg viewBox="0 0 ${width} ${height}" class="linechart" role="img" aria-label="Token 趋势">
+    <svg viewBox="0 0 ${width} ${height}" class="linechart" role="img" aria-label="Token 与缓存命中率趋势">
       ${gridLines}${paths}${xLabels}
     </svg>
   </div>`
@@ -632,16 +670,25 @@ function renderDashboard() {
   const models = (stats.byModel || []).map(row => ({ label: row.model || '未知模型', value: num(row.requests) }))
   $('chart-models').innerHTML = doughnutChart(models, '总请求', fmtTokens(totalRequests))
 
-  const trend = (stats.trend || []).map(row => ({
-    bucket: row.bucket,
-    prompt_tokens: num(row.prompt_tokens),
-    cache_read_tokens: num(row.cache_read_tokens),
-    completion_tokens: num(row.completion_tokens)
-  }))
+  const trend = (stats.trend || []).map(row => {
+    const prompt = num(row.prompt_tokens)
+    const cacheRead = num(row.cache_read_tokens)
+    // Token-weighted input cache hit rate: cache reads over everything the
+    // prompt sent upstream (net input + cache reads — the two never overlap).
+    const inputTotal = prompt + cacheRead
+    return {
+      bucket: row.bucket,
+      prompt_tokens: prompt,
+      cache_read_tokens: cacheRead,
+      completion_tokens: num(row.completion_tokens),
+      cache_hit_rate: inputTotal ? (cacheRead / inputTotal * 100) : 0
+    }
+  })
   $('chart-tokens').innerHTML = lineChart(trend, [
     { key: 'prompt_tokens', label: '输入 Token', color: '#14b8a6' },
     { key: 'cache_read_tokens', label: '缓存读取', color: '#a855f7' },
-    { key: 'completion_tokens', label: '输出 Token', color: '#3b82f6' }
+    { key: 'completion_tokens', label: '输出 Token', color: '#3b82f6' },
+    { key: 'cache_hit_rate', label: '缓存命中率', color: '#f59e0b', percent: true }
   ])
 
   const recent = state.data.usage.slice(0, 8)
@@ -818,7 +865,7 @@ function renderUsage() {
           tokenBreakdown(item, 'output'),
           tokenBreakdown(item, 'cache'),
           costCell(item),
-          httpBadge(item.status),
+          usageStatusCell(item),
           `${ttftCell(item.ttft_ms)}<span class="cell-sub">${fmtLatency(item.latency_ms)}</span>`,
           `<span class="cell-dim">${fmtDate(item.created_at)}</span>`,
           rowActions([actionButton('delete-usage', item.id, '删除', 'i-trash', 'danger')])
@@ -869,7 +916,7 @@ function renderAccounts() {
     ? table(
         ['账号', '服务商', '分组', '地址', '倍率', '测活', '状态', '错误率', '优先级', '操作'],
         items.map(item => [
-          `<span class="cell-main">${esc(item.name)}</span><span class="cell-sub">ID #${item.id}${item.client_spoofing ? ` · 伪装 ${esc(item.client_spoofing)}` : ''}</span>`,
+          `<span class="cell-main">${esc(item.name)}</span><span class="cell-sub">ID #${item.id}${usageChip(item)}${item.client_spoofing ? ` · 伪装 ${esc(item.client_spoofing)}` : ''}</span>`,
           providerBadge(item.provider),
           `<span class="badge badge-group">${esc(item.group_name || `分组 #${item.group_id}`)}</span>`,
           item.base_url

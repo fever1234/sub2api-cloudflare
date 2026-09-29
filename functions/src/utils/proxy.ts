@@ -324,7 +324,24 @@ export async function stageFirstChunk(
   }
 }
 
+/**
+ * Why a stream settled. Persisted alongside the usage row so an aborted chat
+ * is distinguishable from a healthy one when debugging "the stream died"
+ * reports: client disconnects, upstream resets and watchdog kills each point
+ * at a different culprit. `record_timeout` is the post-response bookkeeping
+ * cap in record.ts, not a stream failure.
+ */
+export type StreamOutcomeKind =
+  | 'completed'
+  | 'client_abort'
+  | 'upstream_error'
+  | 'stalled'
+  | 'timeout'
+  | 'record_timeout';
+
 export interface StreamOutcome {
+  /** How the stream settled; see StreamOutcomeKind. */
+  outcome: StreamOutcomeKind;
   /** Milliseconds until the first upstream byte reached the client. */
   ttftMs: number | null;
   /** Milliseconds until the upstream closed the stream. */
@@ -403,13 +420,14 @@ export function measureStreamTiming(
     }
   };
 
-  const finish = () => {
+  const finish = (outcome: StreamOutcomeKind) => {
     if (settled) return;
     settled = true;
     try {
       const cacheReadTokens = usage.anthropicCache || usage.openaiCache;
       const promptTokens = Math.max(0, usage.promptTokens - usage.openaiCache);
       onDone({
+        outcome,
         ttftMs,
         totalMs: Date.now() - startedAt,
         promptTokens,
@@ -445,11 +463,11 @@ export function measureStreamTiming(
   return new ReadableStream<Uint8Array>({
     async pull(controller) {
       if (failed) return;
-      const fail = (message: string) => {
+      const fail = (message: string, outcome: StreamOutcomeKind) => {
         if (failed) return;
         failed = true;
         clearTimers();
-        finish();
+        finish(outcome);
         try {
           controller.error(new UpstreamStallError(message));
         } catch {
@@ -457,10 +475,10 @@ export function measureStreamTiming(
         }
       };
       if (totalMs > 0 && totalTimer === undefined) {
-        totalTimer = setTimeout(() => fail(`upstream stream exceeded ${totalMs}ms`), totalMs);
+        totalTimer = setTimeout(() => fail(`upstream stream exceeded ${totalMs}ms`, 'timeout'), totalMs);
       }
       if (idleMs > 0) {
-        idleTimer = setTimeout(() => fail(`upstream sent no data for ${idleMs}ms`), idleMs);
+        idleTimer = setTimeout(() => fail(`upstream sent no data for ${idleMs}ms`, 'stalled'), idleMs);
       }
       if (keepaliveMs > 0 && keepTimer === undefined) {
         keepTimer = setInterval(() => {
@@ -481,7 +499,7 @@ export function measureStreamTiming(
         if (failed) return;
         if (done) {
           clearTimers();
-          finish();
+          finish('completed');
           controller.close();
           return;
         }
@@ -497,7 +515,7 @@ export function measureStreamTiming(
       } catch (error) {
         if (failed) return;
         clearTimers();
-        finish();
+        finish('upstream_error');
         try {
           controller.error(error);
         } catch {
@@ -509,7 +527,7 @@ export function measureStreamTiming(
       // The client disconnected mid-stream; still record what was observed.
       failed = true;
       clearTimers();
-      finish();
+      finish('client_abort');
       await reader.cancel().catch(() => {});
     }
   });

@@ -245,6 +245,24 @@ if __name__ == '__main__':
     again = read_accounts(db_file)
     check('migration is idempotent', again == accounts, 'second pass changed rows')
 
+    # v16: the auth audit table and the request-id correlation columns must be
+    # applied to this pre-v16 database by the same ensureSchema pass.
+    connection = sqlite3.connect(db_file)
+    tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    check('audit_logs table was created', 'audit_logs' in tables, sorted(tables))
+
+    def column_names(table):
+        return {row[1] for row in connection.execute('PRAGMA table_info(%s)' % table)}
+
+    check('usage_records gained request_id', 'request_id' in column_names('usage_records'),
+          sorted(column_names('usage_records')))
+    check('request_logs gained request_id', 'request_id' in column_names('request_logs'),
+          sorted(column_names('request_logs')))
+    version_row = connection.execute("SELECT value FROM settings WHERE key='schema_version'").fetchone()
+    check('schema_version reached 16', version_row is not None and version_row[0] == '16',
+          version_row[0] if version_row else None)
+    connection.close()
+
     print()
     print(f'PASSED {passed} / {passed + len(failures)}')
     for failure in failures:

@@ -49,6 +49,11 @@ export interface Account {
    * built-in protocol table for this account; NULL/empty means the defaults.
    */
   protocol_rules?: string | null;
+  /**
+   * OpenCode Go quota windows (rolling/weekly/monthly) as the stored usage
+   * snapshot JSON, refreshed from the official endpoint; NULL until first fetch.
+   */
+  usage_snapshot?: string | null;
   created_at: string;
 }
 
@@ -103,6 +108,10 @@ export interface UsageRecord {
   reasoning_effort?: string | null;
   /** Client User-Agent, so an unexpected caller is identifiable from usage. */
   user_agent?: string | null;
+  /** How a streamed request settled; NULL for buffered responses. See StreamOutcomeKind. */
+  stream_outcome?: string | null;
+  /** Correlation id shared with the x-request-id header and the request log. */
+  request_id?: string | null;
   created_at: string;
 }
 
@@ -117,6 +126,8 @@ export interface RequestLog {
   error_message?: string;
   latency_ms?: number;
   ttft_ms?: number | null;
+  /** Correlation id shared with the x-request-id header and the usage row. */
+  request_id?: string | null;
   created_at: string;
 }
 

@@ -10,6 +10,7 @@ import { createStripRetryState, sendWithRejectedFieldRetry, sanitizeToolSchemas,
 import { SilentRefusalDetector, guardSilentRefusalStream } from '../utils/silent-refusal';
 import { modelAllowed, modelAllowlistDenied } from '../utils/model-allowlist';
 import { streamWithRecording } from '../utils/record';
+import { scheduleUsageRefresh } from '../utils/usage-refresh';
 import { envInt, retryDelayMs, retryBudgetExceeded, sleep } from '../utils/retry';
 import { defer, Deferrable } from '../utils/background';
 import { getModelFromHeader } from '../utils/headers';
@@ -17,7 +18,7 @@ import { extractTokenUsage, calculateCostBreakdown, estimateTokens, extractReaso
 import { Account, Group, ModelMapping } from '../types';
 import { loadRoutingSnapshot } from '../utils/routing-cache';
 
-export async function handleOpenAIRequest(request: Request, env: Env, failover: FailoverManager, ctx?: Deferrable): Promise<Response> {
+export async function handleOpenAIRequest(request: Request, env: Env, failover: FailoverManager, ctx?: Deferrable, requestId = ''): Promise<Response> {
   const db = createDatabase(env.DB);
   const url = new URL(request.url);
   
@@ -130,6 +131,7 @@ export async function handleOpenAIRequest(request: Request, env: Env, failover: 
   
   const { account, group } = selection;
   const provider = account.provider;
+  scheduleUsageRefresh(account, env, ctx);
 
   // Proactive tool-schema sanitation before the first attempt (Go:
   // sanitizeToolSchema on the forward paths): repairs are in-place, and
@@ -202,8 +204,8 @@ export async function handleOpenAIRequest(request: Request, env: Env, failover: 
     if (isError && failover.shouldFailover({ status: proxyResponse.status }) && accounts.length > 1) {
       await proxyResponse.text().catch(() => '');
       failover.recordRequest(account.id, group.id, true);
-      defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: proxyResponse.status, error_message: `Upstream returned ${proxyResponse.status}`, latency_ms: Date.now() - startTime }));
-      return handleFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, model, `Upstream returned ${proxyResponse.status}`, preferredGroupId, startTime, ctx, fallbackGroupId, stickyKey, stripState);
+      defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: proxyResponse.status, error_message: `Upstream returned ${proxyResponse.status}`, latency_ms: Date.now() - startTime, request_id: requestId }));
+      return handleFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, model, `Upstream returned ${proxyResponse.status}`, preferredGroupId, startTime, ctx, fallbackGroupId, stickyKey, stripState, requestId);
     }
 
     let finalStatus = proxyResponse.status;
@@ -222,7 +224,8 @@ export async function handleOpenAIRequest(request: Request, env: Env, failover: 
           reasoningEffort,
           userAgent,
           ctx,
-          env
+          env,
+          requestId
         });
       }
       const buffered = await bufferResponsesSseAsChat(proxyResponse.body, model);
@@ -242,7 +245,8 @@ export async function handleOpenAIRequest(request: Request, env: Env, failover: 
         reasoningEffort,
         userAgent,
         ctx,
-        env
+        env,
+        requestId
       });
     }
     let responseText: string;
@@ -270,7 +274,7 @@ export async function handleOpenAIRequest(request: Request, env: Env, failover: 
     if (cost > 0) {
       defer(ctx, db.incrementApiKeyUsage(keyRecord.id, cost));
     }
-    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cache_read_tokens: cacheReadTokens, cost, base_cost: breakdown.baseCost, rate_multiplier: breakdown.multiplier, cost_estimated: breakdown.estimated ? 1 : 0, cache_status: 'bypass', status: finalStatus, error_message: finalError ? responseBody?.error?.message || 'Error' : '', latency_ms: Date.now() - startTime, reasoning_effort: reasoningEffort, user_agent: userAgent }));
+    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cache_read_tokens: cacheReadTokens, cost, base_cost: breakdown.baseCost, rate_multiplier: breakdown.multiplier, cost_estimated: breakdown.estimated ? 1 : 0, cache_status: 'bypass', status: finalStatus, error_message: finalError ? responseBody?.error?.message || 'Error' : '', latency_ms: Date.now() - startTime, reasoning_effort: reasoningEffort, user_agent: userAgent, request_id: requestId }));
     
     // Record request log
     defer(ctx, db.createRequestLog({
@@ -279,7 +283,8 @@ export async function handleOpenAIRequest(request: Request, env: Env, failover: 
       model: upstreamModel,
       status: finalStatus,
       error_message: finalError ? responseBody?.error?.message || 'Error' : '',
-      latency_ms: Date.now() - startTime
+      latency_ms: Date.now() - startTime,
+      request_id: requestId
     }));
     
     // Record for failover
@@ -297,11 +302,12 @@ export async function handleOpenAIRequest(request: Request, env: Env, failover: 
     
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    console.error(`openai attempt failed [${requestId}] account=${account.id} model=${upstreamModel}: ${errorMessage}`);
     failover.recordRequest(account.id, group.id, true);
-    defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: errorMessage, latency_ms: Date.now() - startTime }));
+    defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: errorMessage, latency_ms: Date.now() - startTime, request_id: requestId }));
     
     // Try failover
-    return handleFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, model, errorMessage, preferredGroupId, startTime, ctx, fallbackGroupId, stickyKey, stripState);
+    return handleFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, model, errorMessage, preferredGroupId, startTime, ctx, fallbackGroupId, stickyKey, stripState, requestId);
   }
 }
 
@@ -325,7 +331,8 @@ async function handleFailover(
   ctx?: Deferrable,
   fallbackGroupId = 0,
   stickyKey?: string,
-  stripState?: StripRetryState
+  stripState?: StripRetryState,
+  requestId = ''
 ): Promise<Response> {
   const db = createDatabase(env.DB);
   const url = new URL(request.url);
@@ -353,6 +360,7 @@ async function handleFailover(
     
     const { account, group } = selection;
     attempted.add(account.id);
+    scheduleUsageRefresh(account, env, ctx);
     const currentProvider = account.provider;
     // Session hints are read from the body on the retry path too, so a retried
     // OpenCode call keeps the conversation id rather than minting a new one.
@@ -420,7 +428,8 @@ async function handleFailover(
             reasoningEffort,
             userAgent,
             ctx,
-            env
+            env,
+            requestId
           });
         }
         const buffered = await bufferResponsesSseAsChat(proxyResponse.body, clientModel);
@@ -441,7 +450,8 @@ async function handleFailover(
           reasoningEffort,
           userAgent,
           ctx,
-          env
+          env,
+          requestId
         });
       }
 
@@ -452,7 +462,8 @@ async function handleFailover(
         model: upstreamModel,
         status: finalStatus,
         error_message: finalError ? errorMessage : '',
-        latency_ms: 0
+        latency_ms: 0,
+        request_id: requestId
       }));
       const responseText = finalBody !== undefined ? JSON.stringify(finalBody) : await proxyResponse.text();
 
@@ -466,7 +477,7 @@ async function handleFailover(
       if (retryBreakdown.cost > 0) {
         defer(ctx, db.incrementApiKeyUsage(keyRecord.id, retryBreakdown.cost));
       }
-      defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider: currentProvider, prompt_tokens: usage.promptTokens, completion_tokens: usage.completionTokens, total_tokens: usage.totalTokens, cache_read_tokens: usage.cacheReadTokens, cost: retryBreakdown.cost, base_cost: retryBreakdown.baseCost, rate_multiplier: retryBreakdown.multiplier, cost_estimated: retryBreakdown.estimated ? 1 : 0, cache_status: 'bypass', status: finalStatus, error_message: finalError ? retryResponseBody?.error?.message || errorMessage : '', latency_ms: Date.now() - originStart, reasoning_effort: reasoningEffort, user_agent: userAgent }));
+      defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider: currentProvider, prompt_tokens: usage.promptTokens, completion_tokens: usage.completionTokens, total_tokens: usage.totalTokens, cache_read_tokens: usage.cacheReadTokens, cost: retryBreakdown.cost, base_cost: retryBreakdown.baseCost, rate_multiplier: retryBreakdown.multiplier, cost_estimated: retryBreakdown.estimated ? 1 : 0, cache_status: 'bypass', status: finalStatus, error_message: finalError ? retryResponseBody?.error?.message || errorMessage : '', latency_ms: Date.now() - originStart, reasoning_effort: reasoningEffort, user_agent: userAgent, request_id: requestId }));
       
       return new Response(responseText, {
         status: finalStatus,
@@ -477,11 +488,14 @@ async function handleFailover(
       });
       
     } catch (retryError) {
+      const retryMessage = retryError instanceof Error ? retryError.message : 'Upstream request failed';
+      console.error(`openai retry failed [${requestId}] account=${account.id} model=${upstreamModel}: ${retryMessage}`);
       failover.recordRequest(account.id, group.id, true);
-      defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: retryError instanceof Error ? retryError.message : 'Upstream request failed', latency_ms: 0 }));
+      defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: retryMessage, latency_ms: 0, request_id: requestId }));
       continue;
     }
   }
   
+  console.error(`openai request exhausted [${requestId}] model=${upstreamModel}: ${errorMessage}`);
   return new Response(JSON.stringify({ error: 'All accounts failed', message: errorMessage }), { status: 502, headers: { 'Content-Type': 'application/json' } });
 }

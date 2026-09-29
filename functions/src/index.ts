@@ -35,4 +35,8 @@ export interface Env {
   CACHE_BREAKPOINTS?: string;
   /** Retention for usage_records/request_logs in days. '0' disables cleanup. */
   USAGE_RETENTION_DAYS?: string;
+  /** Retention for audit_logs (login/password events) in days. */
+  AUDIT_RETENTION_DAYS?: string;
+  /** Override for the OpenCode Go usage endpoint (e2e binds a local stub). */
+  OPENCODE_USAGE_URL?: string;
 }

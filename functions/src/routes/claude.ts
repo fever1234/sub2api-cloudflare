@@ -6,6 +6,7 @@ import { FailoverManager } from '../failover';
 import { proxyRequest, buildUpstreamHeaders, getUpstreamBaseUrl, findModelMapping, resolveUpstreamCredentials , accountRateMultiplier, stripBodyHeaders } from '../utils/proxy';
 import { applyOpenCodeHeaders, resolveOpenCodeSessionId } from '../utils/opencode-session';
 import { streamWithRecording } from '../utils/record';
+import { scheduleUsageRefresh } from '../utils/usage-refresh';
 import { envInt, retryDelayMs, retryBudgetExceeded, sleep } from '../utils/retry';
 import { applyAnthropicCacheBreakpoints } from '../utils/cache-breakpoints';
 import { sanitizeToolSchemas } from '../utils/responses-compat';
@@ -16,7 +17,7 @@ import { Account, Group, ModelMapping } from '../types';
 import { modelAllowed, modelAllowlistDenied } from '../utils/model-allowlist';
 import { loadRoutingSnapshot } from '../utils/routing-cache';
 
-export async function handleClaudeRequest(request: Request, env: Env, failover: FailoverManager, ctx?: Deferrable): Promise<Response> {
+export async function handleClaudeRequest(request: Request, env: Env, failover: FailoverManager, ctx?: Deferrable, requestId = ''): Promise<Response> {
   const db = createDatabase(env.DB);
   const url = new URL(request.url);
   
@@ -119,6 +120,7 @@ export async function handleClaudeRequest(request: Request, env: Env, failover: 
   
   const { account, group } = selection;
   const provider = account.provider;
+  scheduleUsageRefresh(account, env, ctx);
 
   // OpenCode's Anthropic-compatible layer exposes no count_tokens endpoint:
   // forwarding it only 404s and —worse —feeds the failure into account
@@ -188,7 +190,7 @@ export async function handleClaudeRequest(request: Request, env: Env, failover: 
         // Account-level failure: rotate through the same retry loop, which
         // writes no health for a preflight; with no candidate left its
         // exhaustion fallback answers with an estimate.
-        return handleClaudeFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), groups, mappings, upstreamModel, stream, `count_tokens upstream ${proxyResponse.status}`, preferredGroupId, startTime, ctx, fallbackGroupId, stickyKey, isCountTokens);
+        return handleClaudeFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), groups, mappings, upstreamModel, stream, `count_tokens upstream ${proxyResponse.status}`, preferredGroupId, startTime, ctx, fallbackGroupId, stickyKey, isCountTokens, requestId);
       }
       return new Response(countText, {
         status: proxyResponse.status,
@@ -206,8 +208,8 @@ export async function handleClaudeRequest(request: Request, env: Env, failover: 
     if (isError && failover.shouldFailover({ status: proxyResponse.status }) && accounts.length > 1) {
       await proxyResponse.text().catch(() => '');
       failover.recordRequest(account.id, group.id, true);
-      defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: proxyResponse.status, error_message: `Upstream returned ${proxyResponse.status}`, latency_ms: Date.now() - startTime }));
-      return handleClaudeFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), groups, mappings, upstreamModel, stream, `Upstream returned ${proxyResponse.status}`, preferredGroupId, startTime, ctx, fallbackGroupId, stickyKey);
+      defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: proxyResponse.status, error_message: `Upstream returned ${proxyResponse.status}`, latency_ms: Date.now() - startTime, request_id: requestId }));
+      return handleClaudeFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), groups, mappings, upstreamModel, stream, `Upstream returned ${proxyResponse.status}`, preferredGroupId, startTime, ctx, fallbackGroupId, stickyKey, undefined, requestId);
     }
     if (stream && proxyResponse.body) {
       // Streaming records usage from the stream's completion callback so
@@ -222,7 +224,8 @@ export async function handleClaudeRequest(request: Request, env: Env, failover: 
         reasoningEffort,
         userAgent,
         ctx,
-        env
+        env,
+        requestId
       });
     }
     const responseText = await proxyResponse.text();
@@ -242,7 +245,7 @@ export async function handleClaudeRequest(request: Request, env: Env, failover: 
     if (cost > 0) {
       defer(ctx, db.incrementApiKeyUsage(keyRecord.id, cost));
     }
-    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cache_read_tokens: cacheReadTokens, cost, base_cost: breakdown.baseCost, rate_multiplier: breakdown.multiplier, cost_estimated: breakdown.estimated ? 1 : 0, cache_status: 'bypass', status: proxyResponse.status, error_message: isError ? responseBody?.error?.message || 'Error' : '', latency_ms: Date.now() - startTime, reasoning_effort: reasoningEffort, user_agent: userAgent }));
+    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cache_read_tokens: cacheReadTokens, cost, base_cost: breakdown.baseCost, rate_multiplier: breakdown.multiplier, cost_estimated: breakdown.estimated ? 1 : 0, cache_status: 'bypass', status: proxyResponse.status, error_message: isError ? responseBody?.error?.message || 'Error' : '', latency_ms: Date.now() - startTime, reasoning_effort: reasoningEffort, user_agent: userAgent, request_id: requestId }));
     
     // Record request log
     defer(ctx, db.createRequestLog({
@@ -251,7 +254,8 @@ export async function handleClaudeRequest(request: Request, env: Env, failover: 
       model: upstreamModel,
       status: proxyResponse.status,
       error_message: isError ? responseBody?.error?.message || 'Error' : '',
-      latency_ms: Date.now() - startTime
+      latency_ms: Date.now() - startTime,
+      request_id: requestId
     }));
     
     // Record for failover
@@ -269,16 +273,17 @@ export async function handleClaudeRequest(request: Request, env: Env, failover: 
     
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    console.error(`claude attempt failed [${requestId}] account=${account.id} model=${upstreamModel}: ${errorMessage}`);
     // A preflight's transport error must not mark the account unhealthy —
     // Claude Code probes count_tokens far more often than it generates, and
     // a flaky preflight would open the breaker for real traffic.
     if (!isCountTokens) {
       failover.recordRequest(account.id, group.id, true);
-      defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: errorMessage, latency_ms: Date.now() - startTime }));
+      defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: errorMessage, latency_ms: Date.now() - startTime, request_id: requestId }));
     }
     
     // Try failover
-    return handleClaudeFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), groups, mappings, upstreamModel, stream, errorMessage, preferredGroupId, startTime, ctx, fallbackGroupId, stickyKey, isCountTokens);
+    return handleClaudeFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), groups, mappings, upstreamModel, stream, errorMessage, preferredGroupId, startTime, ctx, fallbackGroupId, stickyKey, isCountTokens, requestId);
   }
 }
 
@@ -300,7 +305,8 @@ async function handleClaudeFailover(
   ctx?: Deferrable,
   fallbackGroupId = 0,
   stickyKey?: string,
-  isCountTokens = false
+  isCountTokens = false,
+  requestId = ''
 ): Promise<Response> {
   const db = createDatabase(env.DB);
   const userAgent = request.headers.get('user-agent')?.slice(0, 255) || null;
@@ -324,6 +330,7 @@ async function handleClaudeFailover(
     
     const { account, group } = selection;
     attempted.add(account.id);
+    scheduleUsageRefresh(account, env, ctx);
     const currentProvider = account.provider;
     // Keep the conversation id stable across OpenCode retries.
     let retryBody: unknown;
@@ -409,7 +416,8 @@ async function handleClaudeFailover(
           reasoningEffort,
           userAgent,
           ctx,
-          env
+          env,
+          requestId
         });
       }
 
@@ -420,7 +428,8 @@ async function handleClaudeFailover(
         model: upstreamModel,
         status: proxyResponse.status,
         error_message: isError ? errorMessage : '',
-        latency_ms: 0
+        latency_ms: 0,
+        request_id: requestId
       }));
       const responseText = await proxyResponse.text();
 
@@ -433,7 +442,7 @@ async function handleClaudeFailover(
       if (retryBreakdown.cost > 0) {
         defer(ctx, db.incrementApiKeyUsage(keyRecord.id, retryBreakdown.cost));
       }
-      defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider: currentProvider, prompt_tokens: usage.promptTokens, completion_tokens: usage.completionTokens, total_tokens: usage.totalTokens, cache_read_tokens: usage.cacheReadTokens, cost: retryBreakdown.cost, base_cost: retryBreakdown.baseCost, rate_multiplier: retryBreakdown.multiplier, cost_estimated: retryBreakdown.estimated ? 1 : 0, cache_status: 'bypass', status: proxyResponse.status, error_message: isError ? retryResponseBody?.error?.message || errorMessage : '', latency_ms: Date.now() - originStart, reasoning_effort: reasoningEffort, user_agent: userAgent }));
+      defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider: currentProvider, prompt_tokens: usage.promptTokens, completion_tokens: usage.completionTokens, total_tokens: usage.totalTokens, cache_read_tokens: usage.cacheReadTokens, cost: retryBreakdown.cost, base_cost: retryBreakdown.baseCost, rate_multiplier: retryBreakdown.multiplier, cost_estimated: retryBreakdown.estimated ? 1 : 0, cache_status: 'bypass', status: proxyResponse.status, error_message: isError ? retryResponseBody?.error?.message || errorMessage : '', latency_ms: Date.now() - originStart, reasoning_effort: reasoningEffort, user_agent: userAgent, request_id: requestId }));
 
       return new Response(responseText, {
         status: proxyResponse.status,
@@ -441,11 +450,13 @@ async function handleClaudeFailover(
       });
       
     } catch (retryError) {
+      const retryMessage = retryError instanceof Error ? retryError.message : 'Upstream request failed';
       // Same rule as the main path: a preflight's transport error rotates
       // accounts but never writes health or logs.
       if (!isCountTokens) {
+        console.error(`claude retry failed [${requestId}] account=${account.id} model=${upstreamModel}: ${retryMessage}`);
         failover.recordRequest(account.id, group.id, true);
-        defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: retryError instanceof Error ? retryError.message : 'Upstream request failed', latency_ms: 0 }));
+        defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: retryMessage, latency_ms: 0, request_id: requestId }));
       }
       continue;
     }
@@ -459,6 +470,7 @@ async function handleClaudeFailover(
     try { parsed = JSON.parse(body); } catch { parsed = undefined; }
     return localCountTokensResponse(parsed);
   }
+  console.error(`claude request exhausted [${requestId}] model=${upstreamModel}: ${errorMessage}`);
   return new Response(JSON.stringify({ error: 'All Anthropic accounts failed', message: errorMessage }), { status: 502, headers: { 'Content-Type': 'application/json' } });
 }
 

@@ -1,5 +1,5 @@
 // functions/src/schema.ts
-var SCHEMA_VERSION = "14";
+var SCHEMA_VERSION = "16";
 var ACCOUNTS_TABLE_DDL = `CREATE TABLE IF NOT EXISTS accounts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
@@ -22,6 +22,7 @@ var ACCOUNTS_TABLE_DDL = `CREATE TABLE IF NOT EXISTS accounts (
   upstream_models_at TEXT,
   probe_model TEXT,
   protocol_rules TEXT,
+  usage_snapshot TEXT,
   created_at TEXT DEFAULT (datetime('now'))
 )`;
 var SCHEMA_STATEMENTS = [
@@ -98,6 +99,8 @@ var SCHEMA_STATEMENTS = [
     latency_ms INTEGER,
     reasoning_effort TEXT,
     user_agent TEXT,
+    stream_outcome TEXT,
+    request_id TEXT,
     created_at TEXT DEFAULT (datetime('now'))
   )`,
   `CREATE TABLE IF NOT EXISTS request_logs (
@@ -109,6 +112,20 @@ var SCHEMA_STATEMENTS = [
     status INTEGER NOT NULL,
     error_message TEXT,
     latency_ms INTEGER,
+    request_id TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+  )`,
+  // Security events: failed/succeeded logins, throttled attempts, password
+  // changes. Written by the auth handlers so a credential-guessing run leaves
+  // evidence even when every attempt was rejected before reaching a request log.
+  `CREATE TABLE IF NOT EXISTS audit_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    action TEXT NOT NULL,
+    username TEXT,
+    ok INTEGER NOT NULL DEFAULT 0,
+    ip TEXT,
+    user_agent TEXT,
+    detail TEXT,
     created_at TEXT DEFAULT (datetime('now'))
   )`,
   // Internal key/value store. Holds the auto-generated JWT signing secret so a
@@ -193,7 +210,21 @@ var ADDITIVE_COLUMNS = [
   // opencode_go: per-account protocol rules that replace the built-in default
   // table for this account (Go: credentials.protocol_rules). JSON array of
   // {pattern, protocol}; NULL means "use the defaults".
-  { table: "accounts", column: "protocol_rules", definition: "TEXT" }
+  { table: "accounts", column: "protocol_rules", definition: "TEXT" },
+  // OpenCode Go usage windows (Go: opencode_go_usage_snapshot), as the stored
+  // snapshot: status, the rolling/weekly/monthly percentages, and the backoff
+  // fields that decide when the next automatic refresh is due.
+  { table: "accounts", column: "usage_snapshot", definition: "TEXT" },
+  // How a streamed request settled (completed / client_abort / upstream_error /
+  // stalled / timeout / record_timeout). NULL on rows written before v15 and on
+  // buffered (non-streamed) responses, which never enter the stream guard.
+  { table: "usage_records", column: "stream_outcome", definition: "TEXT" },
+  // Correlation id for one client request across attempts: the value the
+  // gateway put in the x-request-id response header, so an error a client
+  // reports can be matched to the usage row, the request log and the Workers
+  // log line without guessing by timestamp. NULL on rows written before v16.
+  { table: "usage_records", column: "request_id", definition: "TEXT" },
+  { table: "request_logs", column: "request_id", definition: "TEXT" }
 ];
 
 // functions/src/db.ts
@@ -211,15 +242,36 @@ var Database = class {
     return result ?? null;
   }
   async exec(sql) {
-    await this.db.prepare(sql).run();
+    await this.runWrite(sql, []);
   }
   async insert(sql, params = []) {
-    const result = await this.db.prepare(sql).bind(...params).run();
+    const result = await this.runWrite(sql, params);
     return { lastRowId: Number(result.meta.last_row_id ?? 0), changes: Number(result.meta.changes ?? 0) };
   }
   async update(sql, params = []) {
-    const result = await this.db.prepare(sql).bind(...params).run();
+    const result = await this.runWrite(sql, params);
     return { changes: Number(result.meta.changes ?? 0) };
+  }
+  /**
+   * Run a write statement, retrying transient D1 failures.
+   *
+   * `defer()` keeps a fire-and-forget write alive, but it cannot re-run a
+   * promise that already rejected: an isolated "Network connection lost" from
+   * D1 silently dropped the row. SQL errors (constraint violations, missing
+   * columns) fail fast — only transport-shaped failures get the backoff, and a
+   * row whose write actually landed before the error may duplicate. Telemetry
+   * duplicating beats telemetry vanishing.
+   */
+  async runWrite(sql, params) {
+    const delays = [250, 750];
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await this.db.prepare(sql).bind(...params).run();
+      } catch (error) {
+        if (attempt >= delays.length || !isTransientD1Error(error)) throw error;
+        await new Promise((resolve) => setTimeout(resolve, delays[attempt]));
+      }
+    }
   }
   // User operations
   async getUserByUsername(username) {
@@ -379,6 +431,10 @@ var Database = class {
     if (updates.protocol_rules !== void 0) {
       fields.push("protocol_rules = ?");
       values.push(updates.protocol_rules);
+    }
+    if (updates.usage_snapshot !== void 0) {
+      fields.push("usage_snapshot = ?");
+      values.push(updates.usage_snapshot);
     }
     if (fields.length === 0) return { changes: 0 };
     values.push(id);
@@ -593,8 +649,8 @@ var Database = class {
   async createUsageRecord(record) {
     return this.insert(
       `INSERT INTO usage_records
-       (api_key_id, model, provider, prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, cost, base_cost, rate_multiplier, cost_estimated, cache_status, status, error_message, latency_ms, ttft_ms, group_id, account_id, reasoning_effort, user_agent)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (api_key_id, model, provider, prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, cost, base_cost, rate_multiplier, cost_estimated, cache_status, status, error_message, latency_ms, ttft_ms, group_id, account_id, reasoning_effort, user_agent, stream_outcome, request_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         record.api_key_id ?? 0,
         record.model,
@@ -615,7 +671,9 @@ var Database = class {
         record.group_id ?? null,
         record.account_id ?? null,
         record.reasoning_effort ?? null,
-        record.user_agent ?? null
+        record.user_agent ?? null,
+        record.stream_outcome ?? null,
+        record.request_id || null
       ]
     );
   }
@@ -666,8 +724,8 @@ var Database = class {
   // Request logs for error tracking
   async createRequestLog(log) {
     return this.insert(
-      `INSERT INTO request_logs (account_id, channel_id, group_id, model, status, error_message, latency_ms, ttft_ms)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO request_logs (account_id, channel_id, group_id, model, status, error_message, latency_ms, ttft_ms, request_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         log.account_id,
         0,
@@ -676,9 +734,41 @@ var Database = class {
         log.status,
         log.error_message || "",
         log.latency_ms ?? 0,
-        log.ttft_ms ?? null
+        log.ttft_ms ?? null,
+        log.request_id || null
       ]
     );
+  }
+  // Security events (login success/failure, throttled attempts, password
+  // changes). Written from the auth paths, which have no request log of their
+  // own to hang the event on.
+  async createAuditLog(entry) {
+    return this.insert(
+      `INSERT INTO audit_logs (action, username, ok, ip, user_agent, detail)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [
+        entry.action,
+        entry.username ?? null,
+        entry.ok ? 1 : 0,
+        entry.ip ?? null,
+        entry.user_agent ? entry.user_agent.slice(0, 255) : null,
+        entry.detail ?? null
+      ]
+    );
+  }
+  async listAuditLogs(limit = 100, offset = 0) {
+    return this.query(
+      "SELECT * FROM audit_logs ORDER BY id DESC LIMIT ? OFFSET ?",
+      [limit, offset]
+    );
+  }
+  async deleteAuditLogsOlderThan(days) {
+    if (days <= 0) {
+      await this.update("DELETE FROM audit_logs", []);
+      return;
+    }
+    const cutoff = sqliteTimestamp(Date.now() - days * 24 * 60 * 60 * 1e3);
+    await this.update("DELETE FROM audit_logs WHERE created_at < ?", [cutoff]);
   }
   async getAccountErrorStats(accountId, windowSeconds) {
     const cutoff = sqliteTimestamp(Date.now() - windowSeconds * 1e3);
@@ -986,6 +1076,10 @@ var Database = class {
 };
 function sqliteTimestamp(timestamp) {
   return new Date(timestamp).toISOString().slice(0, 19).replace("T", " ");
+}
+function isTransientD1Error(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return /network|connection|timeout|timed out|temporarily|unavailable|econn|socket|worker closed/i.test(message);
 }
 function createDatabase(db) {
   return new Database(db);
@@ -1411,13 +1505,14 @@ function measureStreamTiming(body, startedAt, onDone, guard, keepalive = false) 
       usage.openaiCache = Math.max(usage.openaiCache, Number(m[1]) || 0);
     }
   };
-  const finish = () => {
+  const finish = (outcome) => {
     if (settled) return;
     settled = true;
     try {
       const cacheReadTokens = usage.anthropicCache || usage.openaiCache;
       const promptTokens = Math.max(0, usage.promptTokens - usage.openaiCache);
       onDone({
+        outcome,
         ttftMs,
         totalMs: Date.now() - startedAt,
         promptTokens,
@@ -1447,21 +1542,21 @@ function measureStreamTiming(body, startedAt, onDone, guard, keepalive = false) 
   return new ReadableStream({
     async pull(controller) {
       if (failed) return;
-      const fail = (message) => {
+      const fail = (message, outcome) => {
         if (failed) return;
         failed = true;
         clearTimers();
-        finish();
+        finish(outcome);
         try {
           controller.error(new UpstreamStallError(message));
         } catch {
         }
       };
       if (totalMs > 0 && totalTimer === void 0) {
-        totalTimer = setTimeout(() => fail(`upstream stream exceeded ${totalMs}ms`), totalMs);
+        totalTimer = setTimeout(() => fail(`upstream stream exceeded ${totalMs}ms`, "timeout"), totalMs);
       }
       if (idleMs > 0) {
-        idleTimer = setTimeout(() => fail(`upstream sent no data for ${idleMs}ms`), idleMs);
+        idleTimer = setTimeout(() => fail(`upstream sent no data for ${idleMs}ms`, "stalled"), idleMs);
       }
       if (keepaliveMs > 0 && keepTimer === void 0) {
         keepTimer = setInterval(() => {
@@ -1479,7 +1574,7 @@ function measureStreamTiming(body, startedAt, onDone, guard, keepalive = false) 
         if (failed) return;
         if (done) {
           clearTimers();
-          finish();
+          finish("completed");
           controller.close();
           return;
         }
@@ -1493,7 +1588,7 @@ function measureStreamTiming(body, startedAt, onDone, guard, keepalive = false) 
       } catch (error) {
         if (failed) return;
         clearTimers();
-        finish();
+        finish("upstream_error");
         try {
           controller.error(error);
         } catch {
@@ -1503,7 +1598,7 @@ function measureStreamTiming(body, startedAt, onDone, guard, keepalive = false) 
     async cancel() {
       failed = true;
       clearTimers();
-      finish();
+      finish("client_abort");
       await reader.cancel().catch(() => {
       });
     }
@@ -1623,8 +1718,8 @@ var FailoverManager = class {
     if (Number(acc.last_check_ok) !== 0) return false;
     const raw = String(acc.last_check_at || "");
     if (!raw) return false;
-    const iso = /^\d{4}-\d{2}-\d{2}[ T]/.test(raw) ? raw.replace(" ", "T") + (/[Zz]|[+-]\d\d:?\d\d$/.test(raw) ? "" : "Z") : raw;
-    const at = Date.parse(iso);
+    const iso2 = /^\d{4}-\d{2}-\d{2}[ T]/.test(raw) ? raw.replace(" ", "T") + (/[Zz]|[+-]\d\d:?\d\d$/.test(raw) ? "" : "Z") : raw;
+    const at = Date.parse(iso2);
     if (!Number.isFinite(at)) return false;
     return Date.now() - at <= this.probeFailTtlMs;
   }
@@ -3547,7 +3642,7 @@ async function streamWithRecording(body, status, headers, context) {
   let timer;
   const timeout = new Promise((resolve) => {
     timer = setTimeout(
-      () => resolve({ promptTokens: 0, completionTokens: 0, totalTokens: 0, cacheReadTokens: 0, ttftMs: null, totalMs: Date.now() - context.startedAt }),
+      () => resolve({ outcome: "record_timeout", promptTokens: 0, completionTokens: 0, totalTokens: 0, cacheReadTokens: 0, ttftMs: null, totalMs: Date.now() - context.startedAt }),
       STREAM_RECORD_TIMEOUT_MS
     );
   });
@@ -3587,8 +3682,10 @@ async function streamWithRecording(body, status, headers, context) {
       error_message: isError ? "Upstream error" : "",
       latency_ms: outcome.totalMs,
       ttft_ms: outcome.ttftMs ?? void 0,
+      stream_outcome: outcome.outcome,
       reasoning_effort: context.reasoningEffort ?? null,
-      user_agent: context.userAgent ?? null
+      user_agent: context.userAgent ?? null,
+      request_id: context.requestId || null
     }).catch(() => {
     });
     await context.db.createRequestLog({
@@ -3598,10 +3695,12 @@ async function streamWithRecording(body, status, headers, context) {
       status,
       error_message: isError ? "Upstream error" : "",
       latency_ms: outcome.totalMs,
-      ttft_ms: outcome.ttftMs ?? void 0
+      ttft_ms: outcome.ttftMs ?? void 0,
+      request_id: context.requestId || null
     }).catch(() => {
     });
-  }).catch(() => {
+  }).catch((error) => {
+    console.error(`stream record failed [${context.requestId || "?"}] account=${context.accountId}: ${error instanceof Error ? error.message : String(error)}`);
   });
   context.ctx?.waitUntil?.(persist2);
   context.failover.recordRequest(context.accountId, context.groupId, isError);
@@ -3614,6 +3713,186 @@ async function streamWithRecording(body, status, headers, context) {
     status,
     headers: outHeaders
   });
+}
+
+// functions/src/utils/usage-refresh.ts
+var OPENCODE_USAGE_DEFAULT_URL = "https://opencode.ai/zen/go/v1/usage";
+var OPENCODE_USAGE_INTERVAL_MS = 15 * 60 * 1e3;
+var OPENCODE_USAGE_MANUAL_MIN_GAP_MS = 30 * 1e3;
+var REQUEST_TIMEOUT_MS = 15e3;
+var MAX_BODY_BYTES = 512 * 1024;
+var MAX_BACKOFF_MS = 24 * 60 * 60 * 1e3;
+function readUsageSnapshot(account) {
+  const raw = account?.usage_snapshot;
+  if (!raw) return null;
+  try {
+    const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+    if (!parsed || typeof parsed !== "object" || !parsed.last_attempt_at) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+function isOpenCodeGoBaseUrl(raw) {
+  const value = String(raw || "").trim();
+  if (!value || /[?#]/.test(value)) return false;
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    return false;
+  }
+  if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) return false;
+  if (url.hostname.toLowerCase() !== "opencode.ai") return false;
+  if (url.host.toLowerCase() !== "opencode.ai") return false;
+  const path = url.pathname.replace(/\/$/, "").toLowerCase();
+  return path === "/zen/go/v1" || path === "/zen/go";
+}
+function isOpenCodeGoUsageAccount(account) {
+  if (!account || !String(account.api_key || "").trim()) return false;
+  if (account.provider === "opencode_go") return true;
+  if (account.provider !== "openai" && account.provider !== "anthropic") return false;
+  return isOpenCodeGoBaseUrl(account.base_url);
+}
+function isUsageRefreshDue(snapshot, now, intervalMs = OPENCODE_USAGE_INTERVAL_MS) {
+  if (!snapshot) return true;
+  if (snapshot.status === "ok") {
+    const fetched = Date.parse(snapshot.fetched_at || "");
+    if (!Number.isFinite(fetched)) return true;
+    return now >= fetched + intervalMs;
+  }
+  const next = Date.parse(snapshot.next_refresh_at || "");
+  if (!Number.isFinite(next)) return true;
+  return now >= next;
+}
+function isManualRefreshRateLimited(snapshot, now) {
+  const last = Date.parse(snapshot?.last_attempt_at || "");
+  return Number.isFinite(last) && now - last < OPENCODE_USAGE_MANUAL_MIN_GAP_MS;
+}
+function emptyWindow() {
+  return { status: "", percent: 0, resets_at: null };
+}
+function windowFrom(raw) {
+  if (!raw || typeof raw !== "object") return emptyWindow();
+  const source = raw;
+  const percent = Number(source.percent);
+  const resetRaw = String(source.resetsAt ?? source.resets_at ?? "");
+  const reset = Date.parse(resetRaw);
+  return {
+    status: String(source.status ?? ""),
+    percent: Number.isFinite(percent) ? percent : 0,
+    resets_at: Number.isFinite(reset) ? new Date(reset).toISOString() : null
+  };
+}
+function parseOpenCodeGoUsageJson(text) {
+  let root;
+  try {
+    root = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!root || typeof root !== "object" || Array.isArray(root)) return null;
+  const envelope = root;
+  const usage = envelope.usage && typeof envelope.usage === "object" ? envelope.usage : root;
+  return {
+    rolling: windowFrom(usage.rolling),
+    weekly: windowFrom(usage.weekly),
+    monthly: windowFrom(usage.monthly)
+  };
+}
+function iso(now) {
+  return new Date(now).toISOString();
+}
+function failureDelayMs(failureCount, intervalMs) {
+  const exponent = Math.min(Math.max(failureCount - 1, 0), 6);
+  return Math.min(intervalMs * 2 ** exponent, MAX_BACKOFF_MS);
+}
+function buildFailure(previous, now, reason, httpStatus, status, intervalMs) {
+  const failureCount = (previous?.failure_count || 0) + 1;
+  const snapshot = {
+    status,
+    last_attempt_at: iso(now),
+    next_refresh_at: iso(now + failureDelayMs(failureCount, intervalMs)),
+    failure_count: failureCount,
+    last_error: reason
+  };
+  if (httpStatus) snapshot.http_status = httpStatus;
+  if (previous?.data) snapshot.data = previous.data;
+  if (previous?.fetched_at) snapshot.fetched_at = previous.fetched_at;
+  return snapshot;
+}
+async function refreshAccountUsage(account, env, intervalMs = OPENCODE_USAGE_INTERVAL_MS) {
+  const now = Date.now();
+  const url = String(env.OPENCODE_USAGE_URL || "").trim() || OPENCODE_USAGE_DEFAULT_URL;
+  const previous = readUsageSnapshot(account);
+  let snapshot;
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      redirect: "manual",
+      headers: {
+        accept: "application/json",
+        authorization: `Bearer ${String(account.api_key || "")}`,
+        "user-agent": "sub2api-opencode-go-usage/1"
+      },
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+    });
+    const status = response.status;
+    if (status >= 300 && status < 400) {
+      snapshot = buildFailure(previous, now, "redirect_blocked", status, "failed", intervalMs);
+    } else if (status === 401) {
+      snapshot = buildFailure(previous, now, "unauthorized", status, "unauthorized", intervalMs);
+    } else if (status === 403) {
+      snapshot = buildFailure(previous, now, "subscription_required (403)", status, "failed", intervalMs);
+    } else if (status < 200 || status >= 300) {
+      snapshot = buildFailure(previous, now, "http_error", status, "failed", intervalMs);
+    } else {
+      const text = await response.text();
+      if (text.length > MAX_BODY_BYTES) {
+        snapshot = buildFailure(previous, now, "response_too_large", status, "failed", intervalMs);
+      } else {
+        const data = parseOpenCodeGoUsageJson(text);
+        snapshot = data ? {
+          status: "ok",
+          data,
+          fetched_at: iso(now),
+          last_attempt_at: iso(now),
+          next_refresh_at: iso(now + intervalMs),
+          http_status: status
+        } : buildFailure(previous, now, "invalid_json", status, "failed", intervalMs);
+      }
+    }
+  } catch (error) {
+    const reason = error instanceof Error && error.name === "TimeoutError" ? "request_timeout" : "request_failed";
+    snapshot = buildFailure(previous, now, reason, 0, "failed", intervalMs);
+  }
+  const raw = JSON.stringify(snapshot);
+  const db = createDatabase(env.DB);
+  await db.updateAccount(account.id, { usage_snapshot: raw }).catch(() => {
+  });
+  account.usage_snapshot = raw;
+  return snapshot;
+}
+var inflight = /* @__PURE__ */ new Map();
+function scheduleUsageRefresh(account, env, ctx) {
+  try {
+    if (!isOpenCodeGoUsageAccount(account)) return;
+    if (inflight.has(account.id)) return;
+    if (!isUsageRefreshDue(readUsageSnapshot(account), Date.now())) return;
+    const task = refreshAccountUsage(account, env).catch(() => void 0).finally(() => {
+      inflight.delete(account.id);
+    });
+    inflight.set(account.id, task);
+    ctx?.waitUntil?.(task);
+  } catch {
+  }
+}
+function usageStateFromAccount(account) {
+  return {
+    account_id: Number(account?.id) || 0,
+    eligible: isOpenCodeGoUsageAccount(account),
+    snapshot: readUsageSnapshot(account)
+  };
 }
 
 // functions/src/utils/cache-breakpoints.ts
@@ -3728,7 +4007,7 @@ function routingCacheMetrics() {
 }
 
 // functions/src/routes/gateway.ts
-async function handleGatewayRequest(request, env, failover, ctx) {
+async function handleGatewayRequest(request, env, failover, ctx, requestId = "") {
   const db = createDatabase(env.DB);
   const url = new URL(request.url);
   const authHeader = request.headers.get("authorization");
@@ -3793,6 +4072,7 @@ async function handleGatewayRequest(request, env, failover, ctx) {
     return new Response(JSON.stringify({ error: "No available accounts" }), { status: 503, headers: { "Content-Type": "application/json" } });
   }
   const { account, group, stats } = selection;
+  scheduleUsageRefresh(account, env, ctx);
   const credentials = resolveUpstreamCredentials(account);
   const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, provider);
   let upstreamPath = url.pathname;
@@ -3871,8 +4151,8 @@ async function handleGatewayRequest(request, env, failover, ctx) {
     if (isError && failover.shouldFailover({ status: responseStatus }) && accounts.length > 1) {
       await proxyResponse.text().catch(() => "");
       failover.recordRequest(account.id, group.id, true);
-      defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: responseStatus, error_message: `Upstream returned ${responseStatus}`, latency_ms: Date.now() - startTime }));
-      return handleFailover(chatBody, request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, model, `Upstream returned ${responseStatus}`, preferredGroupId, startTime, ctx, fallbackGroupId, stickyKey, stripState);
+      defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: responseStatus, error_message: `Upstream returned ${responseStatus}`, latency_ms: Date.now() - startTime, request_id: requestId }));
+      return handleFailover(chatBody, request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, model, `Upstream returned ${responseStatus}`, preferredGroupId, startTime, ctx, fallbackGroupId, stickyKey, stripState, requestId);
     }
     let finalBody;
     if (bridgedBody !== void 0 && !isError) {
@@ -3890,7 +4170,8 @@ async function handleGatewayRequest(request, env, failover, ctx) {
           reasoningEffort,
           userAgent,
           ctx,
-          env
+          env,
+          requestId
         });
       }
       const buffered = await bufferResponsesSseAsChat(proxyResponse.body, model);
@@ -3912,7 +4193,8 @@ async function handleGatewayRequest(request, env, failover, ctx) {
         reasoningEffort,
         userAgent,
         ctx,
-        env
+        env,
+        requestId
       });
     }
     let responseText;
@@ -3933,14 +4215,15 @@ async function handleGatewayRequest(request, env, failover, ctx) {
     if (cost > 0) {
       defer(ctx, db.incrementApiKeyUsage(keyRecord.id, cost));
     }
-    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cache_read_tokens: cacheReadTokens, cost, base_cost: breakdown.baseCost, rate_multiplier: breakdown.multiplier, cost_estimated: breakdown.estimated ? 1 : 0, cache_status: "bypass", status: responseStatus, error_message: isError ? responseBody?.error?.message || "Error" : "", latency_ms: Date.now() - startTime, reasoning_effort: reasoningEffort, user_agent: userAgent }));
+    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cache_read_tokens: cacheReadTokens, cost, base_cost: breakdown.baseCost, rate_multiplier: breakdown.multiplier, cost_estimated: breakdown.estimated ? 1 : 0, cache_status: "bypass", status: responseStatus, error_message: isError ? responseBody?.error?.message || "Error" : "", latency_ms: Date.now() - startTime, reasoning_effort: reasoningEffort, user_agent: userAgent, request_id: requestId }));
     defer(ctx, db.createRequestLog({
       account_id: account.id,
       group_id: group.id,
       model: upstreamModel,
       status: responseStatus,
       error_message: isError ? responseBody?.error?.message || `Upstream returned ${responseStatus}` : "",
-      latency_ms: Date.now() - startTime
+      latency_ms: Date.now() - startTime,
+      request_id: requestId
     }));
     failover.recordRequest(account.id, group.id, isError);
     return new Response(responseText, {
@@ -3957,12 +4240,13 @@ async function handleGatewayRequest(request, env, failover, ctx) {
     isError = true;
     errorMessage = error instanceof Error ? error.message : "Unknown error";
     responseStatus = 502;
+    console.error(`gateway attempt failed [${requestId}] account=${account.id} model=${upstreamModel}: ${errorMessage}`);
     failover.recordRequest(account.id, group.id, true);
-    defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: errorMessage, latency_ms: Date.now() - startTime }));
-    return handleFailover(chatBody, request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, model, errorMessage, preferredGroupId, startTime, ctx, fallbackGroupId, stickyKey, stripState);
+    defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: errorMessage, latency_ms: Date.now() - startTime, request_id: requestId }));
+    return handleFailover(chatBody, request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, model, errorMessage, preferredGroupId, startTime, ctx, fallbackGroupId, stickyKey, stripState, requestId);
   }
 }
-async function handleFailover(body, request, env, failover, keyRecord, accounts, groups, mappings, provider, upstreamModel, stream, clientModel, errorMessage, preferredGroupId, originStart = Date.now(), ctx, fallbackGroupId = 0, stickyKey, stripState) {
+async function handleFailover(body, request, env, failover, keyRecord, accounts, groups, mappings, provider, upstreamModel, stream, clientModel, errorMessage, preferredGroupId, originStart = Date.now(), ctx, fallbackGroupId = 0, stickyKey, stripState, requestId = "") {
   const db = createDatabase(env.DB);
   const userAgent = request.headers.get("user-agent")?.slice(0, 255) || null;
   let requestMetaBody;
@@ -3986,6 +4270,7 @@ async function handleFailover(body, request, env, failover, keyRecord, accounts,
     }
     const { account, group } = selection;
     attempted.add(account.id);
+    scheduleUsageRefresh(account, env, ctx);
     let retryBody;
     try {
       retryBody = body ? JSON.parse(body) : void 0;
@@ -4061,7 +4346,8 @@ async function handleFailover(body, request, env, failover, keyRecord, accounts,
             reasoningEffort,
             userAgent,
             ctx,
-            env
+            env,
+            requestId
           });
         }
         const buffered = await bufferResponsesSseAsChat(proxyResponse.body, clientModel);
@@ -4083,7 +4369,8 @@ async function handleFailover(body, request, env, failover, keyRecord, accounts,
           reasoningEffort,
           userAgent,
           ctx,
-          env
+          env,
+          requestId
         });
       }
       failover.recordRequest(account.id, group.id, finalError);
@@ -4093,7 +4380,8 @@ async function handleFailover(body, request, env, failover, keyRecord, accounts,
         model: upstreamModel,
         status: finalStatus,
         error_message: finalError ? errorMessage || `Upstream returned ${finalStatus}` : "",
-        latency_ms: 0
+        latency_ms: 0,
+        request_id: requestId
       }));
       const responseText = finalBody !== void 0 ? JSON.stringify(finalBody) : await proxyResponse.text();
       let retryResponseBody = {};
@@ -4106,7 +4394,7 @@ async function handleFailover(body, request, env, failover, keyRecord, accounts,
       if (retryBreakdown.cost > 0) {
         defer(ctx, db.incrementApiKeyUsage(keyRecord.id, retryBreakdown.cost));
       }
-      defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: usage.promptTokens, completion_tokens: usage.completionTokens, total_tokens: usage.totalTokens, cache_read_tokens: usage.cacheReadTokens, cost: retryBreakdown.cost, base_cost: retryBreakdown.baseCost, rate_multiplier: retryBreakdown.multiplier, cost_estimated: retryBreakdown.estimated ? 1 : 0, cache_status: "bypass", status: finalStatus, error_message: finalError ? retryResponseBody?.error?.message || errorMessage : "", latency_ms: Date.now() - originStart, reasoning_effort: reasoningEffort, user_agent: userAgent }));
+      defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: usage.promptTokens, completion_tokens: usage.completionTokens, total_tokens: usage.totalTokens, cache_read_tokens: usage.cacheReadTokens, cost: retryBreakdown.cost, base_cost: retryBreakdown.baseCost, rate_multiplier: retryBreakdown.multiplier, cost_estimated: retryBreakdown.estimated ? 1 : 0, cache_status: "bypass", status: finalStatus, error_message: finalError ? retryResponseBody?.error?.message || errorMessage : "", latency_ms: Date.now() - originStart, reasoning_effort: reasoningEffort, user_agent: userAgent, request_id: requestId }));
       return new Response(responseText, {
         status: finalStatus,
         headers: {
@@ -4116,11 +4404,14 @@ async function handleFailover(body, request, env, failover, keyRecord, accounts,
         }
       });
     } catch (retryError) {
+      const retryMessage = retryError instanceof Error ? retryError.message : "Upstream request failed";
+      console.error(`gateway retry failed [${requestId}] account=${account.id} model=${upstreamModel}: ${retryMessage}`);
       failover.recordRequest(account.id, group.id, true);
-      defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: retryError instanceof Error ? retryError.message : "Upstream request failed", latency_ms: 0 }));
+      defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: retryMessage, latency_ms: 0, request_id: requestId }));
       continue;
     }
   }
+  console.error(`gateway request exhausted [${requestId}] model=${upstreamModel}: ${errorMessage}`);
   return new Response(JSON.stringify({
     error: "All accounts failed",
     message: errorMessage
@@ -4147,7 +4438,7 @@ function getModelFromHeader(request) {
 }
 
 // functions/src/routes/openai.ts
-async function handleOpenAIRequest(request, env, failover, ctx) {
+async function handleOpenAIRequest(request, env, failover, ctx, requestId = "") {
   const db = createDatabase(env.DB);
   const url = new URL(request.url);
   const authHeader = request.headers.get("authorization");
@@ -4223,6 +4514,7 @@ async function handleOpenAIRequest(request, env, failover, ctx) {
   }
   const { account, group } = selection;
   const provider = account.provider;
+  scheduleUsageRefresh(account, env, ctx);
   sanitizeToolSchemas(requestBody, { removeLookaround: provider === "openai" });
   let bridged = false;
   let outboundBody = requestBody;
@@ -4272,8 +4564,8 @@ async function handleOpenAIRequest(request, env, failover, ctx) {
     if (isError && failover.shouldFailover({ status: proxyResponse.status }) && accounts.length > 1) {
       await proxyResponse.text().catch(() => "");
       failover.recordRequest(account.id, group.id, true);
-      defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: proxyResponse.status, error_message: `Upstream returned ${proxyResponse.status}`, latency_ms: Date.now() - startTime }));
-      return handleFailover2(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, model, `Upstream returned ${proxyResponse.status}`, preferredGroupId, startTime, ctx, fallbackGroupId, stickyKey, stripState);
+      defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: proxyResponse.status, error_message: `Upstream returned ${proxyResponse.status}`, latency_ms: Date.now() - startTime, request_id: requestId }));
+      return handleFailover2(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, model, `Upstream returned ${proxyResponse.status}`, preferredGroupId, startTime, ctx, fallbackGroupId, stickyKey, stripState, requestId);
     }
     let finalStatus = proxyResponse.status;
     let finalBody;
@@ -4292,7 +4584,8 @@ async function handleOpenAIRequest(request, env, failover, ctx) {
           reasoningEffort,
           userAgent,
           ctx,
-          env
+          env,
+          requestId
         });
       }
       const buffered = await bufferResponsesSseAsChat(proxyResponse.body, model);
@@ -4313,7 +4606,8 @@ async function handleOpenAIRequest(request, env, failover, ctx) {
         reasoningEffort,
         userAgent,
         ctx,
-        env
+        env,
+        requestId
       });
     }
     let responseText;
@@ -4335,14 +4629,15 @@ async function handleOpenAIRequest(request, env, failover, ctx) {
     if (cost > 0) {
       defer(ctx, db.incrementApiKeyUsage(keyRecord.id, cost));
     }
-    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cache_read_tokens: cacheReadTokens, cost, base_cost: breakdown.baseCost, rate_multiplier: breakdown.multiplier, cost_estimated: breakdown.estimated ? 1 : 0, cache_status: "bypass", status: finalStatus, error_message: finalError ? responseBody?.error?.message || "Error" : "", latency_ms: Date.now() - startTime, reasoning_effort: reasoningEffort, user_agent: userAgent }));
+    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cache_read_tokens: cacheReadTokens, cost, base_cost: breakdown.baseCost, rate_multiplier: breakdown.multiplier, cost_estimated: breakdown.estimated ? 1 : 0, cache_status: "bypass", status: finalStatus, error_message: finalError ? responseBody?.error?.message || "Error" : "", latency_ms: Date.now() - startTime, reasoning_effort: reasoningEffort, user_agent: userAgent, request_id: requestId }));
     defer(ctx, db.createRequestLog({
       account_id: account.id,
       group_id: group.id,
       model: upstreamModel,
       status: finalStatus,
       error_message: finalError ? responseBody?.error?.message || "Error" : "",
-      latency_ms: Date.now() - startTime
+      latency_ms: Date.now() - startTime,
+      request_id: requestId
     }));
     failover.recordRequest(account.id, group.id, finalError);
     return new Response(responseText, {
@@ -4357,12 +4652,13 @@ async function handleOpenAIRequest(request, env, failover, ctx) {
     });
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : "Unknown error";
+    console.error(`openai attempt failed [${requestId}] account=${account.id} model=${upstreamModel}: ${errorMessage}`);
     failover.recordRequest(account.id, group.id, true);
-    defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: errorMessage, latency_ms: Date.now() - startTime }));
-    return handleFailover2(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, model, errorMessage, preferredGroupId, startTime, ctx, fallbackGroupId, stickyKey, stripState);
+    defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: errorMessage, latency_ms: Date.now() - startTime, request_id: requestId }));
+    return handleFailover2(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, model, errorMessage, preferredGroupId, startTime, ctx, fallbackGroupId, stickyKey, stripState, requestId);
   }
 }
-async function handleFailover2(body, request, env, failover, keyRecord, accounts, groups, mappings, provider, upstreamModel, stream, clientModel, errorMessage, preferredGroupId, originStart = Date.now(), ctx, fallbackGroupId = 0, stickyKey, stripState) {
+async function handleFailover2(body, request, env, failover, keyRecord, accounts, groups, mappings, provider, upstreamModel, stream, clientModel, errorMessage, preferredGroupId, originStart = Date.now(), ctx, fallbackGroupId = 0, stickyKey, stripState, requestId = "") {
   const db = createDatabase(env.DB);
   const url = new URL(request.url);
   const isResponses = url.pathname.includes("/responses");
@@ -4388,6 +4684,7 @@ async function handleFailover2(body, request, env, failover, keyRecord, accounts
     if (!selection) break;
     const { account, group } = selection;
     attempted.add(account.id);
+    scheduleUsageRefresh(account, env, ctx);
     const currentProvider = account.provider;
     let retryBody;
     try {
@@ -4456,7 +4753,8 @@ async function handleFailover2(body, request, env, failover, keyRecord, accounts
             reasoningEffort,
             userAgent,
             ctx,
-            env
+            env,
+            requestId
           });
         }
         const buffered = await bufferResponsesSseAsChat(proxyResponse.body, clientModel);
@@ -4478,7 +4776,8 @@ async function handleFailover2(body, request, env, failover, keyRecord, accounts
           reasoningEffort,
           userAgent,
           ctx,
-          env
+          env,
+          requestId
         });
       }
       failover.recordRequest(account.id, group.id, finalError);
@@ -4488,7 +4787,8 @@ async function handleFailover2(body, request, env, failover, keyRecord, accounts
         model: upstreamModel,
         status: finalStatus,
         error_message: finalError ? errorMessage : "",
-        latency_ms: 0
+        latency_ms: 0,
+        request_id: requestId
       }));
       const responseText = finalBody !== void 0 ? JSON.stringify(finalBody) : await proxyResponse.text();
       let retryResponseBody = {};
@@ -4501,7 +4801,7 @@ async function handleFailover2(body, request, env, failover, keyRecord, accounts
       if (retryBreakdown.cost > 0) {
         defer(ctx, db.incrementApiKeyUsage(keyRecord.id, retryBreakdown.cost));
       }
-      defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider: currentProvider, prompt_tokens: usage.promptTokens, completion_tokens: usage.completionTokens, total_tokens: usage.totalTokens, cache_read_tokens: usage.cacheReadTokens, cost: retryBreakdown.cost, base_cost: retryBreakdown.baseCost, rate_multiplier: retryBreakdown.multiplier, cost_estimated: retryBreakdown.estimated ? 1 : 0, cache_status: "bypass", status: finalStatus, error_message: finalError ? retryResponseBody?.error?.message || errorMessage : "", latency_ms: Date.now() - originStart, reasoning_effort: reasoningEffort, user_agent: userAgent }));
+      defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider: currentProvider, prompt_tokens: usage.promptTokens, completion_tokens: usage.completionTokens, total_tokens: usage.totalTokens, cache_read_tokens: usage.cacheReadTokens, cost: retryBreakdown.cost, base_cost: retryBreakdown.baseCost, rate_multiplier: retryBreakdown.multiplier, cost_estimated: retryBreakdown.estimated ? 1 : 0, cache_status: "bypass", status: finalStatus, error_message: finalError ? retryResponseBody?.error?.message || errorMessage : "", latency_ms: Date.now() - originStart, reasoning_effort: reasoningEffort, user_agent: userAgent, request_id: requestId }));
       return new Response(responseText, {
         status: finalStatus,
         headers: {
@@ -4511,16 +4811,19 @@ async function handleFailover2(body, request, env, failover, keyRecord, accounts
         }
       });
     } catch (retryError) {
+      const retryMessage = retryError instanceof Error ? retryError.message : "Upstream request failed";
+      console.error(`openai retry failed [${requestId}] account=${account.id} model=${upstreamModel}: ${retryMessage}`);
       failover.recordRequest(account.id, group.id, true);
-      defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: retryError instanceof Error ? retryError.message : "Upstream request failed", latency_ms: 0 }));
+      defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: retryMessage, latency_ms: 0, request_id: requestId }));
       continue;
     }
   }
+  console.error(`openai request exhausted [${requestId}] model=${upstreamModel}: ${errorMessage}`);
   return new Response(JSON.stringify({ error: "All accounts failed", message: errorMessage }), { status: 502, headers: { "Content-Type": "application/json" } });
 }
 
 // functions/src/routes/claude.ts
-async function handleClaudeRequest(request, env, failover, ctx) {
+async function handleClaudeRequest(request, env, failover, ctx, requestId = "") {
   const db = createDatabase(env.DB);
   const url = new URL(request.url);
   const authHeader = request.headers.get("authorization");
@@ -4589,6 +4892,7 @@ async function handleClaudeRequest(request, env, failover, ctx) {
   }
   const { account, group } = selection;
   const provider = account.provider;
+  scheduleUsageRefresh(account, env, ctx);
   if (isCountTokens && provider === "opencode_go") {
     return localCountTokensResponse(requestBody);
   }
@@ -4626,7 +4930,7 @@ async function handleClaudeRequest(request, env, failover, ctx) {
         return localCountTokensResponse(requestBody);
       }
       if (failover.shouldFailover({ status: proxyResponse.status })) {
-        return handleClaudeFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, upstreamModel, stream, `count_tokens upstream ${proxyResponse.status}`, preferredGroupId, startTime, ctx, fallbackGroupId, stickyKey, isCountTokens);
+        return handleClaudeFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, upstreamModel, stream, `count_tokens upstream ${proxyResponse.status}`, preferredGroupId, startTime, ctx, fallbackGroupId, stickyKey, isCountTokens, requestId);
       }
       return new Response(countText, {
         status: proxyResponse.status,
@@ -4643,8 +4947,8 @@ async function handleClaudeRequest(request, env, failover, ctx) {
     if (isError && failover.shouldFailover({ status: proxyResponse.status }) && accounts.length > 1) {
       await proxyResponse.text().catch(() => "");
       failover.recordRequest(account.id, group.id, true);
-      defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: proxyResponse.status, error_message: `Upstream returned ${proxyResponse.status}`, latency_ms: Date.now() - startTime }));
-      return handleClaudeFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, upstreamModel, stream, `Upstream returned ${proxyResponse.status}`, preferredGroupId, startTime, ctx, fallbackGroupId, stickyKey);
+      defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: proxyResponse.status, error_message: `Upstream returned ${proxyResponse.status}`, latency_ms: Date.now() - startTime, request_id: requestId }));
+      return handleClaudeFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, upstreamModel, stream, `Upstream returned ${proxyResponse.status}`, preferredGroupId, startTime, ctx, fallbackGroupId, stickyKey, void 0, requestId);
     }
     if (stream && proxyResponse.body) {
       return await streamWithRecording(proxyResponse.body, proxyResponse.status, proxyResponse.headers, {
@@ -4660,7 +4964,8 @@ async function handleClaudeRequest(request, env, failover, ctx) {
         reasoningEffort,
         userAgent,
         ctx,
-        env
+        env,
+        requestId
       });
     }
     const responseText = await proxyResponse.text();
@@ -4675,14 +4980,15 @@ async function handleClaudeRequest(request, env, failover, ctx) {
     if (cost > 0) {
       defer(ctx, db.incrementApiKeyUsage(keyRecord.id, cost));
     }
-    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cache_read_tokens: cacheReadTokens, cost, base_cost: breakdown.baseCost, rate_multiplier: breakdown.multiplier, cost_estimated: breakdown.estimated ? 1 : 0, cache_status: "bypass", status: proxyResponse.status, error_message: isError ? responseBody?.error?.message || "Error" : "", latency_ms: Date.now() - startTime, reasoning_effort: reasoningEffort, user_agent: userAgent }));
+    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cache_read_tokens: cacheReadTokens, cost, base_cost: breakdown.baseCost, rate_multiplier: breakdown.multiplier, cost_estimated: breakdown.estimated ? 1 : 0, cache_status: "bypass", status: proxyResponse.status, error_message: isError ? responseBody?.error?.message || "Error" : "", latency_ms: Date.now() - startTime, reasoning_effort: reasoningEffort, user_agent: userAgent, request_id: requestId }));
     defer(ctx, db.createRequestLog({
       account_id: account.id,
       group_id: group.id,
       model: upstreamModel,
       status: proxyResponse.status,
       error_message: isError ? responseBody?.error?.message || "Error" : "",
-      latency_ms: Date.now() - startTime
+      latency_ms: Date.now() - startTime,
+      request_id: requestId
     }));
     failover.recordRequest(account.id, group.id, isError);
     return new Response(responseText, {
@@ -4697,14 +5003,15 @@ async function handleClaudeRequest(request, env, failover, ctx) {
     });
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : "Unknown error";
+    console.error(`claude attempt failed [${requestId}] account=${account.id} model=${upstreamModel}: ${errorMessage}`);
     if (!isCountTokens) {
       failover.recordRequest(account.id, group.id, true);
-      defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: errorMessage, latency_ms: Date.now() - startTime }));
+      defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: errorMessage, latency_ms: Date.now() - startTime, request_id: requestId }));
     }
-    return handleClaudeFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, upstreamModel, stream, errorMessage, preferredGroupId, startTime, ctx, fallbackGroupId, stickyKey, isCountTokens);
+    return handleClaudeFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, upstreamModel, stream, errorMessage, preferredGroupId, startTime, ctx, fallbackGroupId, stickyKey, isCountTokens, requestId);
   }
 }
-async function handleClaudeFailover(body, request, env, failover, keyRecord, accounts, groups, mappings, upstreamModel, stream, errorMessage, preferredGroupId, originStart = Date.now(), ctx, fallbackGroupId = 0, stickyKey, isCountTokens = false) {
+async function handleClaudeFailover(body, request, env, failover, keyRecord, accounts, groups, mappings, upstreamModel, stream, errorMessage, preferredGroupId, originStart = Date.now(), ctx, fallbackGroupId = 0, stickyKey, isCountTokens = false, requestId = "") {
   const db = createDatabase(env.DB);
   const userAgent = request.headers.get("user-agent")?.slice(0, 255) || null;
   let requestMetaBody;
@@ -4726,6 +5033,7 @@ async function handleClaudeFailover(body, request, env, failover, keyRecord, acc
     if (!selection) break;
     const { account, group } = selection;
     attempted.add(account.id);
+    scheduleUsageRefresh(account, env, ctx);
     const currentProvider = account.provider;
     let retryBody;
     try {
@@ -4799,7 +5107,8 @@ async function handleClaudeFailover(body, request, env, failover, keyRecord, acc
           reasoningEffort,
           userAgent,
           ctx,
-          env
+          env,
+          requestId
         });
       }
       failover.recordRequest(account.id, group.id, isError);
@@ -4809,7 +5118,8 @@ async function handleClaudeFailover(body, request, env, failover, keyRecord, acc
         model: upstreamModel,
         status: proxyResponse.status,
         error_message: isError ? errorMessage : "",
-        latency_ms: 0
+        latency_ms: 0,
+        request_id: requestId
       }));
       const responseText = await proxyResponse.text();
       let retryResponseBody = {};
@@ -4822,15 +5132,17 @@ async function handleClaudeFailover(body, request, env, failover, keyRecord, acc
       if (retryBreakdown.cost > 0) {
         defer(ctx, db.incrementApiKeyUsage(keyRecord.id, retryBreakdown.cost));
       }
-      defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider: currentProvider, prompt_tokens: usage.promptTokens, completion_tokens: usage.completionTokens, total_tokens: usage.totalTokens, cache_read_tokens: usage.cacheReadTokens, cost: retryBreakdown.cost, base_cost: retryBreakdown.baseCost, rate_multiplier: retryBreakdown.multiplier, cost_estimated: retryBreakdown.estimated ? 1 : 0, cache_status: "bypass", status: proxyResponse.status, error_message: isError ? retryResponseBody?.error?.message || errorMessage : "", latency_ms: Date.now() - originStart, reasoning_effort: reasoningEffort, user_agent: userAgent }));
+      defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider: currentProvider, prompt_tokens: usage.promptTokens, completion_tokens: usage.completionTokens, total_tokens: usage.totalTokens, cache_read_tokens: usage.cacheReadTokens, cost: retryBreakdown.cost, base_cost: retryBreakdown.baseCost, rate_multiplier: retryBreakdown.multiplier, cost_estimated: retryBreakdown.estimated ? 1 : 0, cache_status: "bypass", status: proxyResponse.status, error_message: isError ? retryResponseBody?.error?.message || errorMessage : "", latency_ms: Date.now() - originStart, reasoning_effort: reasoningEffort, user_agent: userAgent, request_id: requestId }));
       return new Response(responseText, {
         status: proxyResponse.status,
         headers: { ...stripBodyHeaders(proxyResponse.headers), "content-type": "application/json", "cache-control": "no-store, no-transform" }
       });
     } catch (retryError) {
+      const retryMessage = retryError instanceof Error ? retryError.message : "Upstream request failed";
       if (!isCountTokens) {
+        console.error(`claude retry failed [${requestId}] account=${account.id} model=${upstreamModel}: ${retryMessage}`);
         failover.recordRequest(account.id, group.id, true);
-        defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: retryError instanceof Error ? retryError.message : "Upstream request failed", latency_ms: 0 }));
+        defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: retryMessage, latency_ms: 0, request_id: requestId }));
       }
       continue;
     }
@@ -4844,6 +5156,7 @@ async function handleClaudeFailover(body, request, env, failover, keyRecord, acc
     }
     return localCountTokensResponse(parsed);
   }
+  console.error(`claude request exhausted [${requestId}] model=${upstreamModel}: ${errorMessage}`);
   return new Response(JSON.stringify({ error: "All Anthropic accounts failed", message: errorMessage }), { status: 502, headers: { "Content-Type": "application/json" } });
 }
 function countTokensEstimate(body) {
@@ -5337,6 +5650,21 @@ async function handleAccountsRequest(request, env) {
       headers: { "Content-Type": "application/json" }
     });
   }
+  const usageMatch = /\/accounts\/(\d+)\/usage$/.exec(url.pathname);
+  if (method === "POST" && usageMatch) {
+    const id = Number(usageMatch[1]);
+    const account = await db.getAccount(id);
+    if (!account) return jsonError2("\u8D26\u53F7\u4E0D\u5B58\u5728", 404);
+    if (!isOpenCodeGoUsageAccount(account)) return jsonError2("\u8BE5\u8D26\u53F7\u4E0D\u5C5E\u4E8E OpenCode Go \u7528\u91CF\u7EC4", 400);
+    if (isManualRefreshRateLimited(readUsageSnapshot(account), Date.now())) {
+      return jsonError2("\u7528\u91CF\u6BCF 30 \u79D2\u53EA\u80FD\u624B\u52A8\u5237\u65B0\u4E00\u6B21", 429);
+    }
+    await refreshAccountUsage(account, env);
+    return new Response(JSON.stringify({ data: usageStateFromAccount(account) }), {
+      status: 200,
+      headers: JSON_HEADERS2
+    });
+  }
   const isProbePath = url.pathname.endsWith("/test") || url.pathname.endsWith("/test-all");
   if (method === "POST" && !isProbePath) {
     let body;
@@ -5754,10 +6082,32 @@ async function clearLoginThrottle(kv, ip) {
   }
 }
 
+// functions/src/utils/correlation.ts
+var CLIENT_ID_PATTERN = /^[A-Za-z0-9._:-]{8,64}$/;
+function resolveRequestId(request) {
+  const supplied = request.headers.get("x-request-id");
+  if (supplied && CLIENT_ID_PATTERN.test(supplied)) return supplied;
+  return crypto.randomUUID();
+}
+function withRequestId(response, requestId) {
+  if (!requestId) return response;
+  const headers = new Headers(response.headers);
+  const upstream = headers.get("x-request-id");
+  if (upstream && upstream !== requestId) headers.set("x-upstream-request-id", upstream);
+  headers.set("x-request-id", requestId);
+  const bodyless = response.status === 204 || response.status === 205 || response.status === 304;
+  return new Response(bodyless ? null : response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers
+  });
+}
+
 // functions/src/utils/maintenance.ts
 var LAST_RUN_KEY = "maintenance:last_usage_cleanup";
 var MIN_INTERVAL_SECONDS = 24 * 60 * 60;
 var DEFAULT_RETENTION_DAYS = 30;
+var DEFAULT_AUDIT_RETENTION_DAYS = 180;
 function resolveRetentionDays(env) {
   const raw = env.USAGE_RETENTION_DAYS;
   if (raw === void 0 || raw === null || raw === "") return DEFAULT_RETENTION_DAYS;
@@ -5765,11 +6115,19 @@ function resolveRetentionDays(env) {
   if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_RETENTION_DAYS;
   return parsed;
 }
+function resolveAuditRetentionDays(env) {
+  const raw = env.AUDIT_RETENTION_DAYS;
+  if (raw === void 0 || raw === null || raw === "") return DEFAULT_AUDIT_RETENTION_DAYS;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_AUDIT_RETENTION_DAYS;
+  return parsed;
+}
 function maybeRunScheduledCleanup(env, ctx) {
   const kv = env.CONFIG_KV;
   if (!kv || !env.DB) return;
   const days = resolveRetentionDays(env);
-  if (days <= 0) return;
+  const auditDays = resolveAuditRetentionDays(env);
+  if (days <= 0 && auditDays <= 0) return;
   void (async () => {
     try {
       const last = await kv.get(LAST_RUN_KEY);
@@ -5777,9 +6135,19 @@ function maybeRunScheduledCleanup(env, ctx) {
       const now = Date.now();
       if (Number.isFinite(lastMs) && now - lastMs < MIN_INTERVAL_SECONDS * 1e3) return;
       await kv.put(LAST_RUN_KEY, String(now), { expirationTtl: MIN_INTERVAL_SECONDS });
-      ctx.waitUntil(
-        createDatabase(env.DB).deleteUsageRecordsOlderThan(days).then(() => console.log(`usage cleanup: applied ${days}d retention`)).catch((error) => console.error("usage cleanup failed:", error instanceof Error ? error.message : String(error)))
-      );
+      const db = createDatabase(env.DB);
+      const work = [];
+      if (days > 0) {
+        work.push(
+          db.deleteUsageRecordsOlderThan(days).then(() => console.log(`usage cleanup: applied ${days}d retention`)).catch((error) => console.error("usage cleanup failed:", error instanceof Error ? error.message : String(error)))
+        );
+      }
+      if (auditDays > 0) {
+        work.push(
+          db.deleteAuditLogsOlderThan(auditDays).then(() => console.log(`audit cleanup: applied ${auditDays}d retention`)).catch((error) => console.error("audit cleanup failed:", error instanceof Error ? error.message : String(error)))
+        );
+      }
+      ctx.waitUntil(Promise.all(work));
     } catch (error) {
       console.error("usage cleanup gate failed:", error instanceof Error ? error.message : String(error));
     }
@@ -5835,7 +6203,7 @@ async function route(request, env, ctx) {
     return json({ status: "ok", timestamp: (/* @__PURE__ */ new Date()).toISOString() });
   }
   if (path === "/api/v1/auth/login" && request.method === "POST") {
-    return handleLogin(request, env);
+    return handleLogin(request, env, ctx);
   }
   if (path === "/api/v1/auth/setup") {
     if (request.method === "POST") return handleSetup(request, env);
@@ -5843,7 +6211,10 @@ async function route(request, env, ctx) {
     return json({ error: "Method not allowed" }, 405);
   }
   if (path === "/api/v1/auth/password" && request.method === "POST") {
-    return handlePasswordChange(request, env);
+    return handlePasswordChange(request, env, ctx);
+  }
+  if (path === "/api/v1/audit" && request.method === "GET") {
+    return handleAuditLogs(request, env);
   }
   if (path === "/api/v1/stats" && request.method === "GET") {
     return handleStats(request, env);
@@ -5871,23 +6242,24 @@ async function route(request, env, ctx) {
   }
   const failover = sharedFailover ?? (sharedFailover = new FailoverManager(env));
   failover.setDb(createDatabase(env.DB));
+  const requestId = resolveRequestId(request);
   if (path === "/v1/models" && request.method === "GET") {
-    return handleProviderModels(request, env, failover);
+    return withRequestId(await handleProviderModels(request, env, failover), requestId);
   }
   if (path.startsWith("/v1/models/") && request.method === "GET") {
-    return handleProviderModelRetrieve(request, env, failover, path);
+    return withRequestId(await handleProviderModelRetrieve(request, env, failover, path), requestId);
   }
   if (path.startsWith("/v1/chat/completions")) {
-    return handleOpenAIRequest(request, env, failover, ctx);
+    return withRequestId(await handleOpenAIRequest(request, env, failover, ctx, requestId), requestId);
   }
   if (path.startsWith("/v1/responses")) {
-    return handleOpenAIRequest(request, env, failover, ctx);
+    return withRequestId(await handleOpenAIRequest(request, env, failover, ctx, requestId), requestId);
   }
   if (path.startsWith("/v1/messages")) {
-    return handleClaudeRequest(request, env, failover, ctx);
+    return withRequestId(await handleClaudeRequest(request, env, failover, ctx, requestId), requestId);
   }
   if (path.startsWith("/v1/")) {
-    return handleGatewayRequest(request, env, failover, ctx);
+    return withRequestId(await handleGatewayRequest(request, env, failover, ctx, requestId), requestId);
   }
   if (env.ASSETS) {
     const assetResponse = await env.ASSETS.fetch(request);
@@ -5910,12 +6282,16 @@ function json(data, status = 200, extraHeaders = {}) {
     }
   });
 }
-async function handleLogin(request, env) {
+async function handleLogin(request, env, ctx) {
   const kv = env.CONFIG_KV;
-  const ip = kv ? clientIp(request) : "";
+  const ip = clientIp(request);
+  const userAgent = request.headers.get("user-agent")?.slice(0, 255) || null;
+  const db = createDatabase(env.DB);
+  const audit = (username, ok, detail) => defer(ctx, db.createAuditLog({ action: "login", username, ok, ip, user_agent: userAgent, detail }));
   if (kv) {
     const throttle = await checkLoginThrottle(kv, ip);
     if (!throttle.allowed) {
+      audit(null, false, "throttled");
       return json({ error: "Too many failed attempts, please retry later" }, 429, { "Retry-After": String(throttle.retryAfterSeconds) });
     }
   }
@@ -5928,15 +6304,16 @@ async function handleLogin(request, env) {
   if (!body.username || !body.password) {
     return json({ error: "Username and password required" }, 400);
   }
-  const db = createDatabase(env.DB);
   const session = await authenticateUser(db, body.username, body.password);
   if (!session) {
     if (kv) await recordLoginFailure(kv, ip);
+    audit(body.username.slice(0, 128), false, "invalid credentials");
     return json({ error: "Invalid credentials" }, 401);
   }
   if (kv) await clearLoginThrottle(kv, ip);
   await db.ensureSchema().catch(() => {
   });
+  audit(body.username.slice(0, 128), true, null);
   const token = await createSessionToken(session, await resolveSessionSecret(db, env.JWT_SECRET));
   return json({
     token,
@@ -6001,7 +6378,7 @@ async function handleSetupStatus(env) {
   const claimable = !existing || existing.password_hash.startsWith("$2a$");
   return json({ data: { initialized: Boolean(existing), setup_available: claimable, schema_ready: true } });
 }
-async function handlePasswordChange(request, env) {
+async function handlePasswordChange(request, env, ctx) {
   const session = await checkAuth(request, env);
   if (!session) return json({ error: "Unauthorized" }, 401);
   let body;
@@ -6017,12 +6394,28 @@ async function handlePasswordChange(request, env) {
     return json({ error: "New password must be at least 8 characters" }, 400);
   }
   const db = createDatabase(env.DB);
+  const ip = clientIp(request);
+  const userAgent = request.headers.get("user-agent")?.slice(0, 255) || null;
+  const audit = (ok, detail) => defer(ctx, db.createAuditLog({ action: "password_change", username: session.username, ok, ip, user_agent: userAgent, detail }));
   const user = await db.getUserByUsername(session.username);
   if (!user || !await verifyPassword(body.current_password, user.password_hash)) {
+    audit(false, "current password incorrect");
     return json({ error: "Current password is incorrect" }, 401);
   }
   await db.update("UPDATE users SET password_hash = ? WHERE id = ?", [await hashPassword(body.new_password), user.id]);
+  audit(true, null);
   return json({ success: true });
+}
+async function handleAuditLogs(request, env) {
+  const session = await checkAuth(request, env);
+  if (!session) return json({ error: "Unauthorized" }, 401);
+  const db = createDatabase(env.DB);
+  await db.ensureSchema().catch(() => {
+  });
+  const url = new URL(request.url);
+  const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit") || "100", 10) || 100, 1), 500);
+  const rows = await db.listAuditLogs(limit);
+  return json({ data: rows });
 }
 async function handleStats(request, env) {
   const session = await checkAuth(request, env);

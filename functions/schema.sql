@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS accounts (
   upstream_models_at TEXT,
   probe_model TEXT,
   protocol_rules TEXT,
+  usage_snapshot TEXT,
   created_at TEXT DEFAULT (datetime('now'))
 );
 
@@ -105,6 +106,8 @@ CREATE TABLE IF NOT EXISTS usage_records (
   status INTEGER DEFAULT 200,
   error_message TEXT,
   latency_ms INTEGER,
+  stream_outcome TEXT,
+  request_id TEXT,
   created_at TEXT DEFAULT (datetime('now'))
 );
 
@@ -118,10 +121,22 @@ CREATE TABLE IF NOT EXISTS request_logs (
   status INTEGER NOT NULL,
   error_message TEXT,
   latency_ms INTEGER,
+  request_id TEXT,
   created_at TEXT DEFAULT (datetime('now'))
 );
 
 -- 运行时设置（例如未配�?JWT_SECRET 时自动生成的会话密钥�?
+CREATE TABLE IF NOT EXISTS audit_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  action TEXT NOT NULL,
+  username TEXT,
+  ok INTEGER NOT NULL DEFAULT 0,
+  ip TEXT,
+  user_agent TEXT,
+  detail TEXT,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL,

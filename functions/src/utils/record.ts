@@ -32,6 +32,8 @@ export interface RecordContext {
   /** Request-shape telemetry carried onto the usage row; see billing.ts. */
   reasoningEffort?: string | null;
   userAgent?: string | null;
+  /** Correlation id shared with the x-request-id header; see correlation.ts. */
+  requestId?: string;
 }
 
 /**
@@ -88,7 +90,7 @@ export async function streamWithRecording(
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<StreamOutcome>(resolve => {
     timer = setTimeout(
-      () => resolve({ promptTokens: 0, completionTokens: 0, totalTokens: 0, cacheReadTokens: 0, ttftMs: null, totalMs: Date.now() - context.startedAt }),
+      () => resolve({ outcome: 'record_timeout', promptTokens: 0, completionTokens: 0, totalTokens: 0, cacheReadTokens: 0, ttftMs: null, totalMs: Date.now() - context.startedAt }),
       STREAM_RECORD_TIMEOUT_MS
     );
   });
@@ -130,8 +132,10 @@ export async function streamWithRecording(
       error_message: isError ? 'Upstream error' : '',
       latency_ms: outcome.totalMs,
       ttft_ms: outcome.ttftMs ?? undefined,
+      stream_outcome: outcome.outcome,
       reasoning_effort: context.reasoningEffort ?? null,
-      user_agent: context.userAgent ?? null
+      user_agent: context.userAgent ?? null,
+      request_id: context.requestId || null
     }).catch(() => {});
 
     await context.db.createRequestLog({
@@ -141,10 +145,13 @@ export async function streamWithRecording(
       status,
       error_message: isError ? 'Upstream error' : '',
       latency_ms: outcome.totalMs,
-      ttft_ms: outcome.ttftMs ?? undefined
+      ttft_ms: outcome.ttftMs ?? undefined,
+      request_id: context.requestId || null
     }).catch(() => {});
-  }).catch(() => {
-    // Telemetry must never surface as a failure to the caller.
+  }).catch((error) => {
+    // Telemetry must never surface as a failure to the caller — but it must
+    // not vanish without a trace either: the id ties this line to the client.
+    console.error(`stream record failed [${context.requestId || '?'}] account=${context.accountId}: ${error instanceof Error ? error.message : String(error)}`);
   });
 
   // Registered while the handler is still running, so the isolate stays alive

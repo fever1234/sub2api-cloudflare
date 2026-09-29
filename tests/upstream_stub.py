@@ -80,6 +80,24 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         port = self._port()
+        # OpenCode Go usage endpoint. Bound via OPENCODE_USAGE_URL (port 9108)
+        # so the auto-refresh hits this stub instead of opencode.ai; recorded
+        # separately so model-list request assertions are not disturbed.
+        if self.path.split('?')[0].endswith('/usage'):
+            with LOCK:
+                state = STATE.setdefault(port, _blank())
+                state.setdefault('usage', []).append({'authorization': self.headers.get('authorization')})
+            raw = json.dumps({'usage': {
+                'rolling': {'status': 'ok', 'percent': 12.5, 'resetsAt': '2026-09-28T16:00:00Z'},
+                'weekly': {'status': 'ok', 'percent': 34.0, 'resetsAt': '2026-10-01T00:00:00Z'},
+                'monthly': {'status': 'ok', 'percent': 56.0, 'resetsAt': '2026-10-15T00:00:00Z'},
+            }}).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+            return
         with LOCK:
             state = STATE.setdefault(port, _blank())
             if self.path.startswith('/__control'):
@@ -324,6 +342,12 @@ def serve(port):
     server = ThreadingHTTPServer(('127.0.0.1', port), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
+
+
+def usage_hits(port):
+    """How many official-usage fetches this instance served, with auth."""
+    with LOCK:
+        return list(STATE.get(port, {}).get('usage', []))
 
 
 if __name__ == '__main__':

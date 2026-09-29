@@ -17,7 +17,7 @@
  * exception". The version is recorded in `settings` once the work succeeds, and
  * later requests spend a single cheap read confirming there is nothing to do.
  */
-export const SCHEMA_VERSION = '14';
+export const SCHEMA_VERSION = '16';
 
 /**
  * The accounts table DDL.
@@ -49,6 +49,7 @@ export const ACCOUNTS_TABLE_DDL = `CREATE TABLE IF NOT EXISTS accounts (
   upstream_models_at TEXT,
   probe_model TEXT,
   protocol_rules TEXT,
+  usage_snapshot TEXT,
   created_at TEXT DEFAULT (datetime('now'))
 )`;
 
@@ -126,6 +127,8 @@ export const SCHEMA_STATEMENTS: string[] = [
     latency_ms INTEGER,
     reasoning_effort TEXT,
     user_agent TEXT,
+    stream_outcome TEXT,
+    request_id TEXT,
     created_at TEXT DEFAULT (datetime('now'))
   )`,
   `CREATE TABLE IF NOT EXISTS request_logs (
@@ -137,6 +140,20 @@ export const SCHEMA_STATEMENTS: string[] = [
     status INTEGER NOT NULL,
     error_message TEXT,
     latency_ms INTEGER,
+    request_id TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+  )`,
+  // Security events: failed/succeeded logins, throttled attempts, password
+  // changes. Written by the auth handlers so a credential-guessing run leaves
+  // evidence even when every attempt was rejected before reaching a request log.
+  `CREATE TABLE IF NOT EXISTS audit_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    action TEXT NOT NULL,
+    username TEXT,
+    ok INTEGER NOT NULL DEFAULT 0,
+    ip TEXT,
+    user_agent TEXT,
+    detail TEXT,
     created_at TEXT DEFAULT (datetime('now'))
   )`,
   // Internal key/value store. Holds the auto-generated JWT signing secret so a
@@ -242,5 +259,22 @@ export const ADDITIVE_COLUMNS: Array<{ table: string; column: string; definition
   // opencode_go: per-account protocol rules that replace the built-in default
   // table for this account (Go: credentials.protocol_rules). JSON array of
   // {pattern, protocol}; NULL means "use the defaults".
-  { table: 'accounts', column: 'protocol_rules', definition: 'TEXT' }
+  { table: 'accounts', column: 'protocol_rules', definition: 'TEXT' },
+
+  // OpenCode Go usage windows (Go: opencode_go_usage_snapshot), as the stored
+  // snapshot: status, the rolling/weekly/monthly percentages, and the backoff
+  // fields that decide when the next automatic refresh is due.
+  { table: 'accounts', column: 'usage_snapshot', definition: 'TEXT' },
+
+  // How a streamed request settled (completed / client_abort / upstream_error /
+  // stalled / timeout / record_timeout). NULL on rows written before v15 and on
+  // buffered (non-streamed) responses, which never enter the stream guard.
+  { table: 'usage_records', column: 'stream_outcome', definition: 'TEXT' },
+
+  // Correlation id for one client request across attempts: the value the
+  // gateway put in the x-request-id response header, so an error a client
+  // reports can be matched to the usage row, the request log and the Workers
+  // log line without guessing by timestamp. NULL on rows written before v16.
+  { table: 'usage_records', column: 'request_id', definition: 'TEXT' },
+  { table: 'request_logs', column: 'request_id', definition: 'TEXT' }
 ];

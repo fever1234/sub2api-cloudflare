@@ -31,7 +31,7 @@ const tsFiles = walk('functions').filter(file => file.endsWith('.ts'))
 // isolate dies. It must be either awaited or handed to ctx.waitUntil.
 const WRITE_METHODS = [
   'createUsageRecord', 'createRequestLog', 'incrementApiKeyUsage',
-  'recordAccountHealthCheck', 'updateAccountError', 'ensureSchema'
+  'recordAccountHealthCheck', 'updateAccountError', 'ensureSchema', 'createAuditLog'
 ]
 
 const strayWrites = []
@@ -57,12 +57,16 @@ for (const route of ['openai', 'claude', 'gateway']) {
   check(`${route} route receives ctx`, signature.includes('ctx'), signature)
 }
 
-// ---- 3. the worker must pass ctx into every route it dispatches -----------
+// ---- 3. the worker must pass ctx and the correlation id into every route --
 const workerSource = readFileSync('functions/_worker.ts', 'utf8')
-const dispatches = [...workerSource.matchAll(/return handle(OpenAI|Claude|Gateway)Request\(([^)]*)\)/g)]
+const dispatches = [...workerSource.matchAll(/handle(OpenAI|Claude|Gateway)Request\(([^)]*)\)/g)]
 check('worker dispatches at least four gateway routes', dispatches.length >= 4, String(dispatches.length))
 const missingCtx = dispatches.filter(match => !match[2].includes('ctx')).map(match => match[1])
 check('worker passes ctx to every gateway route', missingCtx.length === 0, missingCtx.join(','))
+const missingId = dispatches.filter(match => !match[2].includes('requestId')).map(match => match[1])
+check('worker passes the correlation id to every gateway route', missingId.length === 0, missingId.join(','))
+const wrapped = (workerSource.match(/withRequestId\(/g) || []).length
+check('worker attaches the id to gateway responses', wrapped >= 6, String(wrapped))
 
 // ---- 4. every icon reference resolves to a sprite symbol ------------------
 const html = readFileSync('frontend/index.html', 'utf8')
@@ -425,7 +429,7 @@ function blockAfter(source, startMarker, endMarker) {
 // both model endpoints (Go: group_model_allowlist.go).
 {
   const schema = readFileSync('functions/src/schema.ts', 'utf8')
-  check('schema version is bumped for the group allowlist columns', schema.includes("SCHEMA_VERSION = '14'"))
+  check('schema version is bumped for the group allowlist columns', schema.includes("SCHEMA_VERSION = '16'"))
   const groupsDdl = schema.slice(schema.indexOf('CREATE TABLE IF NOT EXISTS groups'), schema.indexOf('CREATE TABLE IF NOT EXISTS channels'))
   check('fresh groups table carries the allowlist columns',
     groupsDdl.includes('model_allowlist_enabled INTEGER DEFAULT 0') && groupsDdl.includes('model_allowlist TEXT'))
@@ -494,7 +498,7 @@ function blockAfter(source, startMarker, endMarker) {
 // usage row is written, aggregated for the dashboard and never billed.
 {
   const schema = readFileSync('functions/src/schema.ts', 'utf8')
-  check('schema version is bumped for the cache-read column', schema.includes("SCHEMA_VERSION = '14'"))
+  check('schema version is bumped for the cache-read column', schema.includes("SCHEMA_VERSION = '16'"))
   const usageDdl = schema.slice(
     schema.indexOf('CREATE TABLE IF NOT EXISTS usage_records'),
     schema.indexOf('CREATE TABLE IF NOT EXISTS request_logs'))
@@ -531,7 +535,7 @@ function blockAfter(source, startMarker, endMarker) {
 // the official ids (Go: DefaultOpenCodeGoModelIDs) rather than one placeholder.
 {
   const schema = readFileSync('functions/src/schema.ts', 'utf8')
-  check('schema version is bumped for the protocol-rules column', schema.includes("SCHEMA_VERSION = '14'"))
+  check('schema version is bumped for the protocol-rules column', schema.includes("SCHEMA_VERSION = '16'"))
   const accountsDdl = schema.slice(
     schema.indexOf('export const ACCOUNTS_TABLE_DDL'),
     schema.indexOf('export const SCHEMA_STATEMENTS'))
@@ -583,6 +587,136 @@ function blockAfter(source, startMarker, endMarker) {
   check('account dialog offers the rules field', frontend.includes("textareaInput('protocol_rules'"))
   check('cleared field is sent back to clear storage',
     frontend.includes("else if (editing) payload.protocol_rules = ''"))
+}
+
+// ---- 22. OpenCode usage windows + stream outcome observability -------------
+// The console shows OpenCode Go quota windows fetched from the official
+// endpoint (auto-scheduled from the request path, manual via the admin API),
+// and every streamed row records how it settled — completed, client_abort,
+// upstream_error, stalled, timeout, record_timeout — so a "the stream died"
+// report can name a culprit instead of a status code.
+{
+  const schema = readFileSync('functions/src/schema.ts', 'utf8')
+  check('schema version is bumped for the usage/outcome columns', schema.includes("SCHEMA_VERSION = '16'"))
+  const accountsDdl = schema.slice(
+    schema.indexOf('export const ACCOUNTS_TABLE_DDL'),
+    schema.indexOf('export const SCHEMA_STATEMENTS'))
+  check('fresh accounts table carries usage_snapshot', accountsDdl.includes('usage_snapshot TEXT'))
+  check('fresh usage table carries stream_outcome', schema.includes('stream_outcome TEXT'))
+  check('existing accounts tables gain usage_snapshot',
+    schema.includes("{ table: 'accounts', column: 'usage_snapshot'"))
+  check('existing usage rows gain stream_outcome',
+    schema.includes("{ table: 'usage_records', column: 'stream_outcome'"))
+
+  const sql = readFileSync('functions/schema.sql', 'utf8')
+  check('schema.sql carries usage_snapshot', sql.includes('usage_snapshot TEXT'))
+  check('schema.sql carries stream_outcome', sql.includes('stream_outcome TEXT'))
+
+  const types = readFileSync('functions/src/types.ts', 'utf8')
+  check('Account type carries usage_snapshot', types.includes('usage_snapshot?: string | null'))
+  check('UsageRecord type carries stream_outcome', types.includes('stream_outcome?: string | null'))
+
+  const db = readFileSync('functions/src/db.ts', 'utf8')
+  check('updateAccount can write the snapshot', db.includes('if (updates.usage_snapshot !== undefined)'))
+  check('createUsageRecord inserts the outcome column', db.includes('stream_outcome, request_id)'))
+  check('createUsageRecord defaults the outcome to null', db.includes('record.stream_outcome ?? null'))
+
+  const refresh = readFileSync('functions/src/utils/usage-refresh.ts', 'utf8')
+  check('refresh util exports the eligibility gate', refresh.includes('export function isOpenCodeGoUsageAccount'))
+  check('refresh util exports the due check', refresh.includes('export function isUsageRefreshDue'))
+  check('refresh util blocks redirects off the official endpoint', refresh.includes("redirect: 'manual'"))
+  check('failed refreshes keep the last known windows', refresh.includes('must not erase the last known windows'))
+  check('refresh is scheduled without blocking the request', refresh.includes('export function scheduleUsageRefresh'))
+
+  // Both the main attempt and the retry of every route select an account, and
+  // each selection is a chance to schedule the background refresh.
+  for (const route of ['gateway', 'openai', 'claude']) {
+    const source = readFileSync(`functions/src/routes/${route}.ts`, 'utf8')
+    const calls = (source.match(/scheduleUsageRefresh\(account, env, ctx\)/g) || []).length
+    check(`${route} schedules the refresh on main and retry paths`, calls === 2, `found ${calls}`)
+  }
+
+  const accounts = readFileSync('functions/src/config/accounts.ts', 'utf8')
+  check('manual refresh endpoint exists', accounts.includes('/accounts\\/(\\d+)\\/usage$'))
+  check('manual refresh is rate limited', accounts.includes('isManualRefreshRateLimited('))
+  check('manual refresh rejects foreign accounts', accounts.includes('该账号不属于 OpenCode Go 用量组'))
+  check('manual refresh precedes account creation',
+    accounts.indexOf('usageMatch') !== -1 && accounts.indexOf('usageMatch') < accounts.indexOf('create account'))
+
+  const env = readFileSync('functions/src/index.ts', 'utf8')
+  check('usage endpoint override binding exists', env.includes('OPENCODE_USAGE_URL?: string'))
+
+  const proxy = readFileSync('functions/src/utils/proxy.ts', 'utf8')
+  check('outcome taxonomy names every settle path',
+    ["'completed'", "'client_abort'", "'upstream_error'", "'stalled'", "'timeout'", "'record_timeout'"]
+      .every(kind => proxy.includes(kind)))
+  check('StreamOutcome carries the tag', proxy.includes('outcome: StreamOutcomeKind'))
+
+  const record = readFileSync('functions/src/utils/record.ts', 'utf8')
+  check('persisted rows carry the outcome', record.includes('stream_outcome: outcome.outcome'))
+  check('bookkeeping cap is tagged separately', record.includes("outcome: 'record_timeout'"))
+
+  const frontend = readFileSync('frontend/app.js', 'utf8')
+  check('usage page marks abnormal endings', frontend.includes('STREAM_OUTCOME_LABELS'))
+  check('account rows show the quota chip', frontend.includes('usageChip(item)'))
+}
+
+// ---- 23. request-id correlation, auth audit, transient write retry --------
+// One id ties the client's error report to the response header, the usage
+// row, the request log and the Workers log line; rejected logins leave an
+// audit row instead of vanishing; and a transient D1 blip retries instead of
+// silently dropping telemetry.
+{
+  const schema = readFileSync('functions/src/schema.ts', 'utf8')
+  check('schema version is bumped for the audit/correlation columns', schema.includes("SCHEMA_VERSION = '16'"))
+  check('fresh schema carries the audit table', schema.includes('CREATE TABLE IF NOT EXISTS audit_logs'))
+  check('existing usage rows gain request_id', schema.includes("{ table: 'usage_records', column: 'request_id'"))
+  check('existing request logs gain request_id', schema.includes("{ table: 'request_logs', column: 'request_id'"))
+
+  const sql = readFileSync('functions/schema.sql', 'utf8')
+  check('schema.sql carries the audit table', sql.includes('CREATE TABLE IF NOT EXISTS audit_logs'))
+  check('schema.sql carries request_id', sql.includes('request_id TEXT'))
+
+  const types = readFileSync('functions/src/types.ts', 'utf8')
+  check('UsageRecord type carries request_id', types.includes('request_id?: string | null'))
+  check('RequestLog type carries request_id', types.includes('request_id?: string | null'))
+
+  const db = readFileSync('functions/src/db.ts', 'utf8')
+  check('transient D1 write failures are retried', db.includes('function isTransientD1Error'))
+  check('permanent errors still fail fast', db.includes('attempt >= delays.length'))
+  check('usage rows insert the correlation id', db.includes('record.request_id || null'))
+  check('request logs insert the correlation id', db.includes('log.request_id || null'))
+  check('audit rows can be written', db.includes('async createAuditLog'))
+  check('audit rows can be listed', db.includes('async listAuditLogs'))
+  check('audit retention is enforced', db.includes('async deleteAuditLogsOlderThan'))
+
+  const worker = readFileSync('functions/_worker.ts', 'utf8')
+  check('login attempts are audited', worker.includes("action: 'login'"))
+  check('password changes are audited', worker.includes("action: 'password_change'"))
+  check('audit endpoint exists', worker.includes("'/api/v1/audit'"))
+
+  const correlation = readFileSync('functions/src/utils/correlation.ts', 'utf8')
+  check('a request id is resolved per request', correlation.includes('export function resolveRequestId'))
+  check('the id travels on the response', correlation.includes("headers.set('x-request-id'"))
+  check('the upstream id is preserved', correlation.includes('x-upstream-request-id'))
+
+  for (const route of ['gateway', 'openai', 'claude']) {
+    const source = readFileSync(`functions/src/routes/${route}.ts`, 'utf8')
+    for (const write of ['createUsageRecord', 'createRequestLog']) {
+      const calls = (source.match(new RegExp(`${write}\\(\\{[\\s\\S]*?\\}\\)`, 'g')) || [])
+      check(`${route} ${write} calls carry the request id`,
+        calls.length > 0 && calls.every(call => call.includes('request_id: requestId')),
+        `found ${calls.length}, missing ${calls.filter(call => !call.includes('request_id: requestId')).length}`)
+    }
+    check(`${route} failures log with the request id`, source.includes('${requestId}'))
+  }
+
+  const record = readFileSync('functions/src/utils/record.ts', 'utf8')
+  check('stream bookkeeping carries the request id', record.includes('request_id: context.requestId || null'))
+  check('stream record failures log with the id', record.includes('stream record failed [${context.requestId'))
+
+  const maintenance = readFileSync('functions/src/utils/maintenance.ts', 'utf8')
+  check('audit rows are cleaned up too', maintenance.includes('deleteAuditLogsOlderThan'))
 }
 
 console.log()

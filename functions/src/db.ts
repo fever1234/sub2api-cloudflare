@@ -18,17 +18,39 @@ export class Database {
   }
 
   async exec(sql: string): Promise<void> {
-    await this.db.prepare(sql).run();
+    await this.runWrite(sql, []);
   }
 
   async insert(sql: string, params: any[] = []): Promise<{ lastRowId: number; changes: number }> {
-    const result = await this.db.prepare(sql).bind(...params).run();
+    const result = await this.runWrite(sql, params);
     return { lastRowId: Number(result.meta.last_row_id ?? 0), changes: Number(result.meta.changes ?? 0) };
   }
 
   async update(sql: string, params: any[] = []): Promise<{ changes: number }> {
-    const result = await this.db.prepare(sql).bind(...params).run();
+    const result = await this.runWrite(sql, params);
     return { changes: Number(result.meta.changes ?? 0) };
+  }
+
+  /**
+   * Run a write statement, retrying transient D1 failures.
+   *
+   * `defer()` keeps a fire-and-forget write alive, but it cannot re-run a
+   * promise that already rejected: an isolated "Network connection lost" from
+   * D1 silently dropped the row. SQL errors (constraint violations, missing
+   * columns) fail fast — only transport-shaped failures get the backoff, and a
+   * row whose write actually landed before the error may duplicate. Telemetry
+   * duplicating beats telemetry vanishing.
+   */
+  private async runWrite(sql: string, params: any[]) {
+    const delays = [250, 750];
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await this.db.prepare(sql).bind(...params).run();
+      } catch (error) {
+        if (attempt >= delays.length || !isTransientD1Error(error)) throw error;
+        await new Promise(resolve => setTimeout(resolve, delays[attempt]));
+      }
+    }
   }
 
   // User operations
@@ -154,6 +176,7 @@ export class Database {
     if (updates.client_spoofing !== undefined) { fields.push('client_spoofing = ?'); values.push(updates.client_spoofing); }
     if (updates.rate_multiplier !== undefined) { fields.push('rate_multiplier = ?'); values.push(updates.rate_multiplier); }
     if (updates.protocol_rules !== undefined) { fields.push('protocol_rules = ?'); values.push(updates.protocol_rules); }
+    if (updates.usage_snapshot !== undefined) { fields.push('usage_snapshot = ?'); values.push(updates.usage_snapshot); }
     
     if (fields.length === 0) return { changes: 0 };
     values.push(id);
@@ -362,8 +385,8 @@ export class Database {
   async createUsageRecord(record: Partial<UsageRecord>) {
     return this.insert(
       `INSERT INTO usage_records
-       (api_key_id, model, provider, prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, cost, base_cost, rate_multiplier, cost_estimated, cache_status, status, error_message, latency_ms, ttft_ms, group_id, account_id, reasoning_effort, user_agent)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (api_key_id, model, provider, prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, cost, base_cost, rate_multiplier, cost_estimated, cache_status, status, error_message, latency_ms, ttft_ms, group_id, account_id, reasoning_effort, user_agent, stream_outcome, request_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         record.api_key_id ?? 0,
         record.model,
@@ -384,7 +407,9 @@ export class Database {
         record.group_id ?? null,
         record.account_id ?? null,
         record.reasoning_effort ?? null,
-        record.user_agent ?? null
+        record.user_agent ?? null,
+        record.stream_outcome ?? null,
+        record.request_id || null
       ]
     );
   }
@@ -440,8 +465,8 @@ export class Database {
   // Request logs for error tracking
   async createRequestLog(log: Partial<RequestLog>) {
     return this.insert(
-      `INSERT INTO request_logs (account_id, channel_id, group_id, model, status, error_message, latency_ms, ttft_ms)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO request_logs (account_id, channel_id, group_id, model, status, error_message, latency_ms, ttft_ms, request_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         log.account_id,
         0,
@@ -450,9 +475,44 @@ export class Database {
         log.status,
         log.error_message || '',
         log.latency_ms ?? 0,
-        log.ttft_ms ?? null
+        log.ttft_ms ?? null,
+        log.request_id || null
       ]
     );
+  }
+
+  // Security events (login success/failure, throttled attempts, password
+  // changes). Written from the auth paths, which have no request log of their
+  // own to hang the event on.
+  async createAuditLog(entry: { action: string; username?: string | null; ok: boolean; ip?: string | null; user_agent?: string | null; detail?: string | null }) {
+    return this.insert(
+      `INSERT INTO audit_logs (action, username, ok, ip, user_agent, detail)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [
+        entry.action,
+        entry.username ?? null,
+        entry.ok ? 1 : 0,
+        entry.ip ?? null,
+        entry.user_agent ? entry.user_agent.slice(0, 255) : null,
+        entry.detail ?? null
+      ]
+    );
+  }
+
+  async listAuditLogs(limit = 100, offset = 0) {
+    return this.query<any>(
+      'SELECT * FROM audit_logs ORDER BY id DESC LIMIT ? OFFSET ?',
+      [limit, offset]
+    );
+  }
+
+  async deleteAuditLogsOlderThan(days: number) {
+    if (days <= 0) {
+      await this.update('DELETE FROM audit_logs', []);
+      return;
+    }
+    const cutoff = sqliteTimestamp(Date.now() - days * 24 * 60 * 60 * 1000);
+    await this.update('DELETE FROM audit_logs WHERE created_at < ?', [cutoff]);
   }
 
   async getAccountErrorStats(accountId: number, windowSeconds: number) {
@@ -821,6 +881,16 @@ export class Database {
 
 function sqliteTimestamp(timestamp: number): string {
   return new Date(timestamp).toISOString().slice(0, 19).replace('T', ' ');
+}
+
+/**
+ * Transport-shaped D1 failures worth retrying. Constraint violations, missing
+ * columns and syntax errors are permanent — retrying them only burns the
+ * waitUntil budget before failing the same way.
+ */
+function isTransientD1Error(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /network|connection|timeout|timed out|temporarily|unavailable|econn|socket|worker closed/i.test(message);
 }
 
 export function createDatabase(db: D1Database): Database {

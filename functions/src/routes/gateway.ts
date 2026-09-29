@@ -10,6 +10,7 @@ import { createStripRetryState, sendWithRejectedFieldRetry, sanitizeToolSchemas,
 import { SilentRefusalDetector, guardSilentRefusalStream } from '../utils/silent-refusal';
 import { modelAllowed, modelAllowlistDenied } from '../utils/model-allowlist';
 import { streamWithRecording } from '../utils/record';
+import { scheduleUsageRefresh } from '../utils/usage-refresh';
 import { envInt, retryDelayMs, retryBudgetExceeded, sleep } from '../utils/retry';
 import { applyAnthropicCacheBreakpoints } from '../utils/cache-breakpoints';
 import { defer, Deferrable } from '../utils/background';
@@ -17,7 +18,7 @@ import { extractTokenUsage, calculateCostBreakdown, extractReasoningEffort } fro
 import { Account, Group, ModelMapping } from '../types';
 import { loadRoutingSnapshot } from '../utils/routing-cache';
 
-export async function handleGatewayRequest(request: Request, env: Env, failover: FailoverManager, ctx?: Deferrable): Promise<Response> {
+export async function handleGatewayRequest(request: Request, env: Env, failover: FailoverManager, ctx?: Deferrable, requestId = ''): Promise<Response> {
   const db = createDatabase(env.DB);
   const url = new URL(request.url);
   
@@ -112,7 +113,10 @@ export async function handleGatewayRequest(request: Request, env: Env, failover:
   }
   
   const { account, group, stats } = selection;
-  
+  // OpenCode Go quota windows refresh in the background once their interval
+  // elapses; the request itself never waits on the endpoint.
+  scheduleUsageRefresh(account, env, ctx);
+
   // Build upstream URL
   const credentials = resolveUpstreamCredentials(account);
   const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, provider);
@@ -245,8 +249,8 @@ export async function handleGatewayRequest(request: Request, env: Env, failover:
     if (isError && failover.shouldFailover({ status: responseStatus }) && accounts.length > 1) {
       await proxyResponse.text().catch(() => '');
       failover.recordRequest(account.id, group.id, true);
-      defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: responseStatus, error_message: `Upstream returned ${responseStatus}`, latency_ms: Date.now() - startTime }));
-      return handleFailover(chatBody, request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, model, `Upstream returned ${responseStatus}`, preferredGroupId, startTime, ctx, fallbackGroupId, stickyKey, stripState);
+      defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: responseStatus, error_message: `Upstream returned ${responseStatus}`, latency_ms: Date.now() - startTime, request_id: requestId }));
+      return handleFailover(chatBody, request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, model, `Upstream returned ${responseStatus}`, preferredGroupId, startTime, ctx, fallbackGroupId, stickyKey, stripState, requestId);
     }
 
     let finalBody: any;
@@ -264,7 +268,8 @@ export async function handleGatewayRequest(request: Request, env: Env, failover:
           reasoningEffort,
           userAgent,
           ctx,
-          env
+          env,
+          requestId
         });
       }
       const buffered = await bufferResponsesSseAsChat(proxyResponse.body, model);
@@ -285,7 +290,8 @@ export async function handleGatewayRequest(request: Request, env: Env, failover:
         reasoningEffort,
         userAgent,
         ctx,
-        env
+        env,
+        requestId
       });
     }
     
@@ -313,7 +319,7 @@ export async function handleGatewayRequest(request: Request, env: Env, failover:
     if (cost > 0) {
       defer(ctx, db.incrementApiKeyUsage(keyRecord.id, cost));
     }
-    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cache_read_tokens: cacheReadTokens, cost, base_cost: breakdown.baseCost, rate_multiplier: breakdown.multiplier, cost_estimated: breakdown.estimated ? 1 : 0, cache_status: 'bypass', status: responseStatus, error_message: isError ? responseBody?.error?.message || 'Error' : '', latency_ms: Date.now() - startTime, reasoning_effort: reasoningEffort, user_agent: userAgent }));
+    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cache_read_tokens: cacheReadTokens, cost, base_cost: breakdown.baseCost, rate_multiplier: breakdown.multiplier, cost_estimated: breakdown.estimated ? 1 : 0, cache_status: 'bypass', status: responseStatus, error_message: isError ? responseBody?.error?.message || 'Error' : '', latency_ms: Date.now() - startTime, reasoning_effort: reasoningEffort, user_agent: userAgent, request_id: requestId }));
     
     defer(ctx, db.createRequestLog({
       account_id: account.id,
@@ -321,7 +327,8 @@ export async function handleGatewayRequest(request: Request, env: Env, failover:
       model: upstreamModel,
       status: responseStatus,
       error_message: isError ? responseBody?.error?.message || `Upstream returned ${responseStatus}` : '',
-      latency_ms: Date.now() - startTime
+      latency_ms: Date.now() - startTime,
+      request_id: requestId
     }));
     
     // Record for failover
@@ -342,13 +349,14 @@ export async function handleGatewayRequest(request: Request, env: Env, failover:
     isError = true;
     errorMessage = error instanceof Error ? error.message : 'Unknown error';
     responseStatus = 502;
-    
+    console.error(`gateway attempt failed [${requestId}] account=${account.id} model=${upstreamModel}: ${errorMessage}`);
+
     // Record failover
     failover.recordRequest(account.id, group.id, true);
-    defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: errorMessage, latency_ms: Date.now() - startTime }));
+    defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: errorMessage, latency_ms: Date.now() - startTime, request_id: requestId }));
     
-    // Try to failover to next account
-    return handleFailover(chatBody, request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, model, errorMessage, preferredGroupId, startTime, ctx, fallbackGroupId, stickyKey, stripState);
+    // Try failover to next account
+    return handleFailover(chatBody, request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, model, errorMessage, preferredGroupId, startTime, ctx, fallbackGroupId, stickyKey, stripState, requestId);
   }
 }
 
@@ -372,7 +380,8 @@ async function handleFailover(
   ctx?: Deferrable,
   fallbackGroupId = 0,
   stickyKey?: string,
-  stripState?: StripRetryState
+  stripState?: StripRetryState,
+  requestId = ''
 ): Promise<Response> {
   const db = createDatabase(env.DB);
   const userAgent = request.headers.get('user-agent')?.slice(0, 255) || null;
@@ -400,6 +409,7 @@ async function handleFailover(
     
     const { account, group } = selection;
     attempted.add(account.id);
+    scheduleUsageRefresh(account, env, ctx);
     // Session hints are re-read from the body so retried OpenCode calls keep
     // the conversation id.
     let retryBody: unknown;
@@ -481,7 +491,8 @@ async function handleFailover(
             reasoningEffort,
             userAgent,
             ctx,
-            env
+            env,
+            requestId
           });
         }
         const buffered = await bufferResponsesSseAsChat(proxyResponse.body, clientModel);
@@ -502,7 +513,8 @@ async function handleFailover(
           reasoningEffort,
           userAgent,
           ctx,
-          env
+          env,
+          requestId
         });
       }
 
@@ -513,7 +525,8 @@ async function handleFailover(
         model: upstreamModel,
         status: finalStatus,
         error_message: finalError ? errorMessage || `Upstream returned ${finalStatus}` : '',
-        latency_ms: 0
+        latency_ms: 0,
+        request_id: requestId
       }));
       const responseText = finalBody !== undefined ? JSON.stringify(finalBody) : await proxyResponse.text();
 
@@ -526,7 +539,7 @@ async function handleFailover(
       if (retryBreakdown.cost > 0) {
         defer(ctx, db.incrementApiKeyUsage(keyRecord.id, retryBreakdown.cost));
       }
-      defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: usage.promptTokens, completion_tokens: usage.completionTokens, total_tokens: usage.totalTokens, cache_read_tokens: usage.cacheReadTokens, cost: retryBreakdown.cost, base_cost: retryBreakdown.baseCost, rate_multiplier: retryBreakdown.multiplier, cost_estimated: retryBreakdown.estimated ? 1 : 0, cache_status: 'bypass', status: finalStatus, error_message: finalError ? retryResponseBody?.error?.message || errorMessage : '', latency_ms: Date.now() - originStart, reasoning_effort: reasoningEffort, user_agent: userAgent }));
+      defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: usage.promptTokens, completion_tokens: usage.completionTokens, total_tokens: usage.totalTokens, cache_read_tokens: usage.cacheReadTokens, cost: retryBreakdown.cost, base_cost: retryBreakdown.baseCost, rate_multiplier: retryBreakdown.multiplier, cost_estimated: retryBreakdown.estimated ? 1 : 0, cache_status: 'bypass', status: finalStatus, error_message: finalError ? retryResponseBody?.error?.message || errorMessage : '', latency_ms: Date.now() - originStart, reasoning_effort: reasoningEffort, user_agent: userAgent, request_id: requestId }));
       
       return new Response(responseText, {
         status: finalStatus,
@@ -537,13 +550,16 @@ async function handleFailover(
       });
       
     } catch (retryError) {
+      const retryMessage = retryError instanceof Error ? retryError.message : 'Upstream request failed';
+      console.error(`gateway retry failed [${requestId}] account=${account.id} model=${upstreamModel}: ${retryMessage}`);
       failover.recordRequest(account.id, group.id, true);
-      defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: retryError instanceof Error ? retryError.message : 'Upstream request failed', latency_ms: 0 }));
+      defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: retryMessage, latency_ms: 0, request_id: requestId }));
       continue;
     }
   }
   
   // All retries failed
+  console.error(`gateway request exhausted [${requestId}] model=${upstreamModel}: ${errorMessage}`);
   return new Response(JSON.stringify({ 
     error: 'All accounts failed',
     message: errorMessage 

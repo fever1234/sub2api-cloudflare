@@ -17,6 +17,8 @@ import { resolveOpenCodeGoProtocol, DEFAULT_OPENCODE_GO_MODEL_IDS } from './src/
 import { readCachedModels } from './src/utils/healthcheck'
 import { modelAllowed, modelAllowlistDenied } from './src/utils/model-allowlist'
 import { clientIp, checkLoginThrottle, recordLoginFailure, clearLoginThrottle } from './src/utils/login-throttle'
+import { resolveRequestId, withRequestId } from './src/utils/correlation'
+import { defer, type Deferrable } from './src/utils/background'
 import { maybeRunScheduledCleanup } from './src/utils/maintenance'
 
 // Keep an isolate-local scheduler between requests. Persistent request logs in
@@ -99,7 +101,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
 
   // Login
   if (path === '/api/v1/auth/login' && request.method === 'POST') {
-    return handleLogin(request, env)
+    return handleLogin(request, env, ctx)
   }
 
   // Setup. GET reports whether an administrator already exists so the login
@@ -112,7 +114,13 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
 
   // Change the signed-in administrator password.
   if (path === '/api/v1/auth/password' && request.method === 'POST') {
-    return handlePasswordChange(request, env)
+    return handlePasswordChange(request, env, ctx)
+  }
+
+  // Security events (login attempts, password changes), for the operator to
+  // review after the fact — a rejected guess used to leave no trace anywhere.
+  if (path === '/api/v1/audit' && request.method === 'GET') {
+    return handleAuditLogs(request, env)
   }
 
   // Aggregated dashboard metrics
@@ -156,27 +164,31 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
   const failover = sharedFailover ?? (sharedFailover = new FailoverManager(env))
   failover.setDb(createDatabase(env.DB))
 
+  // One correlation id for the whole client request: bound before dispatch so
+  // every attempt's bookkeeping carries it, attached once on the way out.
+  const requestId = resolveRequestId(request)
+
   // OpenAI clients commonly probe this endpoint before sending a request.
   if (path === '/v1/models' && request.method === 'GET') {
-    return handleProviderModels(request, env, failover)
+    return withRequestId(await handleProviderModels(request, env, failover), requestId)
   }
   // Retrieving a single model shares the list's allowlist gate: a model the
   // key's group excludes reads as nonexistent (Go: openai_models_handler 404).
   if (path.startsWith('/v1/models/') && request.method === 'GET') {
-    return handleProviderModelRetrieve(request, env, failover, path)
+    return withRequestId(await handleProviderModelRetrieve(request, env, failover, path), requestId)
   }
 
   if (path.startsWith('/v1/chat/completions')) {
-    return handleOpenAIRequest(request, env, failover, ctx)
+    return withRequestId(await handleOpenAIRequest(request, env, failover, ctx, requestId), requestId)
   }
   if (path.startsWith('/v1/responses')) {
-    return handleOpenAIRequest(request, env, failover, ctx)
+    return withRequestId(await handleOpenAIRequest(request, env, failover, ctx, requestId), requestId)
   }
   if (path.startsWith('/v1/messages')) {
-    return handleClaudeRequest(request, env, failover, ctx)
+    return withRequestId(await handleClaudeRequest(request, env, failover, ctx, requestId), requestId)
   }
   if (path.startsWith('/v1/')) {
-    return handleGatewayRequest(request, env, failover, ctx)
+    return withRequestId(await handleGatewayRequest(request, env, failover, ctx, requestId), requestId)
   }
 
   // In Pages advanced mode static files are exposed through ASSETS.
@@ -206,15 +218,20 @@ function json(data: any, status = 200, extraHeaders: Record<string, string> = {}
   })
 }
 
-async function handleLogin(request: Request, env: Env): Promise<Response> {
+async function handleLogin(request: Request, env: Env, ctx: Deferrable): Promise<Response> {
   // Failure-only fixed window per IP: five wrong passwords in a row buy a
   // 60-second 429, but one correct password anywhere in the window clears the
   // counter, so a misconfigured client can never lock the operator out.
   const kv = env.CONFIG_KV
-  const ip = kv ? clientIp(request) : ''
+  const ip = clientIp(request)
+  const userAgent = request.headers.get('user-agent')?.slice(0, 255) || null
+  const db = createDatabase(env.DB)
+  const audit = (username: string | null, ok: boolean, detail: string | null) =>
+    defer(ctx, db.createAuditLog({ action: 'login', username, ok, ip, user_agent: userAgent, detail }))
   if (kv) {
     const throttle = await checkLoginThrottle(kv, ip)
     if (!throttle.allowed) {
+      audit(null, false, 'throttled')
       return json({ error: 'Too many failed attempts, please retry later' }, 429, { 'Retry-After': String(throttle.retryAfterSeconds) })
     }
   }
@@ -226,10 +243,10 @@ async function handleLogin(request: Request, env: Env): Promise<Response> {
     return json({ error: 'Username and password required' }, 400)
   }
 
-  const db = createDatabase(env.DB)
   const session = await authenticateUser(db, body.username, body.password)
   if (!session) {
     if (kv) await recordLoginFailure(kv, ip)
+    audit(body.username.slice(0, 128), false, 'invalid credentials')
     return json({ error: 'Invalid credentials' }, 401)
   }
   if (kv) await clearLoginThrottle(kv, ip)
@@ -238,8 +255,10 @@ async function handleLogin(request: Request, env: Env): Promise<Response> {
   // runs before the first admin exists, so an upgraded deployment would never
   // otherwise gain columns or the channel fold-in added after it was created.
   // ensureSchema is idempotent and flag-guarded, so this costs one settings
-  // read once the work is done.
+  // read once the work is done. Audited after it, so the login that performed
+  // the migration lands in a table the migration just created.
   await db.ensureSchema().catch(() => {})
+  audit(body.username.slice(0, 128), true, null)
 
   const token = await createSessionToken(session, await resolveSessionSecret(db, env.JWT_SECRET))
 
@@ -322,7 +341,7 @@ async function handleSetupStatus(env: Env): Promise<Response> {
   return json({ data: { initialized: Boolean(existing), setup_available: claimable, schema_ready: true } })
 }
 
-async function handlePasswordChange(request: Request, env: Env): Promise<Response> {
+async function handlePasswordChange(request: Request, env: Env, ctx: Deferrable): Promise<Response> {
   const session = await checkAuth(request, env)
   if (!session) return json({ error: 'Unauthorized' }, 401)
 
@@ -337,13 +356,31 @@ async function handlePasswordChange(request: Request, env: Env): Promise<Respons
   }
 
   const db = createDatabase(env.DB)
+  const ip = clientIp(request)
+  const userAgent = request.headers.get('user-agent')?.slice(0, 255) || null
+  const audit = (ok: boolean, detail: string | null) =>
+    defer(ctx, db.createAuditLog({ action: 'password_change', username: session.username, ok, ip, user_agent: userAgent, detail }))
   const user = await db.getUserByUsername(session.username)
   if (!user || !(await verifyPassword(body.current_password, user.password_hash))) {
+    audit(false, 'current password incorrect')
     return json({ error: 'Current password is incorrect' }, 401)
   }
 
   await db.update('UPDATE users SET password_hash = ? WHERE id = ?', [await hashPassword(body.new_password), user.id])
+  audit(true, null)
   return json({ success: true })
+}
+
+async function handleAuditLogs(request: Request, env: Env): Promise<Response> {
+  const session = await checkAuth(request, env)
+  if (!session) return json({ error: 'Unauthorized' }, 401)
+
+  const db = createDatabase(env.DB)
+  await db.ensureSchema().catch(() => {})
+  const url = new URL(request.url)
+  const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') || '100', 10) || 100, 1), 500)
+  const rows = await db.listAuditLogs(limit)
+  return json({ data: rows })
 }
 
 async function handleStats(request: Request, env: Env): Promise<Response> {

@@ -20,8 +20,8 @@ const db = {
     { id: 2, name: 'claude-pool', description: 'Claude 专用', enabled: 1, priority: 5, error_threshold: 0.5, error_count_threshold: 5, window_seconds: 300 }
   ],
   accounts: [
-    { id: 1, name: 'acct-openai', provider: 'openai', group_id: 1, group_name: 'default', enabled: 1, priority: 0, error_rate: 0, rate_multiplier: 1, has_api_key: true, api_key: '***', base_url: '' },
-    { id: 2, name: 'acct-claude', provider: 'anthropic', group_id: 2, group_name: 'claude-pool', enabled: 1, priority: 0, error_rate: 0, rate_multiplier: 0.5, has_api_key: true, api_key: '***', base_url: '' }
+    { id: 1, name: 'acct-openai', provider: 'openai', group_id: 1, group_name: 'default', enabled: 1, priority: 0, error_rate: 0, rate_multiplier: 1, has_api_key: true, api_key: '***', base_url: '', usage_snapshot: '{"status":"ok","data":{"rolling":{"status":"ok","percent":12.5,"resets_at":"2026-02-01T00:00:00.000Z"},"weekly":{"status":"ok","percent":10,"resets_at":null},"monthly":{"status":"ok","percent":20,"resets_at":null}},"fetched_at":"2026-01-01T00:00:00.000Z","last_attempt_at":"2026-01-01T00:00:00.000Z","next_refresh_at":"2026-01-01T00:15:00.000Z"}' },
+    { id: 2, name: 'acct-claude', provider: 'anthropic', group_id: 2, group_name: 'claude-pool', enabled: 1, priority: 0, error_rate: 0, rate_multiplier: 0.5, has_api_key: true, api_key: '***', base_url: '', usage_snapshot: '{"status":"failed","last_attempt_at":"2026-01-01T00:10:00.000Z","next_refresh_at":"2026-01-01T00:25:00.000Z","failure_count":1,"last_error":"http_error"}' }
   ],
   models: [
     { id: 1, requested_model: 'gpt-4o', provider: 'openai', upstream_model: 'gpt-4o-mini', group_id: 1, enabled: 1, priority: 0 },
@@ -32,7 +32,7 @@ const db = {
     { id: 2, name: 'staging', enabled: 1, balance: 0, quota_limit: 5, group_id: 2, group_name: 'claude-pool', created_at: '2026-01-02 00:00:00' }
   ],
   usage: [
-    { id: 1, model: 'gpt-4o', provider: 'openai', total_tokens: 150, prompt_tokens: 100, cache_read_tokens: 30, completion_tokens: 20, cost: 0.002, base_cost: 0.002, rate_multiplier: 1, cost_estimated: 0, status: 200, latency_ms: 850, ttft_ms: 320, group_id: 1, group_name: 'default', account_id: 1, account_name: 'acct-openai', key_name: 'prod', reasoning_effort: 'high', user_agent: 'python-requests/2.31.0', created_at: '2026-01-01 00:00:00' },
+    { id: 1, model: 'gpt-4o', provider: 'openai', total_tokens: 150, prompt_tokens: 100, cache_read_tokens: 30, completion_tokens: 20, cost: 0.002, base_cost: 0.002, rate_multiplier: 1, cost_estimated: 0, status: 200, latency_ms: 850, ttft_ms: 320, stream_outcome: 'client_abort', group_id: 1, group_name: 'default', account_id: 1, account_name: 'acct-openai', key_name: 'prod', reasoning_effort: 'high', user_agent: 'python-requests/2.31.0', created_at: '2026-01-01 00:00:00' },
     { id: 2, model: 'claude-3-5-sonnet', provider: 'anthropic', total_tokens: 80, prompt_tokens: 60, cache_read_tokens: 0, completion_tokens: 20, cost: 0.002, base_cost: 0.004, rate_multiplier: 0.5, cost_estimated: 1, status: 200, latency_ms: 1200, ttft_ms: 2900, group_id: 2, group_name: 'claude-pool', account_id: 2, account_name: 'acct-claude', key_name: 'staging', reasoning_effort: null, user_agent: null, created_at: '2026-01-02 00:00:00' }
   ]
 }
@@ -401,6 +401,14 @@ press(doc.querySelector('.nav-item[data-page="dashboard"]'))
 await tick(12)
 check('trend chart drew svg', Boolean(doc.querySelector('#chart-tokens svg')))
 check('trend chart plots cache reads', /缓存读取/.test(doc.getElementById('chart-tokens').textContent))
+// The hit rate rides its own 0–100% axis: token counts and a percentage never
+// share one scale, so the right-hand labels are what prove it was added.
+check('trend chart plots the cache hit rate', /缓存命中率/.test(doc.getElementById('chart-tokens').textContent))
+check('trend chart draws a percent axis', /100%/.test(doc.getElementById('chart-tokens').textContent),
+  doc.getElementById('chart-tokens').textContent.slice(0, 200))
+check('hit rate is cache reads over total input',
+  /缓存命中率: 23\.1%/.test(doc.getElementById('chart-tokens').innerHTML),
+  doc.getElementById('chart-tokens').innerHTML.slice(0, 400))
 check('model chart drew svg', Boolean(doc.querySelector('#chart-models svg')))
 check('stat cards populated', /1/.test(doc.getElementById('stats-grid').textContent))
 
@@ -444,6 +452,18 @@ check('hovering a token cell reveals the full breakdown',
 check('usage cost cell shows the multiplier', /0\.5x/.test(doc.getElementById('usage-list').textContent),
   doc.getElementById('usage-list').textContent.slice(0, 200))
 check('usage marks an estimated price', /估算价/.test(doc.getElementById('usage-list').textContent))
+
+// ---- stream outcome markers on the row --------------------------------------
+// A streamed row records how it settled; only abnormal endings get a marker
+// under the status badge, so an unmarked row stays readable as a normal one.
+check('usage row marks a client-side abort',
+  /中断 · 客户端断开/.test(doc.getElementById('usage-list').textContent),
+  doc.getElementById('usage-list').textContent.slice(0, 300))
+const unmarkedUsageRow = [...doc.querySelectorAll('#usage-list tbody tr')]
+  .find(tr => /claude-3-5-sonnet/.test(tr.textContent))
+check('a row without a stream outcome carries no marker',
+  Boolean(unmarkedUsageRow) && !/中断 ·/.test(unmarkedUsageRow.textContent),
+  unmarkedUsageRow?.textContent?.slice(0, 120) || 'row not found')
 
 // ---- request-shape telemetry on the row -------------------------------------
 // reasoning_effort and user_agent are stored on every usage row; the page owes
@@ -504,6 +524,14 @@ if (cleanupForm) {
 // format; the provider default stays preselected so 开始测试 works instantly.
 press(doc.querySelector('.nav-item[data-page="accounts"]'))
 await tick(10)
+// The quota chip renders the stored usage snapshot: the rolling percent when
+// the last fetch succeeded, a plain failure note when it did not.
+check('account row shows the rolling quota percent',
+  /用量 12\.5%/.test(doc.getElementById('accounts-list').textContent),
+  doc.getElementById('accounts-list').textContent.slice(0, 300))
+check('a failed quota fetch surfaces on the row',
+  /用量获取失败/.test(doc.getElementById('accounts-list').textContent),
+  doc.getElementById('accounts-list').textContent.slice(0, 300))
 press(doc.querySelector('#accounts-list [data-action="test-account"]'))
 await tick(24)
 const probeCard = doc.querySelector('.modal-card')

@@ -10,7 +10,7 @@
     "test:api": "python tests/api.test.py",
     "test:gateway": "python tests/gateway.test.py",
     "test:features": "python tests/features.test.py",
-    "test": "npm run typecheck && npm run build && npm run test:source && npm run test:bridge && npm run test:session && npm run test:pricing && npm run test:ui && npm run test:resilience",
+    "test": "npm run typecheck && npm run build && npm run test:source && npm run test:bridge && npm run test:session && npm run test:pricing && npm run test:usage && npm run test:ui && npm run test:resilience",
     "test:pricing": "node tests/pricing.test.mjs",
     "test:bridge": "node tests/bridge.test.mjs",
     "test:session": "node tests/session.test.mjs",
@@ -18,7 +18,8 @@
     "dev": "npm run build:functions && wrangler pages dev frontend --compatibility-flag=nodejs_compat",
     "deploy": "npm run build:functions && wrangler pages deploy frontend --project-name sub2api-gateway",
     "test:source": "node tests/source.test.mjs",
-    "test:migration": "python tests/migration.test.py"
+    "test:migration": "python tests/migration.test.py",
+    "test:usage": "node tests/usage.test.mjs"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250829.0",

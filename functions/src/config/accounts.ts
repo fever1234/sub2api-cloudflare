@@ -6,6 +6,13 @@ import { probeAccount, probeAccounts, listUpstreamModels } from '../utils/health
 import { invalidateAllRoutingSnapshots } from '../utils/routing-cache';
 import { isProvider, getProbeModel } from '../utils/provider';
 import { normalizeProtocolRulesInput } from '../utils/responses-bridge';
+import {
+  isOpenCodeGoUsageAccount,
+  isManualRefreshRateLimited,
+  readUsageSnapshot,
+  refreshAccountUsage,
+  usageStateFromAccount
+} from '../utils/usage-refresh';
 
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
 
@@ -112,6 +119,26 @@ export async function handleAccountsRequest(request: Request, env: Env): Promise
     });
   }
   
+  // POST /api/v1/accounts/:id/usage - manual refresh of the OpenCode Go usage
+  // snapshot (Go: the console's manual refresh, one attempt per 30 seconds).
+  // Matched before the create route below: the trailing segment would otherwise
+  // turn this into an account creation with a garbled name.
+  const usageMatch = /\/accounts\/(\d+)\/usage$/.exec(url.pathname);
+  if (method === 'POST' && usageMatch) {
+    const id = Number(usageMatch[1]);
+    const account = await db.getAccount(id);
+    if (!account) return jsonError('账号不存在', 404);
+    if (!isOpenCodeGoUsageAccount(account)) return jsonError('该账号不属于 OpenCode Go 用量组', 400);
+    if (isManualRefreshRateLimited(readUsageSnapshot(account), Date.now())) {
+      return jsonError('用量每 30 秒只能手动刷新一次', 429);
+    }
+    await refreshAccountUsage(account, env);
+    return new Response(JSON.stringify({ data: usageStateFromAccount(account) }), {
+      status: 200,
+      headers: JSON_HEADERS
+    });
+  }
+
   // POST /api/v1/accounts - create account
   // `/test` and `/test-all` are probe endpoints, not creates. Checking only for
   // a `/test` suffix would let `/test-all` fall through into account creation.
